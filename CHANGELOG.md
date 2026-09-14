@@ -46,6 +46,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   macOS has one radio, so more than one `ble` instance is a config error
   there.
 
+- `transports.udp.interface` binds a UDP instance, and the per-peer
+  connected sockets under it, to one interface, so two instances bound to
+  two interfaces are two distinct routes to a peer reachable over both.
+  Linux binds both directions (`SO_BINDTODEVICE`); macOS binds egress only
+  (`IP_BOUND_IF`), so inbound on a wildcard `bind_addr` still arrives from
+  any interface there, and naming an interface elsewhere is an error at
+  start. The interface must exist when the daemon starts: unlike an
+  Ethernet transport, an interface-bound UDP instance is not retried when
+  its interface appears later.
+
 - Dynamic interface binding for the Ethernet transport. An interface-bound
   transport is now a long-lived object that is *sometimes bound*: the interface
   it names need not exist when the daemon starts, may appear minutes later, and
