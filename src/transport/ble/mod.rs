@@ -27,8 +27,15 @@
 //! ## Connection Pool
 //!
 //! BLE hardware limits concurrent connections (typically 4-10). The pool
-//! enforces a configurable maximum (default 7) with priority eviction:
-//! static (configured) peers get priority over discovered peers.
+//! enforces a configurable maximum (default 7). An address counts as
+//! carrying a node's session only while the node's active peer uses it.
+//! Until then it may be evicted, once it has had at least
+//! `connect_timeout_ms` (never less than 10 s) to verify; a verified address
+//! is never evicted, and a newcomer that finds nothing evictable is refused.
+//! Eviction happens only when the pool is full and nothing closes an
+//! unverified link on a timer, so with `max_connections` above what the
+//! adapter can hold, links that never verify can keep the adapter's
+//! remaining connections.
 
 pub mod addr;
 pub mod io;
@@ -56,10 +63,11 @@ use super::{
     TransportError, TransportId, TransportState, TransportType,
 };
 use crate::config::BleConfig;
+use crate::identity::NodeAddr;
 use addr::BleAddr;
 use io::{BleIo, BleScanner, BleStream};
 use neighbor::NeighborBuffer;
-use pool::{Admission, Admitted, BleConnection, ConnectionPool};
+use pool::{Admission, Admitted, BleConnection, ConnectionPool, Verify};
 use stats::BleStats;
 use stream_read::BleStreamRead;
 
@@ -125,7 +133,7 @@ compile_error!(
 ///
 /// Provides connection-oriented, reliable delivery over BLE L2CAP CoC.
 /// Each peer has its own L2CAP connection; the pool enforces hardware
-/// connection limits with priority eviction.
+/// connection limits, evicting only unverified addresses.
 pub struct BleTransport<I: BleIo> {
     /// Unique transport identifier.
     transport_id: TransportId,
@@ -275,6 +283,7 @@ impl<S: BleStream + 'static> Channels<S> {
             Arc::clone(&self.stats),
         ));
 
+        let now = tokio::time::Instant::now();
         let conn = BleConnection {
             stream,
             send_tx,
@@ -282,29 +291,44 @@ impl<S: BleStream + 'static> Channels<S> {
             recv_task: Some(recv_task),
             send_mtu,
             recv_mtu,
-            established_at: tokio::time::Instant::now(),
-            is_static: false,
+            established_at: now,
             addr,
             outbound,
             id,
         };
 
         let role = if outbound { "central" } else { "peripheral" };
-        let admitted = self.pool.lock().await.insert(ta.clone(), conn);
+        let (admitted, max) = {
+            let mut pool = self.pool.lock().await;
+            (pool.insert(ta.clone(), conn, now), pool.max_connections())
+        };
+        let (Ok(Admitted { ended, .. }) | Err(pool::Refused { ended, .. })) = &admitted;
+        if let Some(n) = ended {
+            info!(refused = n, "BLE pool refusal run ended");
+        }
+        // A full pool is a state an attacker in radio range can hold, so a
+        // refusal logs at debug, with one warning at the start of a run.
         let admitted = match admitted {
             Ok(admitted) => admitted,
-            Err(e) => {
+            Err(refused) => {
                 self.stats.record_connection_rejected();
-                warn!(
-                    addr = %ta, role, outcome = "pool-rejected", error = %e,
-                    "BLE pool full, connection dropped"
-                );
-                return Err(e);
+                debug!(addr = %ta, role, outcome = "pool-rejected", "BLE pool full, link dropped");
+                if refused.first {
+                    warn!(
+                        bound = max,
+                        "BLE pool full of verified links or links still inside their grace \
+                         (max_connections); refusing new links"
+                    );
+                }
+                return Err(TransportError::SendFailed("pool full".into()));
             }
         };
         if let Some(evicted) = &admitted.evicted {
             self.stats.record_pool_eviction();
-            debug!(addr = %ta, evicted = %evicted, "BLE connection evicted a peer");
+            debug!(
+                addr = %ta, role, evicted = %evicted, outcome = "evicted-unverified",
+                "BLE pool full, evicted an unverified link"
+            );
         }
         if admitted.admission != Admission::Retire {
             if outbound {
@@ -361,13 +385,14 @@ impl<I: BleIo> BleTransport<I> {
         packet_tx: PacketTx,
     ) -> Self {
         let max_conns = config.max_connections();
+        let verify_grace = config.verify_grace();
         Self {
             transport_id,
             name,
             config,
             state: TransportState::Configured,
             io: Arc::new(io),
-            pool: Arc::new(Mutex::new(ConnectionPool::new(max_conns))),
+            pool: Arc::new(Mutex::new(ConnectionPool::new(max_conns, verify_grace))),
             connecting: Arc::new(Mutex::new(HashMap::new())),
             packet_tx,
             accept_task: None,
@@ -767,6 +792,50 @@ impl<I: BleIo> BleTransport<I> {
         if closed > 0 {
             debug!(addr = %addr, channels = closed, "BLE connection closed");
         }
+    }
+
+    /// Records that the node's active peer `node` now uses the address
+    /// `addr`.
+    ///
+    /// The node calls this on every authenticated frame that arrives over
+    /// BLE, so the common case (the address is already verified for `node`)
+    /// must stay cheap and quiet.
+    pub async fn mark_verified(&self, addr: &TransportAddr, node: &NodeAddr) {
+        let outcome = self.pool.lock().await.mark_verified(addr, node);
+        match outcome {
+            // A remote holding two addresses can alternate its frames
+            // between them, demoting one per frame: never louder than trace.
+            Verify::Marked { demoted } => {
+                for other in demoted {
+                    trace!(
+                        addr = %other, node = %node, kept = %addr, outcome = "superseded",
+                        "BLE link no longer carries its node's session"
+                    );
+                }
+            }
+            Verify::Absent => {
+                trace!(addr = %addr, outcome = "absent", "BLE link to verify is not pooled");
+            }
+        }
+    }
+
+    /// Records that the node's active peer `node` no longer uses the address
+    /// `addr`. The address stays pooled. When `removed`, the peer itself is
+    /// gone and the address gets its grace again; otherwise the peer moved
+    /// to another address and this one keeps the grace it had.
+    pub async fn clear_verified(&self, addr: &TransportAddr, node: &NodeAddr, removed: bool) {
+        let regrace = removed.then(tokio::time::Instant::now);
+        let cleared = self.pool.lock().await.clear_verified(addr, node, regrace);
+        if cleared {
+            trace!(addr = %addr, node = %node, "BLE link no longer verified");
+        }
+    }
+
+    /// Whether the address `addr` is verified; `None` when nothing is pooled
+    /// there.
+    #[cfg(test)]
+    pub(crate) async fn is_verified(&self, addr: &TransportAddr) -> Option<bool> {
+        self.pool.lock().await.is_verified(addr)
     }
 
     /// `(id, outbound)` of each channel held at `addr`, oldest first, and
@@ -1514,7 +1583,10 @@ mod tests {
     /// Wire up a receive loop over one end of a mock stream pair.
     fn spawn_receive_loop(local: MockBleStream) -> ReceiveLoopHarness {
         let addr = test_addr(2).to_transport_addr();
-        let pool = Arc::new(Mutex::new(ConnectionPool::new(7)));
+        let pool = Arc::new(Mutex::new(ConnectionPool::new(
+            7,
+            std::time::Duration::from_secs(10),
+        )));
         let (tx, rx) = tokio::sync::mpsc::channel(16);
         let reader = BleStreamRead::new(Arc::new(local), 2048);
         let task = tokio::spawn(receive_loop(
@@ -1766,11 +1838,11 @@ mod tests {
                     send_mtu: 2048,
                     recv_mtu: 2048,
                     established_at: tokio::time::Instant::now(),
-                    is_static: false,
                     addr: test_addr(2),
                     outbound: false,
                     id: 0,
                 },
+                tokio::time::Instant::now(),
             )
             .unwrap();
         assert!(pool.lock().await.contains(&ta));
@@ -1843,12 +1915,9 @@ mod tests {
     /// as one. The inbound path already continues on rejection; this pins the
     /// outbound probe path to the same shape.
     ///
-    /// Reaching the refusal needs `max_connections: 0`. `ConnectionPool::insert`
-    /// only fails when the pool is full *and* every slot is static, and every
-    /// BLE connection is built with `is_static: false`, so a non-empty pool
-    /// always has an evictable slot. That makes this arm unreachable in a
-    /// default deployment today and reachable the moment anything marks a
-    /// connection static, which the pool is already written for.
+    /// The pool refuses a link whenever every slot holds a verified address
+    /// or one still inside its grace; `max_connections: 0` reaches the
+    /// refusal without building either.
     #[tokio::test(start_paused = true)]
     async fn a_pool_rejected_probe_is_neither_established_nor_reported() {
         use std::sync::Mutex as StdMutex;
@@ -2261,11 +2330,11 @@ mod tests {
                     send_mtu: 2048,
                     recv_mtu: 2048,
                     established_at: tokio::time::Instant::now(),
-                    is_static: false,
                     addr: test_addr(2),
                     outbound: false,
                     id: 0,
                 },
+                tokio::time::Instant::now(),
             )
             .unwrap();
 
@@ -2927,11 +2996,11 @@ mod tests {
                     send_mtu: 64,
                     recv_mtu: 64,
                     established_at: tokio::time::Instant::now(),
-                    is_static: false,
                     addr: test_addr(2),
                     outbound: false,
                     id: 0,
                 },
+                tokio::time::Instant::now(),
             )
             .unwrap();
 
@@ -2972,5 +3041,176 @@ mod tests {
             assert!(object.contains_key(key), "snapshot lost `{key}`");
         }
         assert_eq!(object.len(), expected.len(), "snapshot gained a key");
+    }
+
+    // ------------------------------------------------------------------
+    // Links carrying a session versus unverified links
+    // ------------------------------------------------------------------
+
+    /// A distinct node identity per `n`.
+    fn node(n: u8) -> NodeAddr {
+        let mut bytes = [0u8; 16];
+        bytes[0] = n;
+        NodeAddr::from_bytes(bytes)
+    }
+
+    /// A transport under `config` whose every dial is answered, keeping the
+    /// remote ends alive.
+    fn dialable_transport(config: BleConfig) -> BleTransport<MockBleIo> {
+        let io = MockBleIo::new("hci0", test_addr(1));
+        let alive: Arc<std::sync::Mutex<Vec<MockBleStream>>> = Arc::default();
+        io.set_connect_handler(move |addr, _psm| {
+            let (mine, theirs) = MockBleStream::pair(test_addr(1), addr.clone(), 2048);
+            alive.lock().unwrap().push(theirs);
+            Ok(mine)
+        });
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        BleTransport::new(TransportId::new(1), None, config, io, tx)
+    }
+
+    /// Dial in from `from`. The remote end is returned and must be kept
+    /// alive, or the link closes.
+    async fn dial_in(transport: &BleTransport<MockBleIo>, from: &BleAddr) -> MockBleStream {
+        let (ours, theirs) = MockBleStream::pair(test_addr(1), from.clone(), 2048);
+        transport.io.inject_inbound(ours).await;
+        theirs
+    }
+
+    /// Whether a link is pooled at `addr`, without waiting on the lock. False
+    /// while the lock is held, so only a wait for presence may use it.
+    fn pooled(transport: &BleTransport<MockBleIo>, addr: &BleAddr) -> bool {
+        transport
+            .pool
+            .try_lock()
+            .map(|p| p.contains(&addr.to_transport_addr()))
+            .unwrap_or(false)
+    }
+
+    /// Whether a link is pooled at `addr`, waiting on the lock.
+    async fn holds(transport: &BleTransport<MockBleIo>, addr: &BleAddr) -> bool {
+        transport
+            .pool
+            .lock()
+            .await
+            .contains(&addr.to_transport_addr())
+    }
+
+    /// A link that never completes a handshake is not closed by any timer:
+    /// it leaves only by eviction or link loss.
+    #[tokio::test(start_paused = true)]
+    async fn an_unverified_link_that_never_handshakes_stays_open() {
+        let mut transport = dialable_transport(identity_test_config());
+        transport.start_async().await.unwrap();
+        let _link = dial_in(&transport, &test_addr(2)).await;
+        wait_for("the link", || pooled(&transport, &test_addr(2))).await;
+
+        for _ in 0..60 {
+            tokio::time::advance(std::time::Duration::from_secs(10)).await;
+            settle().await;
+        }
+        assert!(
+            pooled(&transport, &test_addr(2)),
+            "still pooled after 600 s"
+        );
+        transport.stop_async().await.unwrap();
+    }
+
+    /// The whole chain once the node drops its peer: the withdrawn link gets
+    /// the grace again, then a newcomer takes its slot.
+    #[tokio::test(start_paused = true)]
+    async fn a_withdrawn_link_is_evicted_by_a_newcomer_once_past_its_grace() {
+        let config = BleConfig {
+            max_connections: Some(1),
+            ..identity_test_config()
+        };
+        let mut transport = dialable_transport(config);
+        transport.start_async().await.unwrap();
+        let rejected = |t: &BleTransport<MockBleIo>| t.stats.snapshot().connections_rejected;
+        let secs = std::time::Duration::from_secs;
+
+        let _p_link = dial_in(&transport, &test_addr(2)).await;
+        wait_for("P's link", || pooled(&transport, &test_addr(2))).await;
+        let ta2 = test_addr(2).to_transport_addr();
+        transport.mark_verified(&ta2, &node(2)).await;
+
+        tokio::time::advance(secs(20)).await;
+        let _q_link = dial_in(&transport, &test_addr(3)).await;
+        wait_for("Q's refusal", || rejected(&transport) == 1).await;
+        assert!(
+            !holds(&transport, &test_addr(3)).await,
+            "a verified link is kept"
+        );
+
+        tokio::time::advance(secs(1)).await;
+        transport.clear_verified(&ta2, &node(2), true).await;
+        tokio::time::advance(secs(5)).await;
+        let _r_link = dial_in(&transport, &test_addr(4)).await;
+        wait_for("R's refusal", || rejected(&transport) == 2).await;
+        assert!(
+            pooled(&transport, &test_addr(2)),
+            "the withdrawn link is inside its new grace"
+        );
+
+        tokio::time::advance(secs(6)).await;
+        let _r_again = dial_in(&transport, &test_addr(5)).await;
+        wait_for("R's admission", || pooled(&transport, &test_addr(5))).await;
+        assert!(
+            !holds(&transport, &test_addr(2)).await,
+            "P's link was evicted"
+        );
+        assert_eq!(transport.stats.snapshot().pool_evictions, 1);
+        transport.stop_async().await.unwrap();
+    }
+
+    /// An inbound or a node dial the pool refuses has no link behind it and
+    /// must not be announced to the node.
+    #[tokio::test(start_paused = true)]
+    async fn an_inbound_or_dial_refused_by_a_full_pool_is_not_reported() {
+        for max in [0, 2] {
+            let config = BleConfig {
+                max_connections: Some(max),
+                ..identity_test_config()
+            };
+            let mut transport = dialable_transport(config);
+            transport.start_async().await.unwrap();
+            let snapshot = Arc::clone(&transport.stats);
+            let settled = |n: u64| {
+                let stats = Arc::clone(&snapshot);
+                move || {
+                    let s = stats.snapshot();
+                    s.connections_rejected + s.connections_accepted + s.connections_established == n
+                }
+            };
+
+            let _inbound = dial_in(&transport, &test_addr(2)).await;
+            wait_for("the inbound to be decided", settled(1)).await;
+            let after_inbound = transport.neighbor_buffer.take();
+
+            transport
+                .connect_async(&test_addr(3).to_transport_addr())
+                .await
+                .unwrap();
+            wait_for("the dial to be decided", settled(2)).await;
+            let after_dial = transport.neighbor_buffer.take();
+
+            if max == 0 {
+                assert_eq!(snapshot.snapshot().connections_rejected, 2);
+                assert!(!holds(&transport, &test_addr(2)).await);
+                assert!(
+                    after_inbound.is_empty(),
+                    "a refused inbound is not announced: {after_inbound:?}"
+                );
+                assert!(
+                    after_dial.is_empty(),
+                    "a refused dial is not announced: {after_dial:?}"
+                );
+            } else {
+                // The control: with room, the same inbound and dial are
+                // announced, so an empty buffer above is not a dead path.
+                assert_eq!(after_inbound.len(), 1, "an admitted inbound is announced");
+                assert_eq!(after_dial.len(), 1, "an admitted dial is announced");
+            }
+            transport.stop_async().await.unwrap();
+        }
     }
 }

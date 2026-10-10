@@ -835,6 +835,16 @@ dial itself, and the node that accepted both follows when it reads
 end-of-stream. A channel at a rotated address is a separate link to the
 node layer and is not settled here.
 
+An address counts as carrying a peer once the node's FIPS session with
+that peer uses it: the initiator's promotion marks the address its
+handshake completed on, and every authenticated frame marks the address
+it arrived on. When the pool is full, a newcomer evicts only an
+unverified address that has had one connect timeout (never less than
+10 s) to complete its handshake, preferring one whose node holds another
+address in the pool, then the oldest. A verified address is never
+evicted, and a newcomer that finds nothing evictable is refused, so a
+device in radio range cannot displace a link carrying a session.
+
 Failing addresses back off by powers of two up to
 `MAX_PROBE_BACKOFF_SHIFT`, and the retry book is capped at
 `MAX_PENDING_PROBES` so that rotating addresses cannot grow it without

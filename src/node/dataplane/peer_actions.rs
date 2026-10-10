@@ -40,6 +40,7 @@
 //! shell drivers — so populating them stays behavior-neutral.
 
 use crate::PeerIdentity;
+use crate::identity::NodeAddr;
 use crate::node::diag::{self, OrNone};
 use crate::node::reject::{HandshakeReject, RejectReason};
 use crate::node::{Node, NodeError};
@@ -333,6 +334,16 @@ impl Node {
                             if let Some(k) = ambient.pending_outbound_key {
                                 self.pending_outbound.remove(&k);
                             }
+
+                            // Tell the transport which link the new peer uses.
+                            // Only the initiator's promotion does; the
+                            // responder's link is marked by the initiator's
+                            // first authenticated frame, which follows its
+                            // promotion at once.
+                            if ambient.is_outbound {
+                                let link = (ambient.transport_id, ambient.remote_addr.clone());
+                                self.relink(&node_addr, None, Some(link)).await;
+                            }
                         }
                         Ok(PromotionResult::CrossConnectionWon {
                             loser_link_id,
@@ -598,7 +609,10 @@ impl Node {
                     // FSP `sessions` entry and `pending_tun_packets`. The machine
                     // emits NO `FreeIndex` for those slots, so there is no
                     // double-free.
-                    self.remove_active_peer(ambient.verified_identity.node_addr());
+                    let gone = *ambient.verified_identity.node_addr();
+                    let held = self.peer_link(&gone);
+                    self.remove_active_peer(&gone);
+                    self.relink(&gone, held, None).await;
                 }
                 PeerAction::SwapToInboundSession {
                     peer,
@@ -847,5 +861,56 @@ impl Node {
                 }
             }
         }
+    }
+}
+
+impl Node {
+    /// The transport and address the active peer `node` sends over.
+    pub(in crate::node) fn peer_link(
+        &self,
+        node: &NodeAddr,
+    ) -> Option<(TransportId, TransportAddr)> {
+        let peer = self.peers.get(node)?;
+        Some((peer.transport_id()?, peer.current_addr()?.clone()))
+    }
+
+    /// Tell the transports that the active peer `node` moved from `old` to
+    /// `new`: the old connection no longer carries it, the new one does. With
+    /// no `new`, the peer was removed.
+    ///
+    /// BLE uses this to decide which of its connections carry an active
+    /// peer's session, which it protects from eviction; every other
+    /// transport ignores it.
+    ///
+    /// The new link is marked before the old one is cleared. Each is a
+    /// separate turn of the transport's lock, and a newcomer waiting on that
+    /// lock in between must not find the peer with no verified link: it
+    /// could evict the link the peer is moving onto. Within one transport the
+    /// mark already demotes the old link; across transports the two links
+    /// are in different pools.
+    pub(in crate::node) async fn relink(
+        &self,
+        node: &NodeAddr,
+        old: Option<(TransportId, TransportAddr)>,
+        new: Option<(TransportId, TransportAddr)>,
+    ) {
+        if let Some((tid, addr)) = &new
+            && let Some(transport) = self.transports.get(tid)
+        {
+            transport.mark_verified(addr, node).await;
+        }
+        if let Some((tid, addr)) = &old
+            && old != new
+            && let Some(transport) = self.transports.get(tid)
+        {
+            transport.clear_verified(addr, node, new.is_none()).await;
+        }
+    }
+
+    /// Whether `transport` needs to hear of every authenticated frame's link.
+    pub(in crate::node) fn tracks_peers(&self, transport: TransportId) -> bool {
+        self.transports
+            .get(&transport)
+            .is_some_and(|t| t.tracks_peers())
     }
 }
