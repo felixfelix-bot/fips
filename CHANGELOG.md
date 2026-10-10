@@ -829,6 +829,14 @@ with v0.5.x or earlier peers.
 
 #### Data plane and transports
 
+- A Nostr traversal connect no longer stalls for `signal_ttl_secs` (120 s by
+  default) when both peers dial each other and one offer is lost. The node
+  with the smaller address drops the peer's offer and waits for an answer to
+  its own; if its own offer never reached the peer, neither side answered
+  until the wait ran out. Dropping the peer's offer now re-sends ours once, so
+  the peer can answer it straight away. A peer that already has it ignores
+  the copy through its replay check.
+
 - Two nodes that started a handshake to each other at once over Bluetooth LE
   no longer drop the link between them. Resolving the crossed handshake, or
   reaping a stale handshake leg, closed the losing leg's connection by its
@@ -1275,6 +1283,20 @@ with v0.5.x or earlier peers.
   two roots.
 
 #### Sessions and rekey
+
+- A session that loses its route now looks the destination up again instead
+  of going dark until it idles out. A link change anywhere on the way (a wifi
+  roam, a BLE drop, a re-plugged cable, the tree re-parenting) flushes the
+  coordinates a node routes a destination by while both ends keep the session
+  established, and every packet sent on it then failed with "no route to
+  destination" and was dropped: lookups were only started for destinations
+  without a session. The session stayed dark until the idle timeout removed it
+  90 s later, and the fresh session after that found the destination in
+  milliseconds. A send on an established session that finds no next hop, from
+  the TUN or the native datagram API, now starts a lookup (deduplicated, so a
+  stream of failing sends starts one), re-caching the destination's identity
+  from the session first so the answer can be verified, and the existing
+  session carries on once the coordinates return.
 
 - Link quality estimates no longer freeze after a link rekey. Frames the peer
   sent on the old session just before it switched were counted into the new
