@@ -697,6 +697,16 @@ with v0.5.x or earlier peers.
 
 ### Deprecated
 
+#### Library surface and internals
+
+- The type `FipsAddress`, at `fips::FipsAddress` and
+  `fips::identity::FipsAddress`, is renamed to `Ipv6Address`, following the
+  crate's casing for acronyms. The old name stays at both paths as a
+  deprecated alias, so code written against it still builds, with a
+  deprecation warning. The type's `Debug` output now reads
+  `Ipv6Address(...)`. Its methods, its `Display` output, the control socket
+  and the wire are unchanged.
+
 #### Sessions and rekey
 
 - Setting `node.rekey.enabled: false`. The disabled path is less tested and is

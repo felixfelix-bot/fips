@@ -547,7 +547,7 @@ pub struct Node {
     // === Routing ===
     /// Address -> coordinates cache (from session setup and discovery).
     coord_cache: CoordCache,
-    /// Per-destination path MTU lookup, keyed by FipsAddress (mirrors
+    /// Per-destination path MTU lookup, keyed by Ipv6Address (mirrors
     /// `coord_cache.entries[*].path_mtu`). Sync read-only access from
     /// the TUN reader/writer threads at TCP MSS clamp time so the
     /// SYN/SYN-ACK clamp can use the smaller of the local-egress floor
@@ -579,7 +579,7 @@ pub struct Node {
     /// describes: `path_mtu_lookup_release` drops both together, and peer
     /// removal is one of its callers, so a peer that never comes back leaves
     /// nothing behind.
-    path_mtu_seeded_by: Arc<std::sync::RwLock<HashMap<crate::FipsAddress, TransportId>>>,
+    path_mtu_seeded_by: Arc<std::sync::RwLock<HashMap<crate::Ipv6Address, TransportId>>>,
     /// The embedder's wake-up for the medium-change detector, handed out by
     /// [`Node::netmon_trigger`] and into the detector at `start()`. Always
     /// allocated so the trigger works whenever it is fetched.
@@ -666,7 +666,7 @@ pub struct Node {
     sessions: HashMap<NodeAddr, SessionEntry>,
 
     // === Identity Cache ===
-    /// Maps FipsAddress prefix bytes (bytes 1-15) to (NodeAddr, PublicKey).
+    /// Maps Ipv6Address prefix bytes (bytes 1-15) to (NodeAddr, PublicKey).
     /// Enables reverse lookup from IPv6 destination to session/routing identity.
     identity_cache: HashMap<[u8; 15], (NodeAddr, secp256k1::PublicKey, u64)>,
 
@@ -2465,7 +2465,7 @@ impl Node {
             .identity_cache_iter()
             .map(|(node_addr, pubkey, last_seen_ms)| {
                 let (xonly, _parity) = pubkey.x_only_public_key();
-                let fips_addr = crate::identity::FipsAddress::from_node_addr(node_addr);
+                let fips_addr = crate::identity::Ipv6Address::from_node_addr(node_addr);
                 snap::IdentityRow {
                     node_addr: *node_addr,
                     npub: crate::identity::encode_npub(&xonly),
@@ -3502,9 +3502,9 @@ impl Node {
         self.sessions.remove(remote)
     }
 
-    /// Read the path MTU stored for a destination FipsAddress.
+    /// Read the path MTU stored for a destination Ipv6Address.
     #[cfg(test)]
-    pub(crate) fn path_mtu_lookup_get(&self, fips_addr: &crate::FipsAddress) -> Option<u16> {
+    pub(crate) fn path_mtu_lookup_get(&self, fips_addr: &crate::Ipv6Address) -> Option<u16> {
         self.path_mtu_lookup
             .read()
             .ok()
@@ -3515,7 +3515,7 @@ impl Node {
     #[cfg(test)]
     pub(crate) fn path_mtu_lookup_entry(
         &self,
-        fips_addr: &crate::FipsAddress,
+        fips_addr: &crate::Ipv6Address,
     ) -> Option<crate::node::path_mtu::PathMtuEntry> {
         self.path_mtu_lookup
             .read()
@@ -3530,7 +3530,7 @@ impl Node {
     /// the mercy of the expiry pass. Use `path_mtu_lookup_learn` for the
     /// discovery-carrier shape.
     #[cfg(test)]
-    pub(crate) fn path_mtu_lookup_insert(&self, fips_addr: crate::FipsAddress, mtu: u16) {
+    pub(crate) fn path_mtu_lookup_insert(&self, fips_addr: crate::Ipv6Address, mtu: u16) {
         if let Ok(mut map) = self.path_mtu_lookup.write() {
             map.insert(fips_addr, crate::node::path_mtu::PathMtuEntry::held(mtu));
         }
@@ -3541,7 +3541,7 @@ impl Node {
     #[cfg(test)]
     pub(crate) fn path_mtu_lookup_learn(
         &self,
-        fips_addr: crate::FipsAddress,
+        fips_addr: crate::Ipv6Address,
         mtu: u16,
         at_ms: u64,
     ) {
@@ -3568,7 +3568,7 @@ impl Node {
     /// ceiling until its link re-handshakes.
     ///
     /// Three stores describe the same dead path, so this releases all of
-    /// them: the `FipsAddress`-keyed map the TCP MSS clamp reads, the record
+    /// them: the `Ipv6Address`-keyed map the TCP MSS clamp reads, the record
     /// of which transport last link-seeded that map, and the session's own
     /// source-side path MTU estimate.
     fn path_mtu_lookup_release(&mut self, addr: &NodeAddr) {
@@ -3593,7 +3593,7 @@ impl Node {
             mmp.path_mtu.reset_source_mtu();
         }
 
-        let fips_addr = crate::FipsAddress::from_node_addr(addr);
+        let fips_addr = crate::Ipv6Address::from_node_addr(addr);
         match self.path_mtu_lookup.write() {
             Ok(mut map) => {
                 if map.remove(&fips_addr).is_some() {
@@ -3653,7 +3653,7 @@ impl Node {
 
     // === Identity Cache ===
 
-    /// Register a node in the identity cache for FipsAddress → NodeAddr lookup.
+    /// Register a node in the identity cache for Ipv6Address → NodeAddr lookup.
     pub(crate) fn register_identity(&mut self, node_addr: NodeAddr, pubkey: secp256k1::PublicKey) {
         let mut prefix = [0u8; 15];
         prefix.copy_from_slice(&node_addr.as_bytes()[0..15]);
@@ -3672,7 +3672,7 @@ impl Node {
         }
     }
 
-    /// Look up a destination by FipsAddress prefix (bytes 1-15 of the IPv6 address).
+    /// Look up a destination by Ipv6Address prefix (bytes 1-15 of the IPv6 address).
     pub(crate) fn lookup_by_fips_prefix(
         &mut self,
         prefix: &[u8; 15],
@@ -4137,7 +4137,7 @@ impl Node {
     /// Going through the responder rather than resolving in the app is what
     /// keeps route warming working: answering a `<npub>.fips` query is what
     /// populates the node's identity cache with that peer's public key, and a
-    /// `FipsAddress` is a truncated hash — the pubkey cannot be recovered from
+    /// `Ipv6Address` is a truncated hash — the pubkey cannot be recovered from
     /// the IPv6 address alone. Without a cache entry the first packet to a
     /// freshly-resolved name is rejected with ICMPv6 "No route". Direct
     /// neighbours mask this, since their identity comes from the Noise
