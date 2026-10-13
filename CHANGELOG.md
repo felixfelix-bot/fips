@@ -920,6 +920,8 @@ with v0.5.x or earlier peers.
   the interface goes away between the presence check and the bind.
 - TCP connections try the remaining addresses for a hostname after a
   connection fails, within the existing overall connection timeout.
+- Repeated UDP receive errors now back off instead of spinning the receive
+  task and flooding logs. Normal retry timing resumes after a received packet.
 - An Ethernet peer's address is always shown as a colon-separated MAC address
   in `fipsctl show links` and in log lines. An address whose six bytes happened
   to be valid UTF-8 was printed as text instead.
