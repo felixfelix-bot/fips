@@ -183,6 +183,13 @@ Standalone cargo project (`ble_spike`) that validates the `bluer` API
 assumptions behind the `BleIo` trait against real adapters on two
 machines. Not a Docker harness.
 
+### [package-isolation/](package-isolation/) -- Package Build Isolation
+
+Builds two marked trees in the package build container, in turn and
+together, sharing a target volume, and checks that each package holds
+its own tree's code and revision. Run by hand when changing the package
+build; not part of `ci-local.sh` or GitHub CI.
+
 ## Running CI locally (`ci-local.sh`)
 
 [`ci-local.sh`](ci-local.sh) runs the full local CI pipeline — build,
@@ -204,6 +211,9 @@ profiling` pass; the musl
 leg exists because interface presence is built on `getifaddrs`/`ifa_flags`,
 which musl reimplements independently, and OpenWrt is a musl target. A local
 green run does not certify those four.
+GitHub's `core-baremetal` job also builds the `no_std` core for two
+bare-metal targets on every push; a local run does that only with
+`--baremetal` or `FIPS_CI_BAREMETAL=1`.
 
 The Linux and musl legs also create an address-less dummy interface
 (`fips-probe0`) and pass its name to the tests as

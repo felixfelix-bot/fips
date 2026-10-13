@@ -23,6 +23,8 @@ use rand::RngExt;
 use std::collections::HashSet;
 use thiserror::Error;
 
+pub use fips_core::utils::index::SessionIndex;
+
 /// Errors related to index allocation.
 #[derive(Debug, Error)]
 pub enum IndexError {
@@ -34,40 +36,6 @@ pub enum IndexError {
 
     #[error("index {0} already in use")]
     AlreadyInUse(u32),
-}
-
-/// A 32-bit session index.
-///
-/// Wrapper type for type safety and clarity in APIs.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
-pub struct SessionIndex(u32);
-
-impl SessionIndex {
-    /// Create from raw u32.
-    pub fn new(value: u32) -> Self {
-        Self(value)
-    }
-
-    /// Get the raw u32 value.
-    pub fn as_u32(&self) -> u32 {
-        self.0
-    }
-
-    /// Convert to little-endian bytes.
-    pub fn to_le_bytes(&self) -> [u8; 4] {
-        self.0.to_le_bytes()
-    }
-
-    /// Create from little-endian bytes.
-    pub fn from_le_bytes(bytes: [u8; 4]) -> Self {
-        Self(u32::from_le_bytes(bytes))
-    }
-}
-
-impl std::fmt::Display for SessionIndex {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{:08x}", self.0)
-    }
 }
 
 /// Allocator for session indices, node-global across every transport.
@@ -114,7 +82,7 @@ impl IndexAllocator {
             let candidate = rng.random::<u32>();
             if !self.in_use.contains(&candidate) {
                 self.in_use.insert(candidate);
-                return Ok(SessionIndex(candidate));
+                return Ok(SessionIndex::new(candidate));
             }
         }
 
@@ -125,16 +93,16 @@ impl IndexAllocator {
     ///
     /// Returns error if the index was not allocated.
     pub fn free(&mut self, index: SessionIndex) -> Result<(), IndexError> {
-        if self.in_use.remove(&index.0) {
+        if self.in_use.remove(&index.as_u32()) {
             Ok(())
         } else {
-            Err(IndexError::NotFound(index.0))
+            Err(IndexError::NotFound(index.as_u32()))
         }
     }
 
     /// Check if an index is currently allocated.
     pub fn is_allocated(&self, index: SessionIndex) -> bool {
-        self.in_use.contains(&index.0)
+        self.in_use.contains(&index.as_u32())
     }
 
     /// Number of currently allocated indices.
@@ -151,10 +119,10 @@ impl IndexAllocator {
     ///
     /// Returns error if the index is already in use.
     pub fn reserve(&mut self, index: SessionIndex) -> Result<(), IndexError> {
-        if self.in_use.contains(&index.0) {
-            Err(IndexError::AlreadyInUse(index.0))
+        if self.in_use.contains(&index.as_u32()) {
+            Err(IndexError::AlreadyInUse(index.as_u32()))
         } else {
-            self.in_use.insert(index.0);
+            self.in_use.insert(index.as_u32());
             Ok(())
         }
     }
@@ -172,116 +140,5 @@ impl Default for IndexAllocator {
 }
 
 #[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn test_session_index_roundtrip() {
-        let idx = SessionIndex::new(0x12345678);
-        assert_eq!(idx.as_u32(), 0x12345678);
-
-        let bytes = idx.to_le_bytes();
-        assert_eq!(bytes, [0x78, 0x56, 0x34, 0x12]);
-
-        let restored = SessionIndex::from_le_bytes(bytes);
-        assert_eq!(restored, idx);
-    }
-
-    #[test]
-    fn test_session_index_display() {
-        let idx = SessionIndex::new(0x000000ff);
-        assert_eq!(format!("{}", idx), "000000ff");
-
-        let idx = SessionIndex::new(0xdeadbeef);
-        assert_eq!(format!("{}", idx), "deadbeef");
-    }
-
-    #[test]
-    fn test_allocator_basic() {
-        let mut alloc = IndexAllocator::new();
-        assert!(alloc.is_empty());
-        assert_eq!(alloc.count(), 0);
-
-        let idx1 = alloc.allocate().unwrap();
-        assert!(!alloc.is_empty());
-        assert_eq!(alloc.count(), 1);
-        assert!(alloc.is_allocated(idx1));
-
-        let idx2 = alloc.allocate().unwrap();
-        assert_eq!(alloc.count(), 2);
-        assert!(alloc.is_allocated(idx2));
-        assert_ne!(idx1, idx2);
-
-        alloc.free(idx1).unwrap();
-        assert_eq!(alloc.count(), 1);
-        assert!(!alloc.is_allocated(idx1));
-        assert!(alloc.is_allocated(idx2));
-    }
-
-    #[test]
-    fn test_allocator_free_not_found() {
-        let mut alloc = IndexAllocator::new();
-        let result = alloc.free(SessionIndex::new(12345));
-        assert!(matches!(result, Err(IndexError::NotFound(12345))));
-    }
-
-    #[test]
-    fn test_allocator_reserve() {
-        let mut alloc = IndexAllocator::new();
-
-        let idx = SessionIndex::new(0xdeadbeef);
-        alloc.reserve(idx).unwrap();
-        assert!(alloc.is_allocated(idx));
-
-        // Double reserve fails
-        let result = alloc.reserve(idx);
-        assert!(matches!(result, Err(IndexError::AlreadyInUse(0xdeadbeef))));
-    }
-
-    #[test]
-    fn test_allocator_uniqueness() {
-        let mut alloc = IndexAllocator::new();
-        let mut indices = Vec::new();
-
-        // Allocate 1000 indices and verify all unique
-        for _ in 0..1000 {
-            let idx = alloc.allocate().unwrap();
-            assert!(!indices.contains(&idx));
-            indices.push(idx);
-        }
-
-        assert_eq!(alloc.count(), 1000);
-    }
-
-    #[test]
-    fn test_allocator_clear() {
-        let mut alloc = IndexAllocator::new();
-
-        for _ in 0..10 {
-            alloc.allocate().unwrap();
-        }
-        assert_eq!(alloc.count(), 10);
-
-        alloc.clear();
-        assert!(alloc.is_empty());
-        assert_eq!(alloc.count(), 0);
-    }
-
-    #[test]
-    fn test_allocator_reuse_after_free() {
-        let mut alloc = IndexAllocator::new();
-
-        let idx = alloc.allocate().unwrap();
-        alloc.free(idx).unwrap();
-
-        // The specific index might not be reused immediately (random),
-        // but the count should allow allocation
-        let idx2 = alloc.allocate().unwrap();
-        assert_eq!(alloc.count(), 1);
-
-        // Can now reserve the original index if it wasn't randomly reused
-        if idx != idx2 {
-            alloc.reserve(idx).unwrap();
-        }
-    }
-}
+#[path = "tests/index.rs"]
+mod tests;

@@ -11,6 +11,15 @@ readme = "README.md"
 keywords = ["mesh", "p2p", "decentralized", "overlay-network", "nostr"]
 categories = ["network-programming", "command-line-utilities", "cryptography"]
 
+# The root package stays first, and its version line stays the first `version`
+# key in this file: the packaging scripts and workflows read the release
+# version from it. `default-members` makes the bare `cargo build`, `cargo
+# clippy` and `cargo test` cover the core crate too; without it they cover the
+# root package only.
+[workspace]
+members = [".", "core"]
+default-members = [".", "core"]
+
 [features]
 default = []
 # Tick-body profiler (`src/instr`). Off by default: enabling it edits 26 call
@@ -29,12 +38,10 @@ sha2 = { version = "0.11", features = ["zeroize"] }
 hkdf = "0.13"
 hmac = { version = "0.13", features = ["zeroize"] }
 ring = "0.17"
-libm = "0.2"
 zeroize = { version = "1.9", features = ["zeroize_derive"] }
 rand = "0.10.1"
 crossbeam-channel = "0.5"
 thiserror = "2.0"
-bech32 = "0.12"
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 serde_yaml = "0.9"
@@ -60,6 +67,7 @@ portable-atomic = { version = "1", features = ["std"] }
 nostr = { version = "0.44", features = ["std", "nip59"] }
 nostr-sdk = "0.44"
 arc-swap = "1"
+fips-core = { path = "core" }
 
 [target.'cfg(unix)'.dependencies]
 tun = { version = "0.8.7", features = ["async"] }
@@ -135,6 +143,10 @@ assets = [
 conf-files = ["/etc/fips/hosts", "/etc/fips/fips.nft"]
 
 [dev-dependencies]
+# The protocol modules' test hooks, which this crate's tests call. Enabled
+# here only, so they are compiled into a build that includes tests, examples
+# or benches, where dev-dependency features apply, and into no other build.
+fips-core = { path = "core", features = ["test-hooks"] }
 tempfile = "3.15"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 tokio = { version = "1", features = ["test-util"] }
@@ -159,4 +171,9 @@ harness = false
 [[bench]]
 name = "transport_addr_clone"
 path = "benches/transport_addr_clone.rs"
+harness = false
+
+[[bench]]
+name = "coord_cache"
+path = "benches/coord_cache.rs"
 harness = false

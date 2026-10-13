@@ -1,0 +1,353 @@
+//! Plain, `no_std`+`alloc`-clean transport primitives.
+//!
+//! The identifier/address/statistics value types shared across the transport
+//! layer, defined free of any `std` dependency so the sans-IO protocol cores
+//! (e.g. `proto::fmp`) can name them without pulling in `std`.
+//! `TransportAddr::from_socket_addr` formats through `core::fmt` into a stack
+//! buffer; the `std`-requiring helpers (socket-address resolution,
+//! `local_addr`) stay in the root crate's `transport` module. Re-exported by
+//! name from this crate's `transport` module and from the root crate's
+//! `fips::transport`, so `crate::transport::{LinkId, ...}` imports resolve in
+//! both crates.
+
+use alloc::{string::String, sync::Arc, vec::Vec};
+use core::fmt;
+use core::time::Duration;
+
+// ============================================================================
+// Transport Identifiers
+// ============================================================================
+
+/// Unique identifier for a transport instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct TransportId(u32);
+
+impl TransportId {
+    /// Create a new transport ID.
+    pub fn new(id: u32) -> Self {
+        Self(id)
+    }
+
+    /// Get the raw ID value.
+    pub fn as_u32(&self) -> u32 {
+        self.0
+    }
+}
+
+impl fmt::Display for TransportId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "transport:{}", self.0)
+    }
+}
+
+/// Unique identifier for a link instance.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub struct LinkId(u64);
+
+impl LinkId {
+    /// Create a new link ID.
+    pub fn new(id: u64) -> Self {
+        Self(id)
+    }
+
+    /// Get the raw ID value.
+    pub fn as_u64(&self) -> u64 {
+        self.0
+    }
+}
+
+impl fmt::Display for LinkId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "link:{}", self.0)
+    }
+}
+
+// ============================================================================
+// Link Direction
+// ============================================================================
+
+/// Direction of link establishment.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum LinkDirection {
+    /// We initiated the connection.
+    Outbound,
+    /// They initiated the connection.
+    Inbound,
+}
+
+impl fmt::Display for LinkDirection {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let s = match self {
+            LinkDirection::Outbound => "outbound",
+            LinkDirection::Inbound => "inbound",
+        };
+        write!(f, "{}", s)
+    }
+}
+
+// ============================================================================
+// Transport Address
+// ============================================================================
+
+/// Opaque transport-specific address.
+///
+/// Each transport type interprets this differently:
+/// - UDP/TCP: "host:port" (IP address or DNS hostname)
+/// - Ethernet: MAC address (6 bytes), built with [`TransportAddr::from_mac`]
+///   so it always displays as a MAC, whatever its bytes decode as
+///
+/// The immutable bytes are shared across clones.
+#[derive(Clone)]
+pub struct TransportAddr {
+    bytes: Arc<[u8]>,
+    /// Set only by [`TransportAddr::from_mac`]: the bytes are a MAC address
+    /// and always display as one. Not part of equality or hashing.
+    mac: bool,
+}
+
+impl PartialEq for TransportAddr {
+    fn eq(&self, other: &Self) -> bool {
+        self.bytes == other.bytes
+    }
+}
+
+impl Eq for TransportAddr {}
+
+impl core::hash::Hash for TransportAddr {
+    fn hash<H: core::hash::Hasher>(&self, state: &mut H) {
+        self.bytes.hash(state);
+    }
+}
+
+impl TransportAddr {
+    /// Create a transport address from raw bytes.
+    ///
+    /// Copies the bytes into shared storage; the vector's allocation is not
+    /// reused. Prefer [`Self::from_bytes`] when a byte slice is already available.
+    pub fn new(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes: bytes.into(),
+            mac: false,
+        }
+    }
+
+    /// Create a transport address from a byte slice.
+    pub fn from_bytes(bytes: &[u8]) -> Self {
+        Self {
+            bytes: Arc::from(bytes),
+            mac: false,
+        }
+    }
+
+    /// Create an Ethernet transport address from a MAC address.
+    pub fn from_mac(mac: [u8; 6]) -> Self {
+        Self {
+            bytes: Arc::from(&mac[..]),
+            mac: true,
+        }
+    }
+
+    /// Create a transport address from a string.
+    pub fn from_string(s: &str) -> Self {
+        Self::from_bytes(s.as_bytes())
+    }
+
+    /// Get the raw bytes.
+    pub fn as_bytes(&self) -> &[u8] {
+        &self.bytes
+    }
+
+    /// Try to interpret as a UTF-8 string.
+    pub fn as_str(&self) -> Option<&str> {
+        core::str::from_utf8(&self.bytes).ok()
+    }
+
+    /// Get the length in bytes.
+    pub fn len(&self) -> usize {
+        self.bytes.len()
+    }
+
+    /// Check if empty.
+    pub fn is_empty(&self) -> bool {
+        self.bytes.is_empty()
+    }
+}
+
+impl TransportAddr {
+    /// Create a UDP/TCP transport address directly from a socket address.
+    pub fn from_socket_addr(addr: core::net::SocketAddr) -> Self {
+        use core::fmt::Write;
+        // The longest form is 58 bytes: [39-byte IPv6%10-digit scope]:65535.
+        let mut buf = [0u8; 64];
+        let mut out = SliceWriter {
+            buf: &mut buf,
+            len: 0,
+        };
+        write!(out, "{addr}").expect("64 bytes is enough for any SocketAddr");
+        let len = out.len;
+        Self::from_bytes(&buf[..len])
+    }
+}
+
+/// Formats into a fixed byte buffer, failing once it is full.
+struct SliceWriter<'a> {
+    buf: &'a mut [u8],
+    len: usize,
+}
+
+impl fmt::Write for SliceWriter<'_> {
+    /// Append `s`, or fail without writing if it does not fit.
+    fn write_str(&mut self, s: &str) -> fmt::Result {
+        let end = self.len.checked_add(s.len()).ok_or(fmt::Error)?;
+        let dst = self.buf.get_mut(self.len..end).ok_or(fmt::Error)?;
+        dst.copy_from_slice(s.as_bytes());
+        self.len = end;
+        Ok(())
+    }
+}
+
+impl TransportAddr {
+    /// Write the bytes as a colon-separated MAC address.
+    fn write_mac(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        for (i, byte) in self.bytes.iter().enumerate() {
+            if i > 0 {
+                write!(f, ":")?;
+            }
+            write!(f, "{:02x}", byte)?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Debug for TransportAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        if self.mac {
+            write!(f, "TransportAddr(")?;
+            self.write_mac(f)?;
+            return write!(f, ")");
+        }
+        match self.as_str() {
+            Some(s) => write!(f, "TransportAddr(\"{}\")", s),
+            None => write!(f, "TransportAddr({:?})", self.bytes),
+        }
+    }
+}
+
+impl fmt::Display for TransportAddr {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // An Ethernet address is a MAC whatever its bytes decode as. Any
+        // other address displays as a string if it is valid UTF-8; otherwise
+        // a 6-byte payload is rendered as a colon-separated MAC and any other
+        // byte string as bare hex.
+        if self.mac {
+            return self.write_mac(f);
+        }
+        match self.as_str() {
+            Some(s) => write!(f, "{}", s),
+            None if self.bytes.len() == 6 => self.write_mac(f),
+            None => {
+                for byte in self.bytes.iter() {
+                    write!(f, "{:02x}", byte)?;
+                }
+                Ok(())
+            }
+        }
+    }
+}
+
+impl From<&str> for TransportAddr {
+    fn from(s: &str) -> Self {
+        Self::from_string(s)
+    }
+}
+
+impl From<String> for TransportAddr {
+    fn from(s: String) -> Self {
+        Self::from_string(&s)
+    }
+}
+
+// ============================================================================
+// Link Statistics
+// ============================================================================
+
+/// Statistics for a link.
+#[derive(Clone, Debug, Default)]
+pub struct LinkStats {
+    /// Total packets sent.
+    pub packets_sent: u64,
+    /// Total packets received.
+    pub packets_recv: u64,
+    /// Total bytes sent.
+    pub bytes_sent: u64,
+    /// Total bytes received.
+    pub bytes_recv: u64,
+    /// Timestamp of last received packet (Unix milliseconds).
+    pub last_recv_ms: u64,
+    /// Estimated round-trip time in milliseconds (0 = no estimate yet).
+    rtt_estimate: u64,
+    /// Observed packet loss rate (0.0-1.0).
+    pub loss_rate: f32,
+    /// Estimated throughput in bytes/second.
+    pub throughput_estimate: u64,
+}
+
+impl LinkStats {
+    /// Create new link statistics.
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Record a sent packet.
+    pub fn record_sent(&mut self, bytes: usize) {
+        self.packets_sent += 1;
+        self.bytes_sent += bytes as u64;
+    }
+
+    /// Record a received packet.
+    pub fn record_recv(&mut self, bytes: usize, timestamp_ms: u64) {
+        self.packets_recv += 1;
+        self.bytes_recv += bytes as u64;
+        self.last_recv_ms = timestamp_ms;
+    }
+
+    /// Get the RTT estimate, if available.
+    pub fn rtt_estimate(&self) -> Option<Duration> {
+        if self.rtt_estimate == 0 {
+            None
+        } else {
+            Some(Duration::from_millis(self.rtt_estimate))
+        }
+    }
+
+    /// Update RTT estimate from a probe response.
+    ///
+    /// Uses exponential moving average with alpha=0.2.
+    pub fn update_rtt(&mut self, rtt: Duration) {
+        let rtt_ms = rtt.as_millis() as u64;
+        if self.rtt_estimate == 0 {
+            self.rtt_estimate = rtt_ms;
+        } else {
+            let alpha = 0.2;
+            self.rtt_estimate =
+                (alpha * rtt_ms as f64 + (1.0 - alpha) * self.rtt_estimate as f64) as u64;
+        }
+    }
+
+    /// Time since last receive (for keepalive/timeout).
+    pub fn time_since_recv(&self, current_time_ms: u64) -> u64 {
+        if self.last_recv_ms == 0 {
+            return u64::MAX;
+        }
+        current_time_ms.saturating_sub(self.last_recv_ms)
+    }
+
+    /// Reset all statistics.
+    pub fn reset(&mut self) {
+        *self = Self::default();
+    }
+}
+
+#[cfg(test)]
+#[path = "tests/types.rs"]
+mod tests;

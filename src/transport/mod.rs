@@ -69,8 +69,7 @@ pub(crate) mod stream;
 mod stats_common;
 pub(crate) use stats_common::PoolCounters;
 
-mod types;
-pub use types::*;
+pub use fips_core::transport::{LinkDirection, LinkId, LinkStats, TransportAddr, TransportId};
 
 // ============================================================================
 // Packet Channel Types
@@ -483,23 +482,6 @@ impl fmt::Display for LinkState {
             LinkState::Failed => "failed",
         };
         write!(f, "{}", s)
-    }
-}
-
-// ============================================================================
-// Transport Address (std-bound helper; the plain type lives in `types`)
-// ============================================================================
-
-impl TransportAddr {
-    /// Create a UDP/TCP transport address directly from a socket address.
-    pub fn from_socket_addr(addr: std::net::SocketAddr) -> Self {
-        use std::io::Write;
-        // The longest form is 58 bytes: [39-byte IPv6%10-digit scope]:65535.
-        let mut buf = [0u8; 64];
-        let mut cursor = &mut buf[..];
-        write!(&mut cursor, "{addr}").expect("64 bytes is enough for any SocketAddr");
-        let len = 64 - cursor.len();
-        Self::from_bytes(&buf[..len])
     }
 }
 

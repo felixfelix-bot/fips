@@ -1,0 +1,203 @@
+//! Local node identity with signing capability.
+
+use alloc::string::String;
+use core::fmt;
+use core::marker::PhantomData;
+
+use crate::entropy::EntropySource;
+use secp256k1::{Keypair, PublicKey, SecretKey, XOnlyPublicKey};
+use zeroize::Zeroize;
+
+use super::auth::{AuthResponse, auth_challenge_digest};
+use super::{IdentityError, Ipv6Address, NodeAddr, decode_secret, encode_npub, sha256};
+
+/// A FIPS node identity consisting of a keypair and derived identifiers.
+///
+/// The identity holds the secp256k1 keypair and provides methods for signing
+/// and verifying protocol messages.
+///
+/// The keypair is the node's long-term private key. It is erased when the
+/// identity is dropped, and every constructor below erases the intermediate
+/// secret it built the identity from. All of that clears the copies this
+/// crate owns, not every copy that ever existed. Each erase is a volatile
+/// write, so the optimiser keeps it, but it reaches only the place it is
+/// called on: a copy made before it runs is not cleared, and that includes
+/// the bytes a move leaves behind wherever the value used to be, such as
+/// the frame of the constructor that built it. `from_secret_str` is a known
+/// case: it leaves copies of the private key, a whole intermediate
+/// `Identity` among them, in its own frame.
+///
+/// `E` is the host's random source, used by `generate` and by signing.
+#[derive(Clone)]
+pub struct Identity<E> {
+    keypair: Keypair,
+    node_addr: NodeAddr,
+    address: Ipv6Address,
+    entropy: PhantomData<fn() -> E>,
+}
+
+impl<E: EntropySource> Identity<E> {
+    /// Create a new random identity.
+    pub fn generate() -> Self {
+        let mut secret_bytes = [0u8; 32];
+        E::fill(&mut secret_bytes);
+        let mut secret_key =
+            SecretKey::from_slice(&secret_bytes).expect("32 random bytes is a valid secret key");
+        let identity = Self::from_secret_key(secret_key);
+        secret_bytes.zeroize();
+        secret_key.non_secure_erase();
+        identity
+    }
+
+    /// Create an identity from an existing keypair.
+    pub fn from_keypair(mut keypair: Keypair) -> Self {
+        let (pubkey, _parity) = keypair.x_only_public_key();
+        let node_addr = NodeAddr::from_pubkey(&pubkey);
+        let address = Ipv6Address::from_node_addr(&node_addr);
+        let identity = Self {
+            keypair,
+            node_addr,
+            address,
+            entropy: PhantomData,
+        };
+        keypair.non_secure_erase();
+        identity
+    }
+
+    /// Create an identity from a secret key.
+    pub fn from_secret_key(mut secret_key: SecretKey) -> Self {
+        let mut keypair = Keypair::from_secret_key(super::secp(), &secret_key);
+        let identity = Self::from_keypair(keypair);
+        keypair.non_secure_erase();
+        secret_key.non_secure_erase();
+        identity
+    }
+
+    /// Create an identity from secret key bytes.
+    pub fn from_secret_bytes(bytes: &[u8; 32]) -> Result<Self, IdentityError> {
+        let mut secret_key = SecretKey::from_slice(bytes)?;
+        let identity = Self::from_secret_key(secret_key);
+        secret_key.non_secure_erase();
+        Ok(identity)
+    }
+
+    /// Create an identity from an nsec string (bech32) or hex-encoded secret.
+    pub fn from_secret_str(s: &str) -> Result<Self, IdentityError> {
+        let mut secret_key = decode_secret(s)?;
+        let identity = Self::from_secret_key(secret_key);
+        secret_key.non_secure_erase();
+        Ok(identity)
+    }
+
+    /// Return the underlying keypair.
+    ///
+    /// This is needed for cryptographic operations like Noise handshakes.
+    pub fn keypair(&self) -> Keypair {
+        self.keypair
+    }
+
+    /// Return the x-only public key.
+    pub fn pubkey(&self) -> XOnlyPublicKey {
+        self.keypair.x_only_public_key().0
+    }
+
+    /// Return the full public key (includes parity).
+    pub fn pubkey_full(&self) -> PublicKey {
+        self.keypair.public_key()
+    }
+
+    /// Return the public key as a bech32-encoded npub string (NIP-19).
+    pub fn npub(&self) -> String {
+        encode_npub(&self.pubkey())
+    }
+
+    /// Return the node ID.
+    pub fn node_addr(&self) -> &NodeAddr {
+        &self.node_addr
+    }
+
+    /// Return the IPv6 address.
+    pub fn address(&self) -> &Ipv6Address {
+        &self.address
+    }
+
+    /// Sign arbitrary data with this identity's secret key.
+    ///
+    /// BIP-340 auxiliary randomness: 32 bytes from `E`.
+    pub fn sign(&self, data: &[u8]) -> secp256k1::schnorr::Signature {
+        let digest = sha256(data);
+        let mut aux = [0u8; 32];
+        E::fill(&mut aux);
+        super::secp().sign_schnorr_with_aux_rand(&digest, &self.keypair, &aux)
+    }
+
+    /// Create an authentication response for a challenge.
+    ///
+    /// The response signs: SHA256("fips-auth-v1" || challenge || timestamp)
+    pub fn sign_challenge(&self, challenge: &[u8; 32], timestamp: u64) -> AuthResponse {
+        let digest = auth_challenge_digest(challenge, timestamp);
+        let mut aux = [0u8; 32];
+        E::fill(&mut aux);
+        let signature = super::secp().sign_schnorr_with_aux_rand(&digest, &self.keypair, &aux);
+        AuthResponse {
+            pubkey: self.pubkey(),
+            timestamp,
+            signature,
+        }
+    }
+}
+
+impl<E> Drop for Identity<E> {
+    /// Erase the long-term private key this identity owns.
+    ///
+    /// `Keypair` is `Copy` and so cannot clear itself on drop; `Identity` is
+    /// not, so it does it for the copy it holds. See the type's own
+    /// documentation for what that does and does not reach.
+    fn drop(&mut self) {
+        self.keypair.non_secure_erase();
+    }
+}
+
+/// Erases a `Keypair` in place when it goes out of scope.
+///
+/// `Keypair` is `Copy` and so cannot clear itself on drop. A frame that holds
+/// a copy of the node's long-term private key across several exit paths —
+/// early error returns, `?`, a normal return — would otherwise need an erase
+/// written at each one, and a missed path is invisible. Guarding the copy
+/// makes the clearing structural.
+///
+/// The guard borrows the keypair rather than holding one, so making it and
+/// moving it copy no key bytes: the erase lands on the caller's own binding,
+/// wherever that lies, and there is no second copy for an early return to
+/// leave behind. It clears that one binding, not every copy that ever
+/// existed. The erase is a volatile write, so the optimiser keeps it, but a
+/// copy made before the guard existed, or taken out through
+/// [`ErasingKeypair::get`], is not cleared by it.
+pub struct ErasingKeypair<'a>(&'a mut Keypair);
+
+impl<'a> ErasingKeypair<'a> {
+    /// Guard `source` so it is erased where it lies when the guard drops.
+    pub fn new(source: &'a mut Keypair) -> Self {
+        Self(source)
+    }
+
+    /// Borrow the guarded keypair.
+    pub fn get(&self) -> &Keypair {
+        self.0
+    }
+}
+
+impl Drop for ErasingKeypair<'_> {
+    fn drop(&mut self) {
+        self.0.non_secure_erase();
+    }
+}
+
+impl<E> fmt::Debug for Identity<E> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Identity")
+            .field("node_addr", &self.node_addr)
+            .field("address", &self.address)
+            .finish_non_exhaustive()
+    }
+}

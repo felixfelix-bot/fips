@@ -1,0 +1,58 @@
+[package]
+name = "fips-core"
+# Versioned with the workspace's root package: this crate is not published on
+# its own, and its version here is never bumped. Release version bumps edit the
+# root Cargo.toml only.
+version = "0.0.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[dependencies]
+# `alloc` only on secp256k1, bech32 and hex: their `std` features would link
+# `std`, which the bare-metal build (testing/build-core-baremetal.sh) rejects.
+# Without `rand`, `Secp256k1::new()` does not blind the context; the host
+# blinds it through `identity::init_secp`.
+secp256k1 = { version = "0.30", default-features = false, features = ["alloc"] }
+bech32 = { version = "0.12", default-features = false, features = ["alloc"] }
+hex = { version = "0.4", default-features = false, features = ["alloc"] }
+
+# Left without `zeroize`: only public keys and data to be signed or verified
+# pass through the hasher here.
+sha2 = { version = "0.11", default-features = false }
+# `alloc` for the `Zeroizing<Vec<u8>>` guards in the secret key decoding.
+zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+thiserror = { version = "2.0", default-features = false }
+once_cell = { version = "1.21", default-features = false, features = ["race", "alloc"] }
+# `MmpMode` derives Serialize and Deserialize for the node configuration.
+# Builds without `std` or `alloc`.
+serde = { version = "1.0", default-features = false, features = ["derive"] }
+# `log` for the bloom false-positive estimate: `core` has no float logarithm.
+# Default features (`arch`) as the root crate had them, so the implementation
+# the estimate uses does not change.
+libm = "0.2"
+# The hash map for peer-chosen keys (`utils::hash`): `hashbrown`'s table with a
+# SipHash-1-3 hasher keyed from the host, as `std`'s `HashMap` is built. No
+# default hasher: `foldhash` is not keyed on targets without address-space
+# randomization.
+hashbrown = { version = "0.16", default-features = false }
+siphasher = { version = "1.0", default-features = false }
+
+[features]
+# Test hooks in `proto`: methods and re-exports that only unit tests use to
+# set up or inspect state. This crate's tests see them through `cfg(test)`;
+# the root crate's tests see them because the root enables this feature from
+# its `[dev-dependencies]` only. Never enable it outside tests.
+test-hooks = []
+
+[dev-dependencies]
+# Host-only test dependencies; tests may use `std`.
+# Random keys for the test fixtures (`testutil::make_keypair`, the lookup tests).
+rand = "0.10.1"
+# `sign_schnorr` for the protocol tests' signing fixtures, which secp256k1
+# provides only with `rand` and `std`. Tests only: the library stays on
+# `alloc`.
+secp256k1 = { version = "0.30", default-features = false, features = ["rand", "std"] }
+# `MmpMode`'s configuration spelling, checked with the parser the node
+# configuration uses.
+serde_yaml = "0.9"

@@ -9,6 +9,13 @@
 #   --test-only          Only run unit tests (skip build, skip integration)
 #   --skip-integration   Skip integration tests
 #   --skip-chaos         Skip chaos scenarios
+#   --baremetal          Also build fips-core for two targets with no standard
+#                        library in the build stage
+#                        (testing/build-core-baremetal.sh). Off by default: it
+#                        needs the two bare-metal rustup targets, clang and
+#                        llvm-ar. When asked for, a missing prerequisite fails
+#                        the run. FIPS_CI_BAREMETAL=1 in the environment turns
+#                        it on too. GitHub CI runs it on every push.
 #   --with-tor           Include Tor harnesses (off by default — needs live Tor)
 #   --only <suite>       Run a single integration suite
 #   -j, --jobs <N>       Max parallel chaos scenarios (default: 4)
@@ -78,15 +85,15 @@
 #                    Retired from CI 2026-07-24 as redundant, not unrunnable.
 #                    The rekey timing/choreography decision (trigger, K-bit
 #                    cutover, drain, jitter, guards) is covered by the sans-IO
-#                    poll_rekey tests (src/proto/fsp/tests/core.rs,
-#                    src/proto/fmp/tests/core.rs); the data-plane continuity
+#                    poll_rekey tests (core/src/proto/fsp/tests/core.rs,
+#                    core/src/proto/fmp/tests/core.rs); the data-plane continuity
 #                    across a real cutover by rekey_cutover_preserves_data_plane
 #                    (src/node/tests/session.rs, a real XX rekey over loopback,
 #                    the responder classifying it from the msg3 rekey marker);
 #                    the accept-off dual-init regression and the
 #                    udp.outbound_only rekey loop by the should_admit_msg1 tests
 #                    (src/node/tests/handshake.rs) and the establish_inbound /
-#                    establish_outbound decision tests (src/proto/fmp/tests/core.rs,
+#                    establish_outbound decision tests (core/src/proto/fmp/tests/core.rs,
 #                    src/peer/machine.rs). Still runnable by hand:
 #                    bash testing/static/scripts/rekey-test.sh
 #   mixed-profile    Retired from CI 2026-07-25 as redundant, not unrunnable.
@@ -171,6 +178,7 @@ BUILD_ONLY=false
 TEST_ONLY=false
 SKIP_INTEGRATION=false
 SKIP_CHAOS=false
+BAREMETAL=false
 WITH_TOR=false
 ONLY_SUITE=""
 
@@ -326,12 +334,19 @@ usage() {
 
 # ── Parse arguments ────────────────────────────────────────────────────────
 
+# The environment switch is for runners that cannot pass --baremetal, such as
+# the internal builder, which runs this script unchanged on every trunk.
+if [[ "${FIPS_CI_BAREMETAL:-}" == 1 ]]; then
+    BAREMETAL=true
+fi
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
         --build-only)       BUILD_ONLY=true; shift ;;
         --test-only)        TEST_ONLY=true; shift ;;
         --skip-integration) SKIP_INTEGRATION=true; shift ;;
         --skip-chaos)       SKIP_CHAOS=true; shift ;;
+        --baremetal)        BAREMETAL=true; shift ;;
         --with-tor)         WITH_TOR=true; shift ;;
         --only)             ONLY_SUITE="$2"; shift 2 ;;
         -j|--jobs)          PARALLEL_JOBS="$2"; shift 2 ;;
@@ -643,6 +658,50 @@ run_build() {
         return 1
     fi
 
+    # The no_std core fence. A workspace build unifies dependency features
+    # across members, so a feature the root crate enables can hide one the core
+    # needs and does not ask for. Linting the core alone resolves only its own
+    # features. Two passes, because a build that includes the core's tests also
+    # gives the library its dev-dependencies' features (secp256k1's rand and
+    # std): --lib lints the library with its [dependencies] features alone, and
+    # --all-targets type-checks the tests. Mirrored in .github/workflows/ci.yml;
+    # check-ci-parity.sh compares integration suites only and would not catch a
+    # stage added to one runner and not the other.
+    info "cargo clippy -p fips-core --lib -- -D warnings"
+    if cargo clippy -p fips-core --lib -- -D warnings 2>&1; then
+        record "core-fence-lib" 0
+    else
+        record "core-fence-lib" 1
+        return 1
+    fi
+
+    info "cargo clippy -p fips-core --all-targets -- -D warnings"
+    if cargo clippy -p fips-core --all-targets -- -D warnings 2>&1; then
+        record "core-fence" 0
+    else
+        record "core-fence" 1
+        return 1
+    fi
+
+    # The no_std core on targets with no standard library. The fence above
+    # runs on the host, where std exists, so a dependency that links it
+    # passes there; this build fails on it. The script holds the command,
+    # the targets and the C toolchain choice, so the GitHub job runs the same
+    # thing. Opt-in here (--baremetal or FIPS_CI_BAREMETAL=1), since it needs
+    # the two targets, clang and llvm-ar, and nothing is recorded when off; a
+    # landing or merge-up on a trunk path runs it explicitly. GitHub CI runs
+    # it on every push. check-ci-parity.sh compares integration suites only
+    # and would not catch a stage added to one runner and not the other.
+    if [[ "$BAREMETAL" == true ]]; then
+        info "testing/build-core-baremetal.sh (fips-core for thumbv7em-none-eabihf, riscv32imac-unknown-none-elf)"
+        if "$SCRIPT_DIR/build-core-baremetal.sh" 2>&1; then
+            record "core-baremetal" 0
+        else
+            record "core-baremetal" 1
+            return 1
+        fi
+    fi
+
     # Tick-body profiler: the feature-on tree must build too. Added alongside
     # the default-feature stages rather than replacing them. Mirrored in
     # .github/workflows/ci.yml — check-ci-parity.sh compares integration suites
@@ -693,6 +752,16 @@ run_tests() {
         else
             record "unit-tests" 1
         fi
+    fi
+
+    # The no_std core's tests under the core's own feature resolution, so a
+    # test whose result depends on a feature only the root crate enables runs
+    # at least once without it. Mirrored in .github/workflows/ci.yml.
+    info "cargo test -p fips-core"
+    if cargo test -p fips-core 2>&1; then
+        record "core-fence-tests" 0
+    else
+        record "core-fence-tests" 1
     fi
 
     # The `profiling` feature adds a module, a recorder and a writer thread that
@@ -1855,7 +1924,7 @@ run_shellcheck() {
 # built on it then passes for the wrong reason.
 run_log_strings() {
     local rc=0
-    info "[log-strings] Checking test log matchers against the strings src/ emits"
+    info "[log-strings] Checking test log matchers against the strings the crate sources emit"
     python3 "$SCRIPT_DIR/check-log-strings.py" || rc=$?
     record "log-strings" $rc
 }
