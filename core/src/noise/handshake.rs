@@ -3,11 +3,14 @@ use super::{
     HANDSHAKE_MSG3_SIZE, HandshakeProgress, HandshakeRole, NoiseError, NoisePattern, NoiseSession,
     PROTOCOL_NAME_XX, PUBKEY_SIZE,
 };
+use crate::entropy::EntropySource;
+use alloc::string::ToString;
+use alloc::vec::Vec;
+use core::fmt;
+use core::marker::PhantomData;
 use hkdf::Hkdf;
-use rand::Rng;
-use secp256k1::{Keypair, PublicKey, Secp256k1, SecretKey, ecdh::shared_secret_point};
+use secp256k1::{Keypair, PublicKey, SecretKey, ecdh::shared_secret_point};
 use sha2::{Digest, Sha256};
-use std::fmt;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Symmetric state during handshake.
@@ -143,7 +146,9 @@ pub struct Message2Rollback {
 }
 
 /// Handshake state for the Noise XX pattern.
-pub struct HandshakeState {
+///
+/// `E` is the host's random source, used for the ephemeral key.
+pub struct HandshakeState<E> {
     /// Which Noise pattern is being used.
     pattern: NoisePattern,
     /// Our role in the handshake.
@@ -162,20 +167,19 @@ pub struct HandshakeState {
     remote_static: Option<PublicKey>,
     /// Remote ephemeral public key (learned during handshake).
     remote_ephemeral: Option<PublicKey>,
-    /// Secp256k1 context.
-    secp: Secp256k1<secp256k1::All>,
+    /// The random source for the ephemeral key.
+    entropy: PhantomData<fn() -> E>,
     /// Our startup epoch for restart detection.
     local_epoch: Option<[u8; 8]>,
     /// Remote peer's startup epoch (learned during handshake).
     remote_epoch: Option<[u8; 8]>,
 }
 
-impl HandshakeState {
+impl<E: EntropySource> HandshakeState<E> {
     /// Create a new XX handshake as initiator.
     ///
     /// XX: neither side knows the other's static key. No pre-message.
     pub fn new_initiator(mut static_keypair: Keypair) -> Self {
-        let secp = Secp256k1::new();
         let state = Self {
             pattern: NoisePattern::Xx,
             role: HandshakeRole::Initiator,
@@ -185,7 +189,7 @@ impl HandshakeState {
             ephemeral_keypair: None,
             remote_static: None,
             remote_ephemeral: None,
-            secp,
+            entropy: PhantomData,
             local_epoch: None,
             remote_epoch: None,
         };
@@ -202,7 +206,6 @@ impl HandshakeState {
     ///
     /// XX: neither side knows the other's static key. No pre-message.
     pub fn new_responder(mut static_keypair: Keypair) -> Self {
-        let secp = Secp256k1::new();
         let state = Self {
             pattern: NoisePattern::Xx,
             role: HandshakeRole::Responder,
@@ -212,7 +215,7 @@ impl HandshakeState {
             ephemeral_keypair: None,
             remote_static: None,
             remote_ephemeral: None,
-            secp,
+            entropy: PhantomData,
             local_epoch: None,
             remote_epoch: None,
         };
@@ -257,13 +260,15 @@ impl HandshakeState {
 
     /// Generate ephemeral keypair.
     fn generate_ephemeral(&mut self) {
-        let mut rng = rand::rng();
         let mut secret_bytes = [0u8; 32];
-        rng.fill_bytes(&mut secret_bytes);
+        E::fill(&mut secret_bytes);
 
         let mut secret_key =
             SecretKey::from_slice(&secret_bytes).expect("32 random bytes is valid secret key");
-        self.ephemeral_keypair = Some(Keypair::from_secret_key(&self.secp, &secret_key));
+        self.ephemeral_keypair = Some(Keypair::from_secret_key(
+            crate::identity::secp(),
+            &secret_key,
+        ));
         secret_bytes.zeroize();
         // This clears the copy this frame owns, with a volatile write the
         // optimiser keeps; a copy made before it, such as one a call above
@@ -778,7 +783,7 @@ impl HandshakeState {
     }
 }
 
-impl Drop for HandshakeState {
+impl<E> Drop for HandshakeState<E> {
     /// Erase the two private keys this state holds.
     ///
     /// `static_keypair` is the node's long-term private key and
@@ -804,7 +809,7 @@ impl Drop for HandshakeState {
     }
 }
 
-impl fmt::Debug for HandshakeState {
+impl<E> fmt::Debug for HandshakeState<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HandshakeState")
             .field("pattern", &self.pattern)

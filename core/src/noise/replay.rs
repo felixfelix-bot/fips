@@ -1,5 +1,5 @@
 use super::REPLAY_WINDOW_SIZE;
-use std::fmt;
+use core::fmt;
 
 /// Sliding window for replay protection.
 ///
@@ -30,6 +30,7 @@ impl ReplayWindow {
     ///
     /// Returns true if the counter is acceptable, false if it should be rejected.
     /// Does NOT update the window - call `accept` after successful decryption.
+    #[inline]
     pub fn check(&self, counter: u64) -> bool {
         // The send side refuses to emit u64::MAX (`CipherState::advance_nonce`,
         // `NoiseSession::take_send_counter`), so no conforming peer produces it.
@@ -61,6 +62,7 @@ impl ReplayWindow {
     ///
     /// Call this only after successful decryption to prevent
     /// DoS attacks that exhaust the window.
+    #[inline]
     pub fn accept(&mut self, counter: u64) {
         if counter > self.highest {
             // Shift the window
@@ -119,6 +121,7 @@ impl ReplayWindow {
     }
 
     /// Get the highest counter seen.
+    #[inline]
     pub fn highest(&self) -> u64 {
         self.highest
     }

@@ -37,22 +37,14 @@
 //! - **msg1 handler** can only do address-based duplicate detection (same
 //!   transport + address). Identity-dependent decisions happen later.
 
-mod handshake;
-mod replay;
-mod session;
-
-use ring::aead::{Aad, CHACHA20_POLY1305, LessSafeKey, Nonce, UnboundKey};
-use std::fmt;
+use super::aead::{self, Aead, AeadKey};
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::fmt;
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-pub use fips_core::noise::{
-    EPOCH_ENCRYPTED_SIZE, EPOCH_SIZE, HANDSHAKE_MSG1_SIZE, HANDSHAKE_MSG2_SIZE,
-    HANDSHAKE_MSG3_SIZE, PUBKEY_SIZE, TAG_SIZE,
-};
-pub use handshake::{HandshakeState, Message2Rollback};
-pub use replay::ReplayWindow;
-pub use session::NoiseSession;
+use super::TAG_SIZE;
 
 /// Protocol name for Noise XX with secp256k1.
 /// Format: Noise_XX_secp256k1_ChaChaPoly_SHA256
@@ -98,7 +90,18 @@ pub enum NoiseError {
     ReplayDetected(u64),
 
     #[error("secp256k1 error: {0}")]
-    Secp256k1(#[from] secp256k1::Error),
+    Secp256k1(secp256k1::Error),
+}
+
+// Written out rather than derived with `#[from]`, which would also make the
+// field the error's `source()`: that needs `core::error::Error` on
+// `secp256k1::Error`, which the crate implements only with its `std` feature.
+// So `source()` returns `None` for this variant; the inner error's text is in
+// the `Display` output.
+impl From<secp256k1::Error> for NoiseError {
+    fn from(e: secp256k1::Error) -> Self {
+        Self::Secp256k1(e)
+    }
 }
 
 /// Role in the handshake.
@@ -152,9 +155,10 @@ impl fmt::Display for HandshakeProgress {
 
 /// Symmetric cipher state for post-handshake encryption.
 ///
-/// AEAD is `ring`'s ChaCha20-Poly1305 (BoringSSL backend), which dispatches
-/// to NEON on aarch64 and AVX2/AVX-512 on x86_64. The 32-byte key is
-/// retained alongside a cached `LessSafeKey` so the per-packet AEAD skips
+/// AEAD is ChaCha20-Poly1305 through [`AeadKey`], the backend this build
+/// chose: `ring`'s (BoringSSL assembly, NEON on aarch64 and AVX2/AVX-512 on
+/// x86_64) on hosted builds, RustCrypto's elsewhere. The 32-byte key is
+/// retained alongside a cached keyed cipher so the per-packet AEAD skips
 /// rebuilding the keyed cipher. (It does not skip Poly1305 key derivation,
 /// which is nonce-dependent and happens per message inside seal and open.)
 /// `CipherState`'s manual `Clone` impl rebuilds the keyed AEAD from those
@@ -165,9 +169,10 @@ impl fmt::Display for HandshakeProgress {
 ///
 /// Because the key bytes are retained, every clone leaves a second copy in
 /// memory; each copy is cleared when it goes out of scope. Only `key` is
-/// zeroized. `cipher` is skipped because `LessSafeKey`
-/// holds its material behind `ring`'s own API and cannot be cleared from
-/// here; `nonce` and `has_key` are skipped because they are not secret.
+/// zeroized. `cipher` is skipped because `ring`'s key holds its material
+/// behind `ring`'s own API and cannot be cleared from here (RustCrypto's
+/// clears itself on drop); `nonce` and `has_key` are skipped because they
+/// are not secret.
 #[derive(Zeroize, ZeroizeOnDrop)]
 pub struct CipherState {
     /// Encryption key (32 bytes). Retained because `Clone` and
@@ -175,7 +180,7 @@ pub struct CipherState {
     key: [u8; 32],
     /// Cached keyed AEAD, valid iff `has_key`. None for an un-keyed state.
     #[zeroize(skip)]
-    cipher: Option<LessSafeKey>,
+    cipher: Option<AeadKey>,
     /// Nonce counter (8 bytes used, 4 bytes zero prefix).
     #[zeroize(skip)]
     pub(super) nonce: u64,
@@ -239,13 +244,11 @@ impl CipherState {
         key.zeroize();
     }
 
-    /// Build a ring `LessSafeKey` from raw key bytes. Centralized so the
+    /// Build the keyed cipher from raw key bytes. Centralized so the
     /// cipher-cache rebuild paths (`new`, `initialize_key`, `Clone`) all
     /// agree on construction.
-    fn build_cipher(key: &[u8; 32]) -> Option<LessSafeKey> {
-        UnboundKey::new(&CHACHA20_POLY1305, key)
-            .ok()
-            .map(LessSafeKey::new)
+    fn build_cipher(key: &[u8; 32]) -> Option<AeadKey> {
+        AeadKey::with_key(key)
     }
 
     /// Encrypt plaintext, returning ciphertext with appended tag.
@@ -361,14 +364,6 @@ impl CipherState {
         open(self.cipher.as_ref(), counter, aad, ciphertext)
     }
 
-    /// Build a ring `Nonce` from a counter value (8-byte LE counter, with
-    /// 4-byte zero prefix to match the Noise/WireGuard wire format).
-    fn counter_to_nonce(counter: u64) -> Nonce {
-        let mut nonce_bytes = [0u8; 12];
-        nonce_bytes[4..12].copy_from_slice(&counter.to_le_bytes());
-        Nonce::assume_unique_for_key(nonce_bytes)
-    }
-
     /// Reserve and return the next nonce, advancing the internal counter.
     fn advance_nonce(&mut self) -> Result<u64, NoiseError> {
         if self.nonce == u64::MAX {
@@ -392,18 +387,18 @@ impl CipherState {
     /// Copy out the retained key bytes, so a test can observe zeroization
     /// without reading freed memory.
     #[cfg(test)]
-    fn key_bytes(&self) -> [u8; 32] {
+    pub(super) fn key_bytes(&self) -> [u8; 32] {
         self.key
     }
 
     /// Clone the underlying keyed AEAD, for off-task AEAD workers.
     ///
-    /// Returns `None` if no key. The cloned `LessSafeKey` pairs with
-    /// `decrypt_with_counter[_and_aad]` / `encrypt_with_counter[_and_aad]`
-    /// or with bare `ring::aead::LessSafeKey::seal_in_place_separate_tag` —
-    /// the worker holds the cipher and a pre-assigned counter, while the
-    /// dispatcher keeps the replay window and counter assignment sequential.
-    pub fn cipher_clone(&self) -> Option<LessSafeKey> {
+    /// Returns `None` if no key. On hosted builds the clone is a
+    /// `ring::aead::LessSafeKey`, which the workers seal and open with
+    /// directly — the worker holds the cipher and a pre-assigned counter,
+    /// while the dispatcher keeps the replay window and counter assignment
+    /// sequential.
+    pub fn cipher_clone(&self) -> Option<AeadKey> {
         if self.has_key {
             Self::build_cipher(&self.key)
         } else {
@@ -423,11 +418,10 @@ impl fmt::Debug for CipherState {
 }
 
 /// Encrypt `plaintext` with the given keyed AEAD, counter, and AAD,
-/// returning a `Vec<u8>` of `plaintext.len() + TAG_SIZE` bytes. ring's
-/// `seal_in_place_append_tag` works on a single buffer; we own it here
-/// to keep the public Vec-returning API of `CipherState`.
+/// returning a `Vec<u8>` of `plaintext.len() + TAG_SIZE` bytes: the
+/// ciphertext, sealed in place, then the tag.
 fn seal(
-    cipher: Option<&LessSafeKey>,
+    cipher: Option<&AeadKey>,
     counter: u64,
     aad: &[u8],
     plaintext: &[u8],
@@ -435,29 +429,27 @@ fn seal(
     let cipher = cipher.ok_or(NoiseError::EncryptionFailed)?;
     let mut buf = Vec::with_capacity(plaintext.len() + TAG_SIZE);
     buf.extend_from_slice(plaintext);
-    let nonce = CipherState::counter_to_nonce(counter);
-    cipher
-        .seal_in_place_append_tag(nonce, Aad::from(aad), &mut buf)
+    let tag = cipher
+        .seal(&aead::nonce(counter), aad, &mut buf)
         .map_err(|_| NoiseError::EncryptionFailed)?;
+    buf.extend_from_slice(&tag);
     Ok(buf)
 }
 
 /// Decrypt `ciphertext` (with appended tag) with the given keyed AEAD,
 /// counter, and AAD, returning the plaintext as a `Vec<u8>`. Truncates
 /// in place to drop the AEAD tag.
-pub(crate) fn open(
-    cipher: Option<&LessSafeKey>,
+pub fn open(
+    cipher: Option<&AeadKey>,
     counter: u64,
     aad: &[u8],
     ciphertext: &[u8],
 ) -> Result<Vec<u8>, NoiseError> {
     let cipher = cipher.ok_or(NoiseError::DecryptionFailed)?;
     let mut buf = ciphertext.to_vec();
-    let nonce = CipherState::counter_to_nonce(counter);
     let plaintext_len = cipher
-        .open_in_place(nonce, Aad::from(aad), &mut buf)
-        .map_err(|_| NoiseError::DecryptionFailed)?
-        .len();
+        .open(&aead::nonce(counter), aad, &mut buf)
+        .map_err(|_| NoiseError::DecryptionFailed)?;
     buf.truncate(plaintext_len);
     Ok(buf)
 }
@@ -478,7 +470,7 @@ pub(crate) fn open(
 /// [`clear_slot`] instead: unwrapping after the slot has been cleared makes
 /// the optimiser keep a second copy of the value on the stack, because it
 /// can no longer copy the value straight from the slot to where it ends up.
-pub(crate) fn take_cleared<T>(slot: &mut Option<T>) -> Option<T> {
+pub fn take_cleared<T>(slot: &mut Option<T>) -> Option<T> {
     let value = slot.take();
     clear_slot(slot);
     value
@@ -490,7 +482,7 @@ pub(crate) fn take_cleared<T>(slot: &mut Option<T>) -> Option<T> {
 /// The zeros are volatile writes, which the optimiser keeps. Meant for a
 /// slot whose value has just been moved out, so the bytes the move left
 /// behind are cleared.
-pub(crate) fn clear_slot<T>(slot: &mut Option<T>) {
+pub fn clear_slot<T>(slot: &mut Option<T>) {
     *slot = None;
     let raw: *mut Option<T> = slot;
     // SAFETY: `raw` comes from a live `&mut`, so it is valid and aligned for
@@ -501,10 +493,7 @@ pub(crate) fn clear_slot<T>(slot: &mut Option<T>) {
     // (which does not drop the zeroed bytes) leaves the slot valid before
     // anything reads it again.
     unsafe {
-        zeroize::zeroize_flat_type(raw.cast::<std::mem::MaybeUninit<Option<T>>>());
+        zeroize::zeroize_flat_type(raw.cast::<core::mem::MaybeUninit<Option<T>>>());
         raw.write(None);
     }
 }
-
-#[cfg(test)]
-mod tests;

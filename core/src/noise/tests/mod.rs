@@ -1,6 +1,12 @@
 use super::*;
+use alloc::format;
+use alloc::vec;
+use alloc::vec::Vec;
 use rand::Rng;
 use secp256k1::Parity;
+use zeroize::Zeroize;
+
+type HandshakeState = handshake::HandshakeState<crate::testutil::TestEntropy>;
 
 fn generate_keypair() -> secp256k1::Keypair {
     let secp = secp256k1::Secp256k1::new();
@@ -786,4 +792,58 @@ fn test_clear_slot_drops_a_present_value_once_and_leaves_none() {
     flag.take();
     clear_slot(&mut flag);
     assert_eq!(flag, None);
+}
+
+/// The transport's bytes on the wire, pinned: the nonce layout (four zero
+/// bytes, then the counter little-endian), the counter advancing per message,
+/// the AAD bound to the tag, and the tag after the ciphertext. Computed with
+/// the `ring` code these replaced; every backend must produce them.
+#[test]
+fn test_cipher_state_output_is_pinned() {
+    let mut cipher = CipherState::new([0x42; 32]);
+    let a = cipher
+        .encrypt_with_aad(b"fips wire vector", &[0x11; 16])
+        .unwrap();
+    let b = cipher.encrypt_with_aad(b"", &[0x22; 12]).unwrap();
+    let c = cipher.encrypt(b"handshake payload").unwrap();
+    assert_eq!(
+        hex::encode(&a),
+        "3f0f94583dc35abf898122519c5bc7ca1c821a009610f403d5ef09d65d2f30e3"
+    );
+    assert_eq!(hex::encode(&b), "d4cce26bcf9b6a41c82f4acf35e5dddf");
+    assert_eq!(
+        hex::encode(&c),
+        "ab9695a696e42e1c095456a27767b6aceea57c728fc676fc57205b2f44791a8ef2"
+    );
+
+    let opened = CipherState::new([0x42; 32])
+        .decrypt_with_counter_and_aad(&a, 0, &[0x11; 16])
+        .unwrap();
+    assert_eq!(opened, b"fips wire vector");
+}
+
+/// The ephemeral key comes from the handshake's entropy source: two
+/// initiators under the same fixed source send the same ephemeral public
+/// key, the first 33 bytes of message 1, and one under another source sends
+/// a different one. Without this, nothing ties `generate_ephemeral` to `E`.
+#[test]
+fn test_handshake_ephemeral_draws_from_the_entropy_source() {
+    use crate::testutil::FixedEntropy;
+
+    let static_keypair = generate_keypair();
+    let epoch = generate_epoch();
+
+    let mut first = handshake::HandshakeState::<FixedEntropy<1>>::new_initiator(static_keypair);
+    first.set_local_epoch(epoch);
+    let mut second = handshake::HandshakeState::<FixedEntropy<1>>::new_initiator(static_keypair);
+    second.set_local_epoch(epoch);
+    let mut other = handshake::HandshakeState::<FixedEntropy<2>>::new_initiator(static_keypair);
+    other.set_local_epoch(epoch);
+
+    let first = first.write_message_1().unwrap();
+    let second = second.write_message_1().unwrap();
+    let other = other.write_message_1().unwrap();
+
+    assert_eq!(first[..PUBKEY_SIZE], second[..PUBKEY_SIZE]);
+    assert_ne!(first[..PUBKEY_SIZE], other[..PUBKEY_SIZE]);
 }

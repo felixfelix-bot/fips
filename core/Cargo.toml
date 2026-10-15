@@ -17,11 +17,16 @@ secp256k1 = { version = "0.30", default-features = false, features = ["alloc"] }
 bech32 = { version = "0.12", default-features = false, features = ["alloc"] }
 hex = { version = "0.4", default-features = false, features = ["alloc"] }
 
-# Left without `zeroize`: only public keys and data to be signed or verified
-# pass through the hasher here.
-sha2 = { version = "0.11", default-features = false }
-# `alloc` for the `Zeroizing<Vec<u8>>` guards in the secret key decoding.
-zeroize = { version = "1.9", default-features = false, features = ["alloc"] }
+# The `zeroize` features clear the SHA-256 and HMAC states on drop, which hold
+# handshake secrets in `noise`. `hmac`'s feature only forwards to `digest`'s,
+# which `sha2`'s also turns on; it is listed so the HMAC inside `hkdf` keeps it
+# if `sha2`'s ever stops doing so.
+sha2 = { version = "0.11", default-features = false, features = ["zeroize"] }
+hkdf = { version = "0.13", default-features = false }
+hmac = { version = "0.13", default-features = false, features = ["zeroize"] }
+# `alloc` for the `Zeroizing<Vec<u8>>` guards in the secret key decoding;
+# `zeroize_derive` for the Noise cipher and symmetric states.
+zeroize = { version = "1.9", default-features = false, features = ["alloc", "zeroize_derive"] }
 thiserror = { version = "2.0", default-features = false }
 once_cell = { version = "1.21", default-features = false, features = ["race", "alloc"] }
 # `MmpMode` derives Serialize and Deserialize for the node configuration.
@@ -37,8 +42,17 @@ libm = "0.2"
 # randomization.
 hashbrown = { version = "0.16", default-features = false }
 siphasher = { version = "1.0", default-features = false }
+# The AEAD backend that builds for every target (`noise::aead`).
+chacha20poly1305 = { version = "0.10", default-features = false }
+# The hosted AEAD backend, behind the `ring` feature: its assembly is faster,
+# but it does not build for bare-metal targets. The AEAD needs neither of its
+# defaults (`alloc`, `dev_urandom_fallback`).
+ring = { version = "0.17", default-features = false, optional = true }
 
 [features]
+# Use `ring` for the AEAD instead of RustCrypto (`noise::aead::AeadKey`).
+# Hosted builds turn it on; bare-metal builds must leave it off.
+ring = ["dep:ring"]
 # Test hooks in `proto`: methods and re-exports that only unit tests use to
 # set up or inspect state. This crate's tests see them through `cfg(test)`;
 # the root crate's tests see them because the root enables this feature from

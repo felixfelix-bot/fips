@@ -1,9 +1,35 @@
-//! Noise message sizes.
+//! Noise: the handshake, the transport sessions and the AEAD.
 //!
-//! The fixed sizes of the AEAD tag, a public key, the startup epoch and the
-//! XX handshake messages, which the link-layer wire codec checks frames
-//! against. They are wire format. The handshake and the sessions that use
-//! them stay in the root crate's `noise` module, which re-exports these.
+//! The XX handshake over secp256k1, which both the link layer (FMP) and the
+//! session layer (FSP) run, the sessions it produces, the replay window, and
+//! the ChaCha20-Poly1305 AEAD they seal and open with. Below the declarations
+//! are the fixed sizes of the AEAD tag, a public key, the startup epoch and the
+//! three XX handshake messages, which the link-layer wire codec checks frames
+//! against. They are wire format. The root crate re-exports this module's
+//! items other than `aead` as `fips::noise`, with `HandshakeState` drawing its
+//! ephemeral keys from the host's entropy source.
+
+pub mod aead;
+mod cipher;
+mod handshake;
+mod replay;
+mod session;
+
+pub(crate) use cipher::PROTOCOL_NAME_XX;
+#[cfg(any(test, feature = "test-hooks"))]
+pub use cipher::open;
+pub use cipher::{
+    CipherState, HandshakeProgress, HandshakeRole, MAX_MESSAGE_SIZE, NoiseError, NoisePattern,
+    REPLAY_WINDOW_SIZE,
+};
+#[doc(hidden)]
+pub use cipher::{clear_slot, take_cleared};
+pub use handshake::{HandshakeState, Message2Rollback};
+pub use replay::ReplayWindow;
+pub use session::NoiseSession;
+
+#[cfg(test)]
+mod tests;
 
 /// Size of the AEAD tag.
 pub const TAG_SIZE: usize = 16;

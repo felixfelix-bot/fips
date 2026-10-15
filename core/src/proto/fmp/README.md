@@ -41,4 +41,4 @@ Handshake message bytes are opaque here.
 - **The framing is wire format** and does not change on the deployed
   lines.
 - **No encryption here.** Encryption, decryption and key derivation
-  stay with the Noise code in the root crate.
+  are in the Noise code in `core/src/noise` (`crate::noise`).
