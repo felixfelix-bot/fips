@@ -16,11 +16,11 @@ use rand::RngExt;
 use secp256k1::PublicKey;
 use std::time::Duration;
 
-/// The clock the session table measures its timers on.
-///
-/// Still the wall clock, as before the table took the core's time type: a
-/// separate change moves it onto the monotonic clock.
-pub(crate) type SessionClock = crate::time::WallClock;
+/// The clock the session table measures its timers on: the host's monotonic
+/// clock, so a step of the system clock neither fires nor holds a session
+/// timer. Times the control API reports are converted to Unix milliseconds at
+/// the edge, through `WallStamp`.
+pub(crate) type SessionClock = crate::time::HostClock;
 
 /// An instant on [`SessionClock`].
 pub(crate) type SessionInstant = <SessionClock as Clock>::Instant;

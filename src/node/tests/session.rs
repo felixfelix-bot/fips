@@ -8174,6 +8174,9 @@ async fn test_superseded_key_epoch_is_drained_with_rekey_disabled() {
         .set_previous_session_for_test(old, session_at(1000));
     assert!(node.sessions.get(&peer_addr).unwrap().is_draining());
 
+    // The session clock is monotonic and counts from process start, so the
+    // drain started at 1 s is long ago only once that much time has passed.
+    crate::time::advance(std::time::Duration::from_secs(3_600));
     node.check_session_rekey().await;
 
     assert!(
@@ -11456,6 +11459,86 @@ async fn a_candidate_kept_beside_the_losers_session_expires_on_its_own_deadline(
         Some((true, 0)),
         "a candidate kept beside an established session must expire a \
          handshake timeout after its setup, leaving the session"
+    );
+    cleanup_nodes(&mut nodes).await;
+}
+
+// ============================================================================
+// Session timers across a step of the system clock
+// ============================================================================
+
+/// A node holding one established session, touched now.
+fn node_with_a_fresh_session(peer: &Identity) -> (Node, crate::NodeAddr) {
+    let (mut node, peer_addr) = make_node_with_established_peer(false, peer);
+    let entry = node.sessions.get_mut(&peer_addr).unwrap();
+    entry.mark_established(Node::session_now());
+    entry.touch(Node::session_now());
+    (node, peer_addr)
+}
+
+#[test]
+fn an_established_session_survives_a_forward_wall_clock_step_past_the_idle_timeout() {
+    let peer = Identity::generate();
+    let (mut node, peer_addr) = node_with_a_fresh_session(&peer);
+    let idle_ms = node.config().node.session.idle_timeout_secs * 1000;
+
+    crate::time::step_wall(i64::try_from(idle_ms).unwrap() + 110_000);
+    node.purge_idle_sessions(Node::session_now());
+
+    assert!(
+        node.sessions.contains_key(&peer_addr),
+        "a session touched just now must not be purged because the system clock jumped ahead"
+    );
+}
+
+#[test]
+fn a_backward_wall_clock_step_does_not_hold_the_idle_purge() {
+    let peer = Identity::generate();
+    let (mut node, peer_addr) = node_with_a_fresh_session(&peer);
+    let idle_secs = node.config().node.session.idle_timeout_secs;
+
+    crate::time::step_wall(-3_600_000);
+    crate::time::advance(Duration::from_secs(idle_secs + 1));
+    node.purge_idle_sessions(Node::session_now());
+
+    assert!(
+        !node.sessions.contains_key(&peer_addr),
+        "a session idle for longer than the timeout must be purged although the \
+         system clock stepped back"
+    );
+}
+
+#[tokio::test]
+async fn a_forward_wall_clock_step_does_not_trigger_the_time_based_rekey() {
+    let configs = (0..2)
+        .map(|_| {
+            let mut config = Config::new();
+            config.node.rekey.after_messages = u64::MAX;
+            config
+        })
+        .collect();
+    let mut nodes = run_tree_test_with_configs(configs, &[(0, 1)]).await;
+    verify_tree_convergence(&nodes);
+    populate_all_coord_caches(&mut nodes);
+    establish_pair_session(&mut nodes).await;
+    let node1_addr = *nodes[1].node.node_addr();
+    let after_secs = nodes[0].node.config().node.rekey.after_secs;
+
+    let past_trigger_secs = after_secs + crate::node::REKEY_JITTER_SECS as u64 + 65;
+    crate::time::step_wall(i64::try_from(past_trigger_secs * 1000).unwrap());
+    nodes[0].node.check_session_rekey().await;
+
+    assert!(
+        !rekey_initiated(&nodes[0], &node1_addr),
+        "a session established just now must not rekey because the system clock jumped ahead"
+    );
+
+    // Control: the same age on the monotonic clock does trigger it.
+    crate::time::advance(Duration::from_secs(past_trigger_secs));
+    nodes[0].node.check_session_rekey().await;
+    assert!(
+        rekey_initiated(&nodes[0], &node1_addr),
+        "control: a session past the rekey interval must rekey"
     );
     cleanup_nodes(&mut nodes).await;
 }
