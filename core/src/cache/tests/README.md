@@ -10,7 +10,9 @@ tests are named after it.
   lookup, expiry, eviction, invalidation, and the hint and verification
   rules; the eviction indexes and their consistency after every
   operation, the address bound, the probation segment and funded
-  writes), attached from there with
+  writes; and that the map's hasher is keyed from the cache's entropy
+  source, `coord_cache_keys_its_map_from_its_entropy_source`), attached
+  from there with
   `#[cfg(test)] #[path = "tests/coord_cache.rs"] mod tests;`; names
   `cache::coord_cache::tests::...`.
 - `entry.rs`: tests for `entry.rs` (`CacheEntry` and its expiry),

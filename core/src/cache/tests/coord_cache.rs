@@ -1461,3 +1461,18 @@ fn a_shallow_rewrite_in_probation_does_not_lower_the_weight_a_promotion_pays() {
     assert_eq!(cache.get(&key, 40), Some(&real));
     assert_index_matches_map(&cache, "probation charge kept");
 }
+
+#[test]
+fn coord_cache_keys_its_map_from_its_entropy_source() {
+    use core::hash::BuildHasher;
+
+    use crate::testutil::FixedEntropy;
+    use crate::utils::hash::KeyedHasher;
+
+    let key = make_node_addr(7);
+    let cache = super::CoordCache::<FixedEntropy<1>>::new(16, 1000);
+    let hashed = cache.entries.hasher().hash_one(key);
+
+    assert_eq!(hashed, KeyedHasher::new::<FixedEntropy<1>>().hash_one(key));
+    assert_ne!(hashed, KeyedHasher::new::<FixedEntropy<2>>().hash_one(key));
+}

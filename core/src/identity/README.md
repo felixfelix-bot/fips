@@ -55,9 +55,13 @@ algebraic structure.
 - `auth.rs`: the authentication challenge-response: `AuthChallenge`
   (32 random bytes, and the check of a response to them),
   `AuthResponse`, and the digest the response signs.
-- `tests.rs`: the unit tests for the items above. They build `Identity`
+- `tests.rs`: the unit tests for the items above. Most build `Identity`
   and `AuthChallenge` with the test entropy source, through aliases at
-  the top of the file.
+  the top of the file. The entropy tests, which check that signing and
+  `generate` draw on the type's source, name
+  `super::Identity::<FixedEntropy<N>>` and
+  `super::AuthChallenge::<FixedEntropy<N>>` directly, since the aliases
+  take no parameter.
 
 ## Invariants
 

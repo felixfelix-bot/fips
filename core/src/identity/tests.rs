@@ -782,3 +782,17 @@ fn test_signatures_draw_their_auxiliary_bytes_from_the_entropy_source() {
         two.sign_challenge(&challenge, timestamp).signature
     );
 }
+
+#[test]
+fn identity_generate_draws_its_secret_from_the_entropy_source() {
+    let generated = super::Identity::<FixedEntropy<1>>::generate();
+    let secret = SecretKey::from_slice(&[1; 32]).unwrap();
+    let expected = super::Identity::<FixedEntropy<1>>::from_secret_key(secret);
+    assert_eq!(generated.node_addr(), expected.node_addr());
+}
+
+#[test]
+fn auth_challenge_generate_draws_from_the_entropy_source() {
+    let challenge = super::AuthChallenge::<FixedEntropy<7>>::generate();
+    assert_eq!(challenge.as_bytes(), &[7; 32]);
+}
