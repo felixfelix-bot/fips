@@ -68,3 +68,14 @@ fn a_connected_peer_socket_is_bound_to_the_instance_interface() {
     .expect("open a connected socket bound to lo");
     assert_eq!(bound_interface(fd.as_raw_fd()).unwrap(), "lo");
 }
+
+/// The kernel behaviour behind refusing an empty `interface` at config
+/// load: an empty name binds the socket to no interface, and the call
+/// succeeds, so nothing at start would report it.
+#[cfg(target_os = "linux")]
+#[test]
+fn an_empty_interface_name_binds_a_socket_to_nothing() {
+    let sock = UdpRawSocket::open_on_interface("127.0.0.1:0".parse().unwrap(), BUF, BUF, Some(""))
+        .expect("the kernel accepts an empty interface name");
+    assert_eq!(bound_interface(sock.as_raw_fd()).unwrap(), "");
+}
