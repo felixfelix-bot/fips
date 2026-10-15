@@ -1,5 +1,5 @@
 use super::REPLAY_WINDOW_SIZE;
-use std::fmt;
+use core::fmt;
 
 /// Sliding window for replay protection.
 ///

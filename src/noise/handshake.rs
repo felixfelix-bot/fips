@@ -4,12 +4,14 @@ use super::{
     PROTOCOL_NAME_XK, PUBKEY_SIZE, XK_HANDSHAKE_MSG1_SIZE, XK_HANDSHAKE_MSG2_SIZE,
     XK_HANDSHAKE_MSG3_SIZE,
 };
-use fips_core::entropy::EntropySource;
+use crate::entropy::EntropySource;
+use alloc::string::ToString;
+use alloc::vec::Vec;
+use core::fmt;
+use core::marker::PhantomData;
 use hkdf::Hkdf;
 use secp256k1::{Keypair, PublicKey, SecretKey, ecdh::shared_secret_point};
 use sha2::{Digest, Sha256};
-use std::fmt;
-use std::marker::PhantomData;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Symmetric state during handshake.

@@ -1,7 +1,8 @@
 use super::{CipherState, HandshakeRole, NoiseError, ReplayWindow};
-use fips_core::noise::aead::AeadKey;
+use crate::noise::aead::AeadKey;
+use alloc::vec::Vec;
+use core::fmt;
 use secp256k1::{PublicKey, XOnlyPublicKey};
-use std::fmt;
 
 /// Completed Noise session for transport encryption.
 ///

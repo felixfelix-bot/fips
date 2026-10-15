@@ -1,6 +1,10 @@
 use super::*;
+use alloc::format;
+use alloc::vec;
+use alloc::vec::Vec;
 use rand::Rng;
 use secp256k1::Parity;
+use zeroize::Zeroize;
 
 type HandshakeState = handshake::HandshakeState<crate::testutil::TestEntropy>;
 

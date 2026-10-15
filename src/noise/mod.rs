@@ -39,11 +39,14 @@ mod handshake;
 mod replay;
 mod session;
 
-use fips_core::noise::aead::{self, Aead, AeadKey};
-use std::fmt;
+use aead::{Aead, AeadKey};
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::fmt;
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
+pub(crate) use fips_core::noise::aead;
 pub use fips_core::noise::{
     EPOCH_ENCRYPTED_SIZE, EPOCH_SIZE, HANDSHAKE_MSG1_SIZE, HANDSHAKE_MSG2_SIZE, PUBKEY_SIZE,
     TAG_SIZE,
@@ -516,7 +519,7 @@ pub(crate) fn clear_slot<T>(slot: &mut Option<T>) {
     // (which does not drop the zeroed bytes) leaves the slot valid before
     // anything reads it again.
     unsafe {
-        zeroize::zeroize_flat_type(raw.cast::<std::mem::MaybeUninit<Option<T>>>());
+        zeroize::zeroize_flat_type(raw.cast::<core::mem::MaybeUninit<Option<T>>>());
         raw.write(None);
     }
 }
