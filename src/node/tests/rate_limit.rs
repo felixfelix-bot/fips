@@ -2,50 +2,56 @@
 //! the session-setup limiter. Attached as that module's `tests` child.
 
 use super::*;
-use std::thread;
-use std::time::Duration;
+use crate::time::{HostClock, HostInstant, at};
+
+// The limiters on the tests' clock. Instants are named by `t`.
+type TokenBucket = super::TokenBucket<HostClock>;
+type HandshakeRateLimiter = super::HandshakeRateLimiter<HostClock>;
+type SessionSetupRateLimiter = super::SessionSetupRateLimiter<HostClock>;
+
+/// The instant `ms` milliseconds into the test.
+fn t(ms: u64) -> HostInstant {
+    at::<HostClock>(ms)
+}
 
 #[test]
 fn test_token_bucket_basic() {
-    let mut bucket = TokenBucket::with_params(10, 1.0);
+    let mut bucket = TokenBucket::with_params(10, 1.0, t(0));
 
     // Should have full capacity
     assert_eq!(bucket.capacity(), 10);
-    assert!(bucket.tokens() >= 9.9); // Allow for timing
+    assert!(bucket.tokens(t(0)) >= 9.9); // Allow for timing
 
     // Consume all tokens
     for _ in 0..10 {
-        assert!(bucket.try_acquire());
+        assert!(bucket.try_acquire(t(0)));
     }
 
     // Should be empty
-    assert!(!bucket.try_acquire());
-    assert!(!bucket.available());
+    assert!(!bucket.try_acquire(t(0)));
+    assert!(!bucket.available(t(0)));
 }
 
 #[test]
 fn test_token_bucket_refill() {
-    let mut bucket = TokenBucket::with_params(10, 100.0); // 100 tokens/sec
+    let mut bucket = TokenBucket::with_params(10, 100.0, t(0)); // 100 tokens/sec
 
     // Drain completely
     for _ in 0..10 {
-        bucket.try_acquire();
+        bucket.try_acquire(t(0));
     }
-    assert!(!bucket.available());
+    assert!(!bucket.available(t(0)));
 
-    // Wait for refill, measuring actual elapsed time to avoid sensitivity
-    // to OS scheduler variance (sleep can overshoot by a large margin).
-    let before = Instant::now();
-    thread::sleep(Duration::from_millis(50));
-    let elapsed_secs = before.elapsed().as_secs_f64();
+    // Refill over 50 ms of the bucket's clock.
+    let elapsed_secs = 0.05;
 
     // Expected tokens = elapsed * rate, capped at capacity.
-    // Allow ±20% tolerance around the actual elapsed time.
-    let expected = (elapsed_secs * 100.0).min(10.0);
+    // Allow ±20% tolerance around the elapsed time.
+    let expected = (elapsed_secs * 100.0f64).min(10.0);
     let lo = (expected * 0.8).min(expected - 0.5).max(0.0);
     let hi = (expected * 1.2).max(expected + 0.5).min(10.0);
 
-    let tokens = bucket.tokens();
+    let tokens = bucket.tokens(t(50));
     assert!(
         (lo..=hi).contains(&tokens),
         "tokens: {}, expected ~{:.2} (range {:.2}..={:.2})",
@@ -58,65 +64,69 @@ fn test_token_bucket_refill() {
 
 #[test]
 fn test_token_bucket_try_acquire_n() {
-    let mut bucket = TokenBucket::with_params(10, 1.0);
+    let mut bucket = TokenBucket::with_params(10, 1.0, t(0));
 
     // Acquire 5
-    assert!(bucket.try_acquire_n(5));
-    assert!(bucket.tokens() >= 4.9 && bucket.tokens() <= 5.1);
+    assert!(bucket.try_acquire_n(5, t(0)));
+    assert!(bucket.tokens(t(0)) >= 4.9 && bucket.tokens(t(0)) <= 5.1);
 
     // Acquire 5 more
-    assert!(bucket.try_acquire_n(5));
+    assert!(bucket.try_acquire_n(5, t(0)));
 
     // Can't acquire more
-    assert!(!bucket.try_acquire_n(1));
+    assert!(!bucket.try_acquire_n(1, t(0)));
 }
 
 #[test]
 fn test_token_bucket_reset() {
-    let mut bucket = TokenBucket::with_params(10, 1.0);
+    let mut bucket = TokenBucket::with_params(10, 1.0, t(0));
 
     // Drain
     for _ in 0..10 {
-        bucket.try_acquire();
+        bucket.try_acquire(t(0));
     }
 
     // Reset
-    bucket.reset();
+    bucket.reset(t(0));
 
     // Should be full again
-    assert!(bucket.tokens() >= 9.9);
+    assert!(bucket.tokens(t(0)) >= 9.9);
 }
 
 #[test]
 fn test_token_bucket_time_until_available() {
-    let mut bucket = TokenBucket::with_params(10, 10.0); // 10 tokens/sec
+    let mut bucket = TokenBucket::with_params(10, 10.0, t(0)); // 10 tokens/sec
 
     // When full, should be zero
-    assert_eq!(bucket.time_until_available(), Duration::ZERO);
+    assert_eq!(bucket.time_until_available(t(0)), Duration::ZERO);
 
     // Drain completely
     for _ in 0..10 {
-        bucket.try_acquire();
+        bucket.try_acquire(t(0));
     }
 
     // Should need ~100ms for one token at 10/sec
-    let wait = bucket.time_until_available();
+    let wait = bucket.time_until_available(t(0));
     assert!(wait.as_millis() >= 90 && wait.as_millis() <= 110);
 }
 
 fn test_limiter(bucket: TokenBucket, max_pending: usize) -> HandshakeRateLimiter {
-    HandshakeRateLimiter::with_params(bucket, TokenBucket::with_params(1000, 100.0), max_pending)
+    HandshakeRateLimiter::with_params(
+        bucket,
+        TokenBucket::with_params(1000, 100.0, t(0)),
+        max_pending,
+    )
 }
 
 #[test]
 fn test_handshake_rate_limiter_basic() {
-    let mut limiter = test_limiter(TokenBucket::new(), 100);
+    let mut limiter = test_limiter(TokenBucket::new(t(0)), 100);
 
-    assert!(limiter.can_start_handshake(Msg1Class::Stranger));
+    assert!(limiter.can_start_handshake(Msg1Class::Stranger, t(0)));
     assert_eq!(limiter.pending_count(), 0);
 
     // Start a handshake
-    let slot = limiter.start_handshake(Msg1Class::Stranger).unwrap();
+    let slot = limiter.start_handshake(Msg1Class::Stranger, t(0)).unwrap();
     assert_eq!(limiter.pending_count(), 1);
 
     // Complete it
@@ -126,18 +136,20 @@ fn test_handshake_rate_limiter_basic() {
 
 #[test]
 fn test_handshake_rate_limiter_max_pending() {
-    let bucket = TokenBucket::with_params(1000, 100.0);
+    let bucket = TokenBucket::with_params(1000, 100.0, t(0));
     let mut limiter = test_limiter(bucket, 3);
 
     // Start 3 handshakes
-    let a = limiter.start_handshake(Msg1Class::Stranger).unwrap();
-    let _b = limiter.start_handshake(Msg1Class::Stranger).unwrap();
-    let _c = limiter.start_handshake(Msg1Class::Stranger).unwrap();
+    let a = limiter.start_handshake(Msg1Class::Stranger, t(0)).unwrap();
+    let _b = limiter.start_handshake(Msg1Class::Stranger, t(0)).unwrap();
+    let _c = limiter.start_handshake(Msg1Class::Stranger, t(0)).unwrap();
 
     // Fourth should fail (max pending)
-    assert!(!limiter.can_start_handshake(Msg1Class::Stranger));
+    assert!(!limiter.can_start_handshake(Msg1Class::Stranger, t(0)));
     assert_eq!(
-        limiter.start_handshake(Msg1Class::Stranger).unwrap_err(),
+        limiter
+            .start_handshake(Msg1Class::Stranger, t(0))
+            .unwrap_err(),
         Msg1Refusal::PendingLimit
     );
 
@@ -145,41 +157,43 @@ fn test_handshake_rate_limiter_max_pending() {
     drop(a);
 
     // Now should be able to start another
-    assert!(limiter.can_start_handshake(Msg1Class::Stranger));
-    assert!(limiter.start_handshake(Msg1Class::Stranger).is_ok());
+    assert!(limiter.can_start_handshake(Msg1Class::Stranger, t(0)));
+    assert!(limiter.start_handshake(Msg1Class::Stranger, t(0)).is_ok());
 }
 
 #[test]
 fn test_handshake_rate_limiter_token_exhaustion() {
-    let bucket = TokenBucket::with_params(5, 0.0); // No refill
+    let bucket = TokenBucket::with_params(5, 0.0, t(0)); // No refill
     let mut limiter = test_limiter(bucket, 100);
 
     // Start 5 handshakes (exhausts tokens), releasing each immediately
     for _ in 0..5 {
-        let slot = limiter.start_handshake(Msg1Class::Stranger).unwrap();
+        let slot = limiter.start_handshake(Msg1Class::Stranger, t(0)).unwrap();
         drop(slot);
     }
 
     // Tokens exhausted, even though pending is 0
     assert_eq!(limiter.pending_count(), 0);
-    assert!(!limiter.can_start_handshake(Msg1Class::Stranger));
+    assert!(!limiter.can_start_handshake(Msg1Class::Stranger, t(0)));
     assert_eq!(
-        limiter.start_handshake(Msg1Class::Stranger).unwrap_err(),
+        limiter
+            .start_handshake(Msg1Class::Stranger, t(0))
+            .unwrap_err(),
         Msg1Refusal::RateLimit
     );
 }
 
 #[test]
 fn test_handshake_rate_limiter_reset() {
-    let mut limiter = test_limiter(TokenBucket::new(), 100);
+    let mut limiter = test_limiter(TokenBucket::new(t(0)), 100);
 
     // Start some handshakes
-    let _a = limiter.start_handshake(Msg1Class::Stranger).unwrap();
-    let _b = limiter.start_handshake(Msg1Class::Stranger).unwrap();
+    let _a = limiter.start_handshake(Msg1Class::Stranger, t(0)).unwrap();
+    let _b = limiter.start_handshake(Msg1Class::Stranger, t(0)).unwrap();
     assert_eq!(limiter.pending_count(), 2);
 
     // Reset
-    limiter.reset();
+    limiter.reset(t(0));
 
     assert_eq!(limiter.pending_count(), 0);
     assert!(limiter.bucket().tokens >= DEFAULT_BURST_CAPACITY as f64 - 0.1);
@@ -189,11 +203,11 @@ fn test_handshake_rate_limiter_reset() {
 /// call, and the release saturates at zero rather than underflowing.
 #[test]
 fn pending_slot_releases_on_drop_and_saturates() {
-    let mut limiter = test_limiter(TokenBucket::with_params(100, 100.0), 100);
+    let mut limiter = test_limiter(TokenBucket::with_params(100, 100.0, t(0)), 100);
 
-    let outer = limiter.start_handshake(Msg1Class::Stranger).unwrap();
+    let outer = limiter.start_handshake(Msg1Class::Stranger, t(0)).unwrap();
     {
-        let _inner = limiter.start_handshake(Msg1Class::Stranger).unwrap();
+        let _inner = limiter.start_handshake(Msg1Class::Stranger, t(0)).unwrap();
         assert_eq!(limiter.pending_count(), 2);
     }
     assert_eq!(
@@ -204,7 +218,7 @@ fn pending_slot_releases_on_drop_and_saturates() {
 
     // A reset zeroes the counter while a guard is still live; the
     // guard's later drop must not underflow it.
-    limiter.reset();
+    limiter.reset(t(0));
     assert_eq!(limiter.pending_count(), 0);
     drop(outer);
     assert_eq!(limiter.pending_count(), 0, "release saturates at zero");
@@ -216,19 +230,23 @@ fn pending_slot_releases_on_drop_and_saturates() {
 #[test]
 fn refusal_reason_names_the_limb() {
     // Pending limb: max_pending 1, one live guard, tokens plentiful.
-    let mut pending_bound = test_limiter(TokenBucket::with_params(1000, 100.0), 1);
-    let _held = pending_bound.start_handshake(Msg1Class::Stranger).unwrap();
+    let mut pending_bound = test_limiter(TokenBucket::with_params(1000, 100.0, t(0)), 1);
+    let _held = pending_bound
+        .start_handshake(Msg1Class::Stranger, t(0))
+        .unwrap();
     assert_eq!(
         pending_bound
-            .start_handshake(Msg1Class::Stranger)
+            .start_handshake(Msg1Class::Stranger, t(0))
             .unwrap_err(),
         Msg1Refusal::PendingLimit
     );
 
     // Rate limb: pending headroom, zero-capacity/zero-refill bucket.
-    let mut rate_bound = test_limiter(TokenBucket::with_params(0, 0.0), 1000);
+    let mut rate_bound = test_limiter(TokenBucket::with_params(0, 0.0, t(0)), 1000);
     assert_eq!(
-        rate_bound.start_handshake(Msg1Class::Stranger).unwrap_err(),
+        rate_bound
+            .start_handshake(Msg1Class::Stranger, t(0))
+            .unwrap_err(),
         Msg1Refusal::RateLimit
     );
 
@@ -241,14 +259,16 @@ fn refusal_reason_names_the_limb() {
 #[test]
 fn msg1_classes_draw_on_separate_buckets() {
     let mut limiter = HandshakeRateLimiter::with_params(
-        TokenBucket::with_params(1, 0.0),
-        TokenBucket::with_params(3, 0.0),
+        TokenBucket::with_params(1, 0.0, t(0)),
+        TokenBucket::with_params(3, 0.0, t(0)),
         1000,
     );
 
-    drop(limiter.start_handshake(Msg1Class::Stranger).unwrap());
+    drop(limiter.start_handshake(Msg1Class::Stranger, t(0)).unwrap());
     assert_eq!(
-        limiter.start_handshake(Msg1Class::Stranger).unwrap_err(),
+        limiter
+            .start_handshake(Msg1Class::Stranger, t(0))
+            .unwrap_err(),
         Msg1Refusal::RateLimit,
         "stranger bucket drained"
     );
@@ -256,13 +276,13 @@ fn msg1_classes_draw_on_separate_buckets() {
     for _ in 0..3 {
         drop(
             limiter
-                .start_handshake(Msg1Class::EstablishedLink)
+                .start_handshake(Msg1Class::EstablishedLink, t(0))
                 .expect("established bucket is independent of the stranger bucket"),
         );
     }
     assert_eq!(
         limiter
-            .start_handshake(Msg1Class::EstablishedLink)
+            .start_handshake(Msg1Class::EstablishedLink, t(0))
             .unwrap_err(),
         Msg1Refusal::RateLimit,
         "established bucket drains on its own terms"
@@ -332,14 +352,14 @@ fn setup_limiter_draining_one_link_leaves_another_links_budget_untouched() {
     let noisy = addr(0x01);
     let quiet = addr(0x02);
 
-    assert!(limiter.try_admit(&noisy, Msg1Class::Stranger));
-    assert!(limiter.try_admit(&noisy, Msg1Class::Stranger));
+    assert!(limiter.try_admit(&noisy, Msg1Class::Stranger, t(0)));
+    assert!(limiter.try_admit(&noisy, Msg1Class::Stranger, t(0)));
     assert!(
-        !limiter.try_admit(&noisy, Msg1Class::Stranger),
+        !limiter.try_admit(&noisy, Msg1Class::Stranger, t(0)),
         "the noisy link's own bucket must run out"
     );
     assert!(
-        limiter.try_admit(&quiet, Msg1Class::Stranger),
+        limiter.try_admit(&quiet, Msg1Class::Stranger, t(0)),
         "a second link peer must not share the first one's budget"
     );
     assert_eq!(limiter.len(), 2);
@@ -350,12 +370,37 @@ fn setup_limiter_draining_the_stranger_bucket_still_admits_established_peer_setu
     let mut limiter = SessionSetupRateLimiter::with_params((1, 0.001), (1, 0.001));
     let link = addr(0x01);
 
-    assert!(limiter.try_admit(&link, Msg1Class::Stranger));
-    assert!(!limiter.try_admit(&link, Msg1Class::Stranger));
+    assert!(limiter.try_admit(&link, Msg1Class::Stranger, t(0)));
+    assert!(!limiter.try_admit(&link, Msg1Class::Stranger, t(0)));
     assert!(
-        limiter.try_admit(&link, Msg1Class::EstablishedLink),
+        limiter.try_admit(&link, Msg1Class::EstablishedLink, t(0)),
         "rekey traffic must not be starved by a stranger flood on the \
          same link; suppressed rotation is silent and would show only as \
          a flat rekey_armed counter"
+    );
+}
+
+/// A link's buckets are dropped once it has been idle for the full
+/// [`SETUP_BUCKET_IDLE`], and not a millisecond before.
+#[test]
+fn setup_buckets_are_pruned_after_the_idle_period() {
+    let mut limiter = SessionSetupRateLimiter::with_params((10, 1.0), (10, 1.0));
+    let idle = addr(0x01);
+    let busy = addr(0x02);
+    let idle_ms = SETUP_BUCKET_IDLE.as_millis() as u64;
+
+    assert!(limiter.try_admit(&idle, Msg1Class::Stranger, t(0)));
+    assert!(limiter.try_admit(&busy, Msg1Class::Stranger, t(idle_ms - 1)));
+    assert_eq!(
+        limiter.len(),
+        2,
+        "a link idle for less than the idle period keeps its buckets"
+    );
+
+    assert!(limiter.try_admit(&busy, Msg1Class::Stranger, t(idle_ms)));
+    assert_eq!(
+        limiter.len(),
+        1,
+        "a link idle for the whole idle period is pruned"
     );
 }

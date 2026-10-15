@@ -321,7 +321,7 @@ impl LogBudget {
     /// A full budget as of `now`.
     pub(crate) fn new(now: Instant) -> Self {
         Self {
-            bucket: TokenBucket::with_params_at(BUDGET_BURST, BUDGET_RATE, now),
+            bucket: TokenBucket::with_params(BUDGET_BURST, BUDGET_RATE, now.into()),
             withheld: 0,
         }
     }
@@ -330,7 +330,7 @@ impl LogBudget {
     /// many lines were withheld since the last admitted one and resets that
     /// count; otherwise counts this line as withheld.
     pub(crate) fn admit(&mut self, now: Instant) -> Option<u64> {
-        if self.bucket.try_acquire_at(now) {
+        if self.bucket.try_acquire(now.into()) {
             Some(std::mem::take(&mut self.withheld))
         } else {
             self.withheld = self.withheld.saturating_add(1);

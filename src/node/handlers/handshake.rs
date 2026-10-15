@@ -19,8 +19,10 @@ use crate::proto::fmp::{
     Msg1Digest, OutboundSnapshot, PromotionResult, RekeyAnswer, WireOutcome,
     cross_connection_winner,
 };
+use crate::time::HostClock;
 use crate::transport::{Link, LinkDirection, LinkId, ReceivedPacket, TransportError, TransportId};
 use crate::utils::index::SessionIndex;
+use fips_core::time::Clock as _;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -665,7 +667,10 @@ impl Node {
         // here instead, releasing the slot at acquire time — silently, with
         // no clippy lint catching the difference. Do not "tidy" this
         // binding; the assertion below is what reds if it is tidied.
-        let _slot = match self.msg1_rate_limiter.start_handshake(class) {
+        let _slot = match self
+            .msg1_rate_limiter
+            .start_handshake(class, HostClock.now())
+        {
             Ok(slot) => slot,
             Err(reason) => {
                 debug!(

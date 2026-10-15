@@ -6,6 +6,8 @@
 use crate::identity::{NodeAddr, PeerIdentity, encode_npub};
 use crate::node::Node;
 use crate::node::stats_history::{ALL_METRICS, ALL_PEER_METRICS, Granularity, Metric, PeerMetric};
+use crate::time::HostClock;
+use fips_core::time::{Clock as _, Instant as _};
 use serde_json::{Value, json};
 use std::str::FromStr;
 use std::time::Duration;
@@ -2146,13 +2148,15 @@ pub(crate) fn show_stats_all_history_from_handle(
 /// peer selectors and to confirm a peer is in the retention window.
 pub fn show_stats_peers(node: &Node) -> Value {
     let hist = node.stats_history();
-    let now = std::time::Instant::now();
+    let now = HostClock.now();
 
     let mut peers: Vec<Value> = hist
         .peers()
         .map(|(addr, rings)| {
-            let last_contact_secs = now.duration_since(rings.last_contact()).as_secs();
-            let first_seen_secs = now.duration_since(rings.first_seen()).as_secs();
+            let last_contact_secs = now
+                .saturating_duration_since(rings.last_contact())
+                .as_secs();
+            let first_seen_secs = now.saturating_duration_since(rings.first_seen()).as_secs();
             let is_active = node.peers().any(|p| p.node_addr() == addr);
             let npub = node
                 .peers()
@@ -2208,13 +2212,15 @@ pub(crate) fn show_stats_peers_from_handle(
     let stats = handle.stats();
     let hist = &stats.history;
     let meta = &stats.peer_meta;
-    let now = std::time::Instant::now();
+    let now = HostClock.now();
 
     let mut peers: Vec<Value> = hist
         .peers()
         .map(|(addr, rings)| {
-            let last_contact_secs = now.duration_since(rings.last_contact()).as_secs();
-            let first_seen_secs = now.duration_since(rings.first_seen()).as_secs();
+            let last_contact_secs = now
+                .saturating_duration_since(rings.last_contact())
+                .as_secs();
+            let first_seen_secs = now.saturating_duration_since(rings.first_seen()).as_secs();
             let (is_active, npub, display_name) = match meta.get(addr) {
                 Some(m) => (m.is_active, m.npub.clone(), m.display_name.clone()),
                 None => (false, hex::encode(addr.as_bytes()), addr.short_hex()),

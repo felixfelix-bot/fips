@@ -51,6 +51,7 @@ use crate::proto::routing::{CoordsRequired, MtuExceeded, PathBroken, RoutingSign
 use crate::proto::stp::{coords_wire_size, encode_coords};
 #[cfg(unix)]
 use crate::transport::TransportHandle;
+use fips_core::time::Clock as _;
 use secp256k1::PublicKey;
 use tracing::{debug, info, trace, warn};
 
@@ -895,7 +896,10 @@ impl Node {
         } else {
             Msg1Class::Stranger
         };
-        if !self.setup_rate_limiter.try_admit(link_peer, class) {
+        if !self
+            .setup_rate_limiter
+            .try_admit(link_peer, class, self.setup_now())
+        {
             debug!(
                 link_peer = %self.peer_display_name(link_peer),
                 src = %self.peer_display_name(src_addr),
@@ -3752,6 +3756,16 @@ impl Node {
     /// Current Unix time in milliseconds.
     pub(in crate::node) fn now_ms() -> u64 {
         crate::time::wall_ms()
+    }
+
+    /// The time the session-setup limiter is charged at: the host's
+    /// monotonic clock, or in tests the clock a test set in `setup_clock`.
+    fn setup_now(&self) -> crate::time::HostInstant {
+        #[cfg(test)]
+        if let Some(clock) = self.setup_clock {
+            return clock();
+        }
+        crate::time::HostClock.now()
     }
 
     // === TUN Outbound (Data Plane) ===

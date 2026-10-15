@@ -65,6 +65,7 @@ use crate::proto::lookup::{Lookup, LookupBackoff, LookupForwardRateLimiter};
 use crate::proto::mmp::Mmp;
 use crate::proto::routing::{self, Router, RoutingErrorRateLimiter};
 use crate::proto::stp::TreeState;
+use crate::time::HostClock;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::transport::ethernet::EthernetTransport;
 use crate::transport::nym::NymTransport;
@@ -77,6 +78,7 @@ use crate::transport::{
 };
 use crate::utils::index::IndexAllocator;
 use crate::{Config, ConfigError, Identity, IdentityError, NodeAddr, PeerIdentity, TreeCoordinate};
+use fips_core::time::Clock as _;
 use rand::Rng;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
@@ -823,6 +825,10 @@ pub struct Node {
     msg1_rate_limiter: HandshakeRateLimiter,
     /// Rate limiter for inbound FSP SessionSetup, keyed on the link peer.
     setup_rate_limiter: SessionSetupRateLimiter,
+    /// The clock [`Self::setup_now`] reads instead of [`HostClock`], so a
+    /// test can drive the setup limiter's refill.
+    #[cfg(test)]
+    setup_clock: Option<fn() -> crate::time::HostInstant>,
     /// Budget bounding the routing errors one authenticated link peer can
     /// induce this node to emit. Keyed on the link peer because that is the
     /// only value at the emission point a sender cannot mint; the
@@ -944,11 +950,13 @@ fn build_msg1_rate_limiter(config: &Config) -> HandshakeRateLimiter {
         rl.handshake_burst,
         rl.handshake_rate,
     );
+    let now = HostClock.now();
     HandshakeRateLimiter::with_params(
-        rate_limit::TokenBucket::with_params(rl.handshake_burst, rl.handshake_rate),
+        rate_limit::TokenBucket::with_params(rl.handshake_burst, rl.handshake_rate, now),
         rate_limit::TokenBucket::with_params(
             rl.established_handshake_burst.unwrap_or(derived_burst),
             rl.established_handshake_rate.unwrap_or(derived_rate),
+            now,
         ),
         config.node.limits.max_pending_inbound,
     )
@@ -1113,6 +1121,8 @@ impl Node {
             replayed_msg1s: Default::default(),
             msg1_rate_limiter,
             setup_rate_limiter,
+            #[cfg(test)]
+            setup_clock: None,
             peer_error_budget: PeerBudget::new(),
             coord_hint_budget: PeerBudget::coord_hints(),
             routing: Router::new(),
@@ -1291,6 +1301,8 @@ impl Node {
             replayed_msg1s: Default::default(),
             msg1_rate_limiter,
             setup_rate_limiter,
+            #[cfg(test)]
+            setup_clock: None,
             peer_error_budget: PeerBudget::new(),
             coord_hint_budget: PeerBudget::coord_hints(),
             routing: Router::new(),
@@ -2076,6 +2088,9 @@ impl Node {
     }
 
     /// Get the stats history collector.
+    // The history is fixed over the crate's own host clock, which nothing
+    // outside the crate names; the accessor stays public as it was.
+    #[allow(private_interfaces)]
     pub fn stats_history(&self) -> &stats_history::StatsHistory {
         &self.stats_history
     }
@@ -2108,7 +2123,7 @@ impl Node {
             active_sessions: self.sessions.len() as u64,
         };
 
-        let now = std::time::Instant::now();
+        let now = HostClock.now();
         let peer_snaps: Vec<stats_history::PeerSnapshot> = self
             .peers
             .values()

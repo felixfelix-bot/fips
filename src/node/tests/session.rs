@@ -6424,8 +6424,8 @@ async fn test_forged_setups_from_one_link_peer_stop_creating_session_entries_onc
 
 /// The limiter's clock for the refill test: tokio's paused clock, which the
 /// test moves with `tokio::time::advance` and nothing else moves.
-fn paused_now() -> std::time::Instant {
-    tokio::time::Instant::now().into_std()
+fn paused_now() -> crate::time::HostInstant {
+    crate::time::HostInstant::from(tokio::time::Instant::now().into_std())
 }
 
 #[tokio::test]
@@ -6438,7 +6438,7 @@ async fn test_a_drained_setup_bucket_refills_and_admits_the_next_legitimate_setu
     // cannot race a refill however slowly each delivery runs, and the refill
     // below is exactly the one the test grants.
     tokio::time::pause();
-    nodes[1].node.setup_rate_limiter.set_clock(paused_now);
+    nodes[1].node.setup_clock = Some(paused_now);
 
     let before = nodes[1].node.stats().session.setup_rate_limited;
     for _ in 0..=BURST {

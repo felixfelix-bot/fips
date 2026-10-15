@@ -3,6 +3,16 @@
 //! module's `tests` child.
 
 use super::*;
+use crate::time::{HostClock, HostInstant, at};
+
+// The history on the tests' clock. Instants are named by `secs`.
+type StatsHistory = super::StatsHistory<HostClock>;
+type PeerSnapshot = super::PeerSnapshot<HostClock>;
+
+/// The instant `s` seconds into the test.
+fn secs(s: u64) -> HostInstant {
+    at::<HostClock>(s * 1000)
+}
 
 fn make_snap(t: u64) -> Snapshot {
     Snapshot {
@@ -23,7 +33,7 @@ fn make_addr(tag: u8) -> NodeAddr {
     NodeAddr::from_bytes([tag; 16])
 }
 
-fn make_peer_snap(tag: u8, now: Instant, t: u64) -> PeerSnapshot {
+fn make_peer_snap(tag: u8, now: HostInstant, t: u64) -> PeerSnapshot {
     PeerSnapshot {
         node_addr: make_addr(tag),
         last_seen: now,
@@ -40,9 +50,8 @@ fn make_peer_snap(tag: u8, now: Instant, t: u64) -> PeerSnapshot {
 #[test]
 fn push_and_query_fast_ring() {
     let mut h = StatsHistory::new();
-    let t0 = Instant::now();
     for i in 0..10 {
-        h.tick(t0 + Duration::from_secs(i), &make_snap(i), &[]);
+        h.tick(secs(i), &make_snap(i), &[]);
     }
     let s = h.query(Metric::MeshSize, Duration::from_secs(5), Granularity::Fast);
     assert_eq!(s.values.len(), 5);
@@ -53,9 +62,8 @@ fn push_and_query_fast_ring() {
 #[test]
 fn fast_ring_wraps_at_capacity() {
     let mut h = StatsHistory::new();
-    let t0 = Instant::now();
     for i in 0..3610u64 {
-        h.tick(t0 + Duration::from_secs(i), &make_snap(i), &[]);
+        h.tick(secs(i), &make_snap(i), &[]);
     }
     let s = h.query(
         Metric::MeshSize,
@@ -70,12 +78,11 @@ fn fast_ring_wraps_at_capacity() {
 #[test]
 fn delta_for_counter_metric() {
     let mut h = StatsHistory::new();
-    let t0 = Instant::now();
     let totals = [0, 0, 2, 5];
     for (i, &v) in totals.iter().enumerate() {
         let mut s = make_snap(i as u64);
         s.parent_switches_total = v;
-        h.tick(t0 + Duration::from_secs(i as u64), &s, &[]);
+        h.tick(secs(i as u64), &s, &[]);
     }
     let s = h.query(
         Metric::ParentSwitches,
@@ -90,9 +97,8 @@ fn delta_for_counter_metric() {
 #[test]
 fn downsample_last_aggregation() {
     let mut h = StatsHistory::new();
-    let t0 = Instant::now();
     for i in 0..60u64 {
-        h.tick(t0 + Duration::from_secs(i), &make_snap(i), &[]);
+        h.tick(secs(i), &make_snap(i), &[]);
     }
     let s = h.query(
         Metric::MeshSize,
@@ -108,9 +114,8 @@ fn downsample_last_aggregation() {
 #[test]
 fn downsample_mean_aggregation() {
     let mut h = StatsHistory::new();
-    let t0 = Instant::now();
     for i in 0..60u64 {
-        h.tick(t0 + Duration::from_secs(i), &make_snap(i), &[]);
+        h.tick(secs(i), &make_snap(i), &[]);
     }
     let s = h.query(Metric::LossRate, Duration::from_secs(60), Granularity::Slow);
     assert_eq!(s.values.len(), 1);
@@ -120,11 +125,10 @@ fn downsample_mean_aggregation() {
 #[test]
 fn downsample_sum_aggregation() {
     let mut h = StatsHistory::new();
-    let t0 = Instant::now();
     for i in 0..60u64 {
         let mut s = make_snap(0);
         s.parent_switches_total = i;
-        h.tick(t0 + Duration::from_secs(i), &s, &[]);
+        h.tick(secs(i), &s, &[]);
     }
     let s = h.query(
         Metric::ParentSwitches,
@@ -138,9 +142,8 @@ fn downsample_sum_aggregation() {
 #[test]
 fn query_pads_front_with_nan_when_ring_is_short() {
     let mut h = StatsHistory::new();
-    let t0 = Instant::now();
     for i in 0..3u64 {
-        h.tick(t0 + Duration::from_secs(i), &make_snap(i), &[]);
+        h.tick(secs(i), &make_snap(i), &[]);
     }
     let s = h.query(Metric::MeshSize, Duration::from_secs(10), Granularity::Fast);
     assert_eq!(s.values.len(), 10);
@@ -151,10 +154,9 @@ fn query_pads_front_with_nan_when_ring_is_short() {
 #[test]
 fn fast_query_young_ring_returns_full_hour_with_leading_nan() {
     let mut h = StatsHistory::new();
-    let t0 = Instant::now();
     // 5 minutes of data.
     for i in 0..300u64 {
-        h.tick(t0 + Duration::from_secs(i), &make_snap(i), &[]);
+        h.tick(secs(i), &make_snap(i), &[]);
     }
     let s = h.query(
         Metric::MeshSize,
@@ -170,10 +172,9 @@ fn fast_query_young_ring_returns_full_hour_with_leading_nan() {
 #[test]
 fn slow_query_young_ring_returns_full_day_with_leading_nan() {
     let mut h = StatsHistory::new();
-    let t0 = Instant::now();
     // 30 minutes of data → 30 slow samples flushed.
     for i in 0u64..1800 {
-        h.tick(t0 + Duration::from_secs(i), &make_snap(i), &[]);
+        h.tick(secs(i), &make_snap(i), &[]);
     }
     let s = h.query(
         Metric::MeshSize,
@@ -211,9 +212,8 @@ fn granularity_parse() {
 #[test]
 fn latest_and_recent() {
     let mut h = StatsHistory::new();
-    let t0 = Instant::now();
     for i in 0..5u64 {
-        h.tick(t0 + Duration::from_secs(i), &make_snap(i), &[]);
+        h.tick(secs(i), &make_snap(i), &[]);
     }
     assert_eq!(h.latest(Metric::MeshSize), Some(14.0));
     let r = h.recent(Metric::MeshSize, 3);
@@ -225,11 +225,10 @@ fn latest_and_recent() {
 #[test]
 fn active_sessions_is_sampled_as_gauge() {
     let mut h = StatsHistory::new();
-    let t0 = Instant::now();
     for i in 0..3u64 {
         let mut s = make_snap(i);
         s.active_sessions = 10 + i;
-        h.tick(t0 + Duration::from_secs(i), &s, &[]);
+        h.tick(secs(i), &s, &[]);
     }
     let s = h.query(
         Metric::ActiveSessions,
@@ -244,18 +243,13 @@ fn active_sessions_is_sampled_as_gauge() {
 #[test]
 fn new_peer_backfills_nan_to_align_with_node_rings() {
     let mut h = StatsHistory::new();
-    let t0 = Instant::now();
     // Tick 5 times with no peers (node rings fill up).
     for i in 0..5u64 {
-        h.tick(t0 + Duration::from_secs(i), &make_snap(i), &[]);
+        h.tick(secs(i), &make_snap(i), &[]);
     }
     // Peer A joins on tick 6.
     let a = make_addr(1);
-    h.tick(
-        t0 + Duration::from_secs(5),
-        &make_snap(5),
-        &[make_peer_snap(1, t0 + Duration::from_secs(5), 5)],
-    );
+    h.tick(secs(5), &make_snap(5), &[make_peer_snap(1, secs(5), 5)]);
     // A's srtt ring has 5 NaN backfill + 1 real = 6 samples. A 60s
     // window front-pads with 54 more NaN so the real value lands at
     // the tail.
@@ -275,19 +269,14 @@ fn new_peer_backfills_nan_to_align_with_node_rings() {
 #[test]
 fn absent_peer_gets_nan_sample() {
     let mut h = StatsHistory::new();
-    let t0 = Instant::now();
     let a = make_addr(1);
     // Tick 3 times with A present.
     for i in 0..3u64 {
-        h.tick(
-            t0 + Duration::from_secs(i),
-            &make_snap(i),
-            &[make_peer_snap(1, t0 + Duration::from_secs(i), i)],
-        );
+        h.tick(secs(i), &make_snap(i), &[make_peer_snap(1, secs(i), i)]);
     }
     // A disappears for 2 ticks.
     for i in 3..5u64 {
-        h.tick(t0 + Duration::from_secs(i), &make_snap(i), &[]);
+        h.tick(secs(i), &make_snap(i), &[]);
     }
     let s = h
         .peer_query(
@@ -309,22 +298,21 @@ fn absent_peer_gets_nan_sample() {
 #[test]
 fn counter_decrease_emits_nan_and_rebaselines() {
     let mut h = StatsHistory::new();
-    let t0 = Instant::now();
     let a = make_addr(1);
     // Three ticks with bytes_in increasing.
     for (i, total) in [(0u64, 100u64), (1, 200), (2, 300)].iter().copied() {
-        let mut ps = make_peer_snap(1, t0 + Duration::from_secs(i), i);
+        let mut ps = make_peer_snap(1, secs(i), i);
         ps.bytes_in_total = total;
-        h.tick(t0 + Duration::from_secs(i), &make_snap(i), &[ps]);
+        h.tick(secs(i), &make_snap(i), &[ps]);
     }
     // Fourth tick: bytes_in drops to 50 (link reconnected).
-    let mut ps = make_peer_snap(1, t0 + Duration::from_secs(3), 3);
+    let mut ps = make_peer_snap(1, secs(3), 3);
     ps.bytes_in_total = 50;
-    h.tick(t0 + Duration::from_secs(3), &make_snap(3), &[ps]);
+    h.tick(secs(3), &make_snap(3), &[ps]);
     // Fifth tick: bytes_in grows to 80.
-    let mut ps = make_peer_snap(1, t0 + Duration::from_secs(4), 4);
+    let mut ps = make_peer_snap(1, secs(4), 4);
     ps.bytes_in_total = 80;
-    h.tick(t0 + Duration::from_secs(4), &make_snap(4), &[ps]);
+    h.tick(secs(4), &make_snap(4), &[ps]);
 
     let s = h
         .peer_query(
@@ -350,19 +338,18 @@ fn counter_decrease_emits_nan_and_rebaselines() {
 #[test]
 fn peer_eviction_fires_after_24h_of_silence() {
     let mut h = StatsHistory::new();
-    let t0 = Instant::now();
     let a = make_addr(1);
     // One real sample for A at t=0.
-    h.tick(t0, &make_snap(0), &[make_peer_snap(1, t0, 0)]);
+    h.tick(secs(0), &make_snap(0), &[make_peer_snap(1, secs(0), 0)]);
     assert!(h.has_peer(&a));
     // Keep ticking every minute without A for 24 hours + 1 minute.
     // (we tick at 60s intervals to avoid building a 24h fast ring)
     let eviction = Duration::from_secs(PEER_EVICTION_SECS);
     let mut i = 1u64;
     loop {
-        let t = t0 + Duration::from_secs(i * 60);
+        let t = secs(i * 60);
         h.tick(t, &make_snap(i), &[]);
-        if t.duration_since(t0) >= eviction {
+        if t.saturating_duration_since(secs(0)) >= eviction {
             break;
         }
         i += 1;
@@ -370,22 +357,28 @@ fn peer_eviction_fires_after_24h_of_silence() {
     assert!(!h.has_peer(&a));
 }
 
+/// Eviction waits for the whole window: a peer silent for one second less
+/// than [`PEER_EVICTION_SECS`] is still tracked.
+#[test]
+fn a_peer_silent_for_just_under_the_eviction_window_is_kept() {
+    let mut h = StatsHistory::new();
+    let a = make_addr(1);
+    h.tick(secs(0), &make_snap(0), &[make_peer_snap(1, secs(0), 0)]);
+    h.tick(secs(PEER_EVICTION_SECS - 1), &make_snap(1), &[]);
+    assert!(h.has_peer(&a));
+}
+
 #[test]
 fn nan_mean_downsample_skips_nan_samples() {
     let mut h = StatsHistory::new();
-    let t0 = Instant::now();
     let a = make_addr(1);
     // 60 ticks alternating present / absent — 30 real SRTT samples
     // at values 10, 12, 14, ..., 68, mean = 39.
     for i in 0..60u64 {
         if i.is_multiple_of(2) {
-            h.tick(
-                t0 + Duration::from_secs(i),
-                &make_snap(i),
-                &[make_peer_snap(1, t0 + Duration::from_secs(i), i)],
-            );
+            h.tick(secs(i), &make_snap(i), &[make_peer_snap(1, secs(i), i)]);
         } else {
-            h.tick(t0 + Duration::from_secs(i), &make_snap(i), &[]);
+            h.tick(secs(i), &make_snap(i), &[]);
         }
     }
     let s = h
@@ -408,13 +401,12 @@ fn nan_mean_downsample_skips_nan_samples() {
 #[test]
 fn all_nan_window_downsamples_to_nan() {
     let mut h = StatsHistory::new();
-    let t0 = Instant::now();
     let a = make_addr(1);
     // Introduce A, then silence it for 60+ ticks so one full slow
     // sample accumulates entirely of NaN.
-    h.tick(t0, &make_snap(0), &[make_peer_snap(1, t0, 0)]);
+    h.tick(secs(0), &make_snap(0), &[make_peer_snap(1, secs(0), 0)]);
     for i in 1..=60u64 {
-        h.tick(t0 + Duration::from_secs(i), &make_snap(i), &[]);
+        h.tick(secs(i), &make_snap(i), &[]);
     }
     let s = h
         .peer_query(
@@ -440,7 +432,7 @@ fn all_nan_window_downsamples_to_nan() {
     assert_eq!(s.values[4], 10.0);
 
     for i in 61..=120u64 {
-        h.tick(t0 + Duration::from_secs(i), &make_snap(i), &[]);
+        h.tick(secs(i), &make_snap(i), &[]);
     }
     let s = h
         .peer_query(

@@ -3,6 +3,15 @@
 //! that module path.
 
 use super::*;
+use crate::time::{HostClock, HostInstant, at};
+
+// The limiter on the tests' clock. Instants are named by `t`.
+type LookupSignRateLimiter = super::LookupSignRateLimiter<HostClock>;
+
+/// The instant `ms` milliseconds into the test.
+fn t(ms: u64) -> HostInstant {
+    at::<HostClock>(ms)
+}
 
 fn addr(val: u8) -> NodeAddr {
     let mut bytes = [0u8; 16];
@@ -22,14 +31,14 @@ fn addr(val: u8) -> NodeAddr {
 fn test_sign_budget_is_spent_per_peer_and_does_not_touch_another_peer() {
     let mut limiter = LookupSignRateLimiter::with_params(4.0, 0.0);
     for _ in 0..4 {
-        assert!(limiter.should_sign(&addr(1)));
+        assert!(limiter.should_sign(&addr(1), t(0)));
     }
     assert!(
-        !limiter.should_sign(&addr(1)),
+        !limiter.should_sign(&addr(1), t(0)),
         "the burst is the whole budget when nothing refills it"
     );
     assert!(
-        limiter.should_sign(&addr(2)),
+        limiter.should_sign(&addr(2), t(0)),
         "one peer spending its budget must not spend another's"
     );
     assert_eq!(limiter.len(), 2);
@@ -39,7 +48,7 @@ fn test_sign_budget_is_spent_per_peer_and_does_not_touch_another_peer() {
 fn test_sign_budget_of_zero_burst_is_read_as_unlimited() {
     let mut limiter = LookupSignRateLimiter::with_params(0.0, 0.0);
     for _ in 0..1000 {
-        assert!(limiter.should_sign(&addr(1)));
+        assert!(limiter.should_sign(&addr(1), t(0)));
     }
     assert_eq!(limiter.len(), 0, "unlimited keeps no per-peer state");
 }

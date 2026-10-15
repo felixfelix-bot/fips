@@ -19,10 +19,15 @@
 //! JSON `null` via a custom serializer.
 
 use crate::identity::NodeAddr;
+use alloc::collections::{BTreeMap, BTreeSet, VecDeque};
+use alloc::format;
+use alloc::string::String;
+use alloc::vec::Vec;
+use core::fmt;
+use core::marker::PhantomData;
+use core::str::FromStr;
+use fips_core::time::{Clock, Duration, Instant as _};
 use serde::{Serialize, Serializer};
-use std::collections::{HashMap, HashSet, VecDeque};
-use std::str::FromStr;
-use std::time::{Duration, Instant};
 
 /// Fast-ring capacity: 3600 seconds = 1 hour at 1s resolution.
 pub const FAST_RING_CAPACITY: usize = 3600;
@@ -244,10 +249,12 @@ pub struct Snapshot {
 /// Snapshot of one peer's state at the current tick. An entry missing
 /// from the `peers` slice of [`StatsHistory::tick`] is treated as "peer
 /// absent this tick" and backs NaN into each of its rings.
-#[derive(Clone, Debug)]
-pub struct PeerSnapshot {
+// Defaults to the crate's own host clock, which nothing outside the crate
+// names; transitional until the type moves into `fips-core`.
+#[allow(private_interfaces)]
+pub struct PeerSnapshot<C: Clock = crate::time::HostClock> {
     pub node_addr: NodeAddr,
-    pub last_seen: Instant,
+    pub last_seen: C::Instant,
     /// MMP SRTT; `None` when no MMP measurement exists yet.
     pub srtt_ms: Option<f64>,
     /// MMP loss rate; `None` when the peer has no MMP session yet.
@@ -260,6 +267,38 @@ pub struct PeerSnapshot {
     pub packets_in_total: u64,
     pub packets_out_total: u64,
     pub ecn_ce_total: u64,
+}
+
+impl<C: Clock> Clone for PeerSnapshot<C> {
+    fn clone(&self) -> Self {
+        Self {
+            node_addr: self.node_addr,
+            last_seen: self.last_seen,
+            srtt_ms: self.srtt_ms,
+            loss_rate: self.loss_rate,
+            bytes_in_total: self.bytes_in_total,
+            bytes_out_total: self.bytes_out_total,
+            packets_in_total: self.packets_in_total,
+            packets_out_total: self.packets_out_total,
+            ecn_ce_total: self.ecn_ce_total,
+        }
+    }
+}
+
+impl<C: Clock> fmt::Debug for PeerSnapshot<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("PeerSnapshot")
+            .field("node_addr", &self.node_addr)
+            .field("last_seen", &self.last_seen)
+            .field("srtt_ms", &self.srtt_ms)
+            .field("loss_rate", &self.loss_rate)
+            .field("bytes_in_total", &self.bytes_in_total)
+            .field("bytes_out_total", &self.bytes_out_total)
+            .field("packets_in_total", &self.packets_in_total)
+            .field("packets_out_total", &self.packets_out_total)
+            .field("ecn_ce_total", &self.ecn_ce_total)
+            .finish()
+    }
 }
 
 /// Which ring a query reads from.
@@ -427,15 +466,27 @@ pub struct Series {
 }
 
 /// One peer's per-metric rings plus lifecycle metadata.
-#[derive(Clone)]
-pub struct PeerStatsRings {
+// Defaults to the crate's own host clock, which nothing outside the crate
+// names; transitional until the type moves into `fips-core`.
+#[allow(private_interfaces)]
+pub struct PeerStatsRings<C: Clock = crate::time::HostClock> {
     rings: Vec<Ring>,
-    first_seen: Instant,
-    last_contact: Instant,
+    first_seen: C::Instant,
+    last_contact: C::Instant,
 }
 
-impl PeerStatsRings {
-    fn new(now: Instant, fast_pushes_so_far: u64) -> Self {
+impl<C: Clock> Clone for PeerStatsRings<C> {
+    fn clone(&self) -> Self {
+        Self {
+            rings: self.rings.clone(),
+            first_seen: self.first_seen,
+            last_contact: self.last_contact,
+        }
+    }
+}
+
+impl<C: Clock> PeerStatsRings<C> {
+    fn new(now: C::Instant, fast_pushes_so_far: u64) -> Self {
         let mut rings: Vec<Ring> = ALL_PEER_METRICS
             .iter()
             .map(|m| Ring::new(m.aggregation()))
@@ -472,7 +523,7 @@ impl PeerStatsRings {
         &mut self.rings[idx]
     }
 
-    fn push_sample(&mut self, snap: &PeerSnapshot, now: Instant) {
+    fn push_sample(&mut self, snap: &PeerSnapshot<C>, now: C::Instant) {
         self.last_contact = now;
         for &metric in ALL_PEER_METRICS {
             let value = match metric {
@@ -508,31 +559,48 @@ impl PeerStatsRings {
         }
     }
 
-    pub fn first_seen(&self) -> Instant {
+    pub fn first_seen(&self) -> C::Instant {
         self.first_seen
     }
 
-    pub fn last_contact(&self) -> Instant {
+    pub fn last_contact(&self) -> C::Instant {
         self.last_contact
     }
 }
 
 /// Per-metric ring storage for node-level metrics plus a map of
 /// per-peer rings keyed by `NodeAddr`.
-#[derive(Clone)]
-pub struct StatsHistory {
+///
+/// Every instant passed in must come from the one clock `C`.
+// Defaults to the crate's own host clock, which nothing outside the crate
+// names; transitional until the type moves into `fips-core`.
+#[allow(private_interfaces)]
+pub struct StatsHistory<C: Clock = crate::time::HostClock> {
     rings: Vec<Ring>,
-    peers: HashMap<NodeAddr, PeerStatsRings>,
+    peers: BTreeMap<NodeAddr, PeerStatsRings<C>>,
     /// Wall-clock anchor for 1-minute downsample boundaries. Set on the
     /// first tick; downsample fires when elapsed since the anchor crosses
     /// a multiple of 60s (coarsely — we just count fast pushes).
     fast_pushes: u64,
     /// Monotonic timestamp of the most recent tick, used by readers that
     /// want to label the series in wall-clock terms.
-    last_tick: Option<Instant>,
+    last_tick: Option<C::Instant>,
+    _clock: PhantomData<fn() -> C>,
 }
 
-impl StatsHistory {
+impl<C: Clock> Clone for StatsHistory<C> {
+    fn clone(&self) -> Self {
+        Self {
+            rings: self.rings.clone(),
+            peers: self.peers.clone(),
+            fast_pushes: self.fast_pushes,
+            last_tick: self.last_tick,
+            _clock: PhantomData,
+        }
+    }
+}
+
+impl<C: Clock> StatsHistory<C> {
     pub fn new() -> Self {
         let rings = ALL_METRICS
             .iter()
@@ -540,9 +608,10 @@ impl StatsHistory {
             .collect();
         Self {
             rings,
-            peers: HashMap::new(),
+            peers: BTreeMap::new(),
             fast_pushes: 0,
             last_tick: None,
+            _clock: PhantomData,
         }
     }
 
@@ -564,7 +633,7 @@ impl StatsHistory {
     /// are sampled directly. Every 60 pushes, the accumulator is
     /// flushed to the slow ring. Peers that have been absent for the
     /// full eviction window are dropped from the map.
-    pub fn tick(&mut self, now: Instant, snapshot: &Snapshot, peers: &[PeerSnapshot]) {
+    pub fn tick(&mut self, now: C::Instant, snapshot: &Snapshot, peers: &[PeerSnapshot<C>]) {
         // Node-level metrics.
         for &metric in ALL_METRICS {
             let value = match metric {
@@ -591,7 +660,7 @@ impl StatsHistory {
         }
 
         // Per-peer metrics.
-        let mut seen: HashSet<NodeAddr> = HashSet::with_capacity(peers.len());
+        let mut seen: BTreeSet<NodeAddr> = BTreeSet::new();
         for ps in peers {
             seen.insert(ps.node_addr);
             let entry = self
@@ -619,7 +688,7 @@ impl StatsHistory {
         // Evict peers silent for at least PEER_EVICTION_SECS.
         let threshold = Duration::from_secs(PEER_EVICTION_SECS);
         self.peers
-            .retain(|_, rings| now.duration_since(rings.last_contact) < threshold);
+            .retain(|_, rings| now.saturating_duration_since(rings.last_contact) < threshold);
 
         self.last_tick = Some(now);
     }
@@ -719,7 +788,7 @@ impl StatsHistory {
     }
 
     /// Iterate tracked peers with their ring metadata.
-    pub fn peers(&self) -> impl Iterator<Item = (&NodeAddr, &PeerStatsRings)> {
+    pub fn peers(&self) -> impl Iterator<Item = (&NodeAddr, &PeerStatsRings<C>)> {
         self.peers.iter()
     }
 
@@ -741,7 +810,7 @@ impl StatsHistory {
     }
 }
 
-impl Default for StatsHistory {
+impl<C: Clock> Default for StatsHistory<C> {
     fn default() -> Self {
         Self::new()
     }

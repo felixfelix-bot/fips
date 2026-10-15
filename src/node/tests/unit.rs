@@ -811,13 +811,13 @@ fn test_rate_limiter_initialized() {
     // Rate limiter should allow handshakes initially
     assert!(
         node.msg1_rate_limiter
-            .can_start_handshake(Msg1Class::Stranger)
+            .can_start_handshake(Msg1Class::Stranger, crate::time::HostClock.now())
     );
 
     // Start a handshake
     let slot = node
         .msg1_rate_limiter
-        .start_handshake(Msg1Class::Stranger)
+        .start_handshake(Msg1Class::Stranger, crate::time::HostClock.now())
         .expect("fresh limiter admits");
     assert_eq!(node.msg1_rate_limiter.pending_count(), 1);
 
@@ -3253,7 +3253,7 @@ async fn msg1_reject_arms_do_not_release_another_handshakes_slot() {
     // A foreign in-flight handshake's slot, held for the whole test.
     let seed = node
         .msg1_rate_limiter
-        .start_handshake(Msg1Class::Stranger)
+        .start_handshake(Msg1Class::Stranger, crate::time::HostClock.now())
         .expect("fresh limiter admits the seed");
     assert_eq!(
         node.msg1_rate_limiter.pending_count(),
@@ -3525,7 +3525,7 @@ async fn established_link_msg1_admitted_when_stranger_bucket_drained() {
     // refused from here on.
     drop(
         node.msg1_rate_limiter
-            .start_handshake(Msg1Class::Stranger)
+            .start_handshake(Msg1Class::Stranger, crate::time::HostClock.now())
             .expect("the single stranger token is available at t=0"),
     );
 

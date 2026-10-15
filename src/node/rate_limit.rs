@@ -49,15 +49,19 @@
 //! single sender can mint an unbounded number of distinct values.
 
 use crate::NodeAddr;
-use std::collections::HashMap;
-use std::sync::Arc;
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::time::{Duration, Instant};
+use alloc::collections::BTreeMap;
+use alloc::sync::Arc;
+use core::fmt;
+use core::marker::PhantomData;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use fips_core::time::{Clock, Duration, Instant as _};
 
 /// Default burst capacity (max tokens).
+#[cfg_attr(not(test), allow(dead_code))]
 pub const DEFAULT_BURST_CAPACITY: u32 = 100;
 
 /// Default refill rate (tokens per second).
+#[cfg_attr(not(test), allow(dead_code))]
 pub const DEFAULT_REFILL_RATE: f64 = 10.0;
 
 /// Token bucket rate limiter.
@@ -65,8 +69,10 @@ pub const DEFAULT_REFILL_RATE: f64 = 10.0;
 /// Uses a classic token bucket algorithm where tokens are consumed for each
 /// operation and refilled at a constant rate. When tokens are exhausted,
 /// operations are rate-limited until tokens refill.
-#[derive(Debug, Clone)]
-pub struct TokenBucket {
+///
+/// Every method that refills takes `now`, a reading of the clock `C`; every
+/// reading a bucket is given must come from that one clock.
+pub struct TokenBucket<C: Clock = crate::time::HostClock> {
     /// Maximum number of tokens (burst capacity).
     capacity: u32,
     /// Current number of available tokens (may be fractional during refill).
@@ -74,67 +80,79 @@ pub struct TokenBucket {
     /// Tokens added per second.
     refill_rate: f64,
     /// Last time tokens were refilled.
-    last_refill: Instant,
+    last_refill: C::Instant,
+    _clock: PhantomData<fn() -> C>,
 }
 
-impl TokenBucket {
-    /// Create a new token bucket with default parameters.
+impl<C: Clock> Clone for TokenBucket<C> {
+    fn clone(&self) -> Self {
+        Self {
+            capacity: self.capacity,
+            tokens: self.tokens,
+            refill_rate: self.refill_rate,
+            last_refill: self.last_refill,
+            _clock: PhantomData,
+        }
+    }
+}
+
+impl<C: Clock> fmt::Debug for TokenBucket<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("TokenBucket")
+            .field("capacity", &self.capacity)
+            .field("tokens", &self.tokens)
+            .field("refill_rate", &self.refill_rate)
+            .field("last_refill", &self.last_refill)
+            .finish()
+    }
+}
+
+impl<C: Clock> TokenBucket<C> {
+    /// Create a new token bucket with default parameters, full as of `now`.
     ///
     /// - Burst capacity: 100 tokens
     /// - Refill rate: 10 tokens/second
-    pub fn new() -> Self {
-        Self::with_params(DEFAULT_BURST_CAPACITY, DEFAULT_REFILL_RATE)
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn new(now: C::Instant) -> Self {
+        Self::with_params(DEFAULT_BURST_CAPACITY, DEFAULT_REFILL_RATE, now)
     }
 
-    /// Create a token bucket with custom parameters.
+    /// Create a token bucket with custom parameters, full as of `now`.
     ///
     /// # Arguments
     ///
     /// * `capacity` - Maximum number of tokens (burst capacity)
     /// * `refill_rate` - Tokens added per second
-    pub fn with_params(capacity: u32, refill_rate: f64) -> Self {
-        Self::with_params_at(capacity, refill_rate, Instant::now())
-    }
-
-    /// Create a token bucket with custom parameters, full as of `now`.
-    ///
-    /// For a caller that keeps its own clock and passes the same clock's
-    /// readings to [`Self::try_acquire_at`].
-    pub fn with_params_at(capacity: u32, refill_rate: f64, now: Instant) -> Self {
+    /// * `now` - The time the bucket starts refilling from
+    pub fn with_params(capacity: u32, refill_rate: f64, now: C::Instant) -> Self {
         Self {
             capacity,
             tokens: capacity as f64,
             refill_rate,
             last_refill: now,
+            _clock: PhantomData,
         }
-    }
-
-    /// Try to consume one token.
-    ///
-    /// Returns `true` if a token was available and consumed, `false` if
-    /// rate limited (no tokens available).
-    pub fn try_acquire(&mut self) -> bool {
-        self.try_acquire_n(1)
-    }
-
-    /// Try to consume n tokens.
-    ///
-    /// Returns `true` if n tokens were available and consumed, `false` if
-    /// rate limited (insufficient tokens).
-    pub fn try_acquire_n(&mut self, n: u32) -> bool {
-        self.try_acquire_n_at(n, Instant::now())
     }
 
     /// Try to consume one token, refilling as of `now`.
     ///
-    /// `now` must come from the same clock as every earlier reading this
-    /// bucket was given.
-    pub fn try_acquire_at(&mut self, now: Instant) -> bool {
+    /// Returns `true` if a token was available and consumed, `false` if
+    /// rate limited (no tokens available).
+    pub fn try_acquire(&mut self, now: C::Instant) -> bool {
         self.try_acquire_n_at(1, now)
     }
 
     /// Try to consume n tokens, refilling as of `now`.
-    fn try_acquire_n_at(&mut self, n: u32, now: Instant) -> bool {
+    ///
+    /// Returns `true` if n tokens were available and consumed, `false` if
+    /// rate limited (insufficient tokens).
+    #[cfg_attr(not(test), allow(dead_code))]
+    pub fn try_acquire_n(&mut self, n: u32, now: C::Instant) -> bool {
+        self.try_acquire_n_at(n, now)
+    }
+
+    /// Try to consume n tokens, refilling as of `now`.
+    fn try_acquire_n_at(&mut self, n: u32, now: C::Instant) -> bool {
         self.refill_at(now);
 
         if self.tokens >= n as f64 {
@@ -145,17 +163,17 @@ impl TokenBucket {
         }
     }
 
-    /// Check if tokens are available without consuming them.
+    /// Check if tokens are available as of `now` without consuming them.
     #[cfg(test)]
-    pub fn available(&mut self) -> bool {
-        self.refill_at(Instant::now());
+    pub fn available(&mut self, now: C::Instant) -> bool {
+        self.refill_at(now);
         self.tokens >= 1.0
     }
 
-    /// Get the current number of available tokens.
+    /// Get the number of tokens available as of `now`.
     #[cfg(test)]
-    pub fn tokens(&mut self) -> f64 {
-        self.refill_at(Instant::now());
+    pub fn tokens(&mut self, now: C::Instant) -> f64 {
+        self.refill_at(now);
         self.tokens
     }
 
@@ -166,8 +184,8 @@ impl TokenBucket {
     }
 
     /// Refill tokens based on the time elapsed up to `now`.
-    fn refill_at(&mut self, now: Instant) {
-        let elapsed = now.duration_since(self.last_refill);
+    fn refill_at(&mut self, now: C::Instant) {
+        let elapsed = now.saturating_duration_since(self.last_refill);
         let elapsed_secs = elapsed.as_secs_f64();
 
         // Add tokens based on time elapsed
@@ -181,34 +199,28 @@ impl TokenBucket {
         self.last_refill = now;
     }
 
-    /// Reset to full capacity.
+    /// Reset to full capacity as of `now`.
     #[cfg(test)]
-    pub fn reset(&mut self) {
+    pub fn reset(&mut self, now: C::Instant) {
         self.tokens = self.capacity as f64;
-        self.last_refill = Instant::now();
+        self.last_refill = now;
     }
 
-    /// Time until the next token is available.
+    /// Time from `now` until the next token is available.
     ///
     /// Returns `Duration::ZERO` if tokens are available, otherwise the
     /// estimated time until one token will be available.
     #[cfg(test)]
-    pub fn time_until_available(&mut self) -> std::time::Duration {
-        self.refill_at(Instant::now());
+    pub fn time_until_available(&mut self, now: C::Instant) -> Duration {
+        self.refill_at(now);
 
         if self.tokens >= 1.0 {
-            std::time::Duration::ZERO
+            Duration::ZERO
         } else {
             let needed = 1.0 - self.tokens;
             let secs = needed / self.refill_rate;
-            std::time::Duration::from_secs_f64(secs)
+            Duration::from_secs_f64(secs)
         }
-    }
-}
-
-impl Default for TokenBucket {
-    fn default() -> Self {
-        Self::new()
     }
 }
 
@@ -249,8 +261,8 @@ impl Msg1Refusal {
     }
 }
 
-impl std::fmt::Display for Msg1Refusal {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+impl fmt::Display for Msg1Refusal {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.as_str())
     }
 }
@@ -338,12 +350,11 @@ pub fn derive_established_bucket(
 /// protect against DoS attacks on the handshake path. The rate limb is
 /// split by [`Msg1Class`]; the concurrency limb is shared (see the module
 /// doc for why, and for what the aggregate rate becomes).
-#[derive(Debug)]
-pub struct HandshakeRateLimiter {
+pub struct HandshakeRateLimiter<C: Clock = crate::time::HostClock> {
     /// Token bucket for stranger msg1.
-    bucket: TokenBucket,
+    bucket: TokenBucket<C>,
     /// Token bucket for established-link msg1 (rekey / restart).
-    established: TokenBucket,
+    established: TokenBucket<C>,
     /// Current count of pending inbound connections, shared with the
     /// outstanding [`PendingHandshake`] guards.
     pending: Arc<AtomicUsize>,
@@ -351,9 +362,24 @@ pub struct HandshakeRateLimiter {
     max_pending: usize,
 }
 
-impl HandshakeRateLimiter {
+impl<C: Clock> fmt::Debug for HandshakeRateLimiter<C> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("HandshakeRateLimiter")
+            .field("bucket", &self.bucket)
+            .field("established", &self.established)
+            .field("pending", &self.pending)
+            .field("max_pending", &self.max_pending)
+            .finish()
+    }
+}
+
+impl<C: Clock> HandshakeRateLimiter<C> {
     /// Create a handshake rate limiter with the given parameters.
-    pub fn with_params(bucket: TokenBucket, established: TokenBucket, max_pending: usize) -> Self {
+    pub fn with_params(
+        bucket: TokenBucket<C>,
+        established: TokenBucket<C>,
+        max_pending: usize,
+    ) -> Self {
         Self {
             bucket,
             established,
@@ -362,7 +388,7 @@ impl HandshakeRateLimiter {
         }
     }
 
-    /// Check if a new handshake of `class` can be started.
+    /// Check if a new handshake of `class` can be started at `now`.
     ///
     /// Returns `true` if:
     /// - The class's token bucket has available tokens (rate limit not exceeded)
@@ -370,21 +396,26 @@ impl HandshakeRateLimiter {
     ///
     /// Does NOT consume a token - call `start_handshake` for that.
     #[cfg(test)]
-    pub fn can_start_handshake(&mut self, class: Msg1Class) -> bool {
-        self.bucket_for(class).available()
+    pub fn can_start_handshake(&mut self, class: Msg1Class, now: C::Instant) -> bool {
+        self.bucket_for(class).available(now)
             && self.pending.load(Ordering::Relaxed) < self.max_pending
     }
 
-    /// Start a new handshake, consuming a token and taking a pending slot.
+    /// Start a new handshake at `now`, consuming a token and taking a
+    /// pending slot.
     ///
     /// The returned guard releases the slot when it drops. On refusal the
     /// [`Msg1Refusal`] says which limb refused.
-    pub fn start_handshake(&mut self, class: Msg1Class) -> Result<PendingHandshake, Msg1Refusal> {
+    pub fn start_handshake(
+        &mut self,
+        class: Msg1Class,
+        now: C::Instant,
+    ) -> Result<PendingHandshake, Msg1Refusal> {
         if self.pending.load(Ordering::Relaxed) >= self.max_pending {
             return Err(Msg1Refusal::PendingLimit);
         }
 
-        if !self.bucket_for(class).try_acquire() {
+        if !self.bucket_for(class).try_acquire(now) {
             return Err(Msg1Refusal::RateLimit);
         }
 
@@ -394,7 +425,7 @@ impl HandshakeRateLimiter {
         })
     }
 
-    fn bucket_for(&mut self, class: Msg1Class) -> &mut TokenBucket {
+    fn bucket_for(&mut self, class: Msg1Class) -> &mut TokenBucket<C> {
         match class {
             Msg1Class::Stranger => &mut self.bucket,
             Msg1Class::EstablishedLink => &mut self.established,
@@ -409,24 +440,24 @@ impl HandshakeRateLimiter {
 
     /// Get a reference to the stranger token bucket.
     #[cfg(test)]
-    pub fn bucket(&self) -> &TokenBucket {
+    pub fn bucket(&self) -> &TokenBucket<C> {
         &self.bucket
     }
 
     /// Get a reference to the established-link token bucket.
     #[cfg(test)]
-    pub fn established_bucket(&self) -> &TokenBucket {
+    pub fn established_bucket(&self) -> &TokenBucket<C> {
         &self.established
     }
 
-    /// Reset the rate limiter.
+    /// Reset the rate limiter as of `now`.
     ///
     /// Does not affect slots held by live [`PendingHandshake`] guards; they
     /// still decrement on drop, saturating at zero.
     #[cfg(test)]
-    pub fn reset(&mut self) {
-        self.bucket.reset();
-        self.established.reset();
+    pub fn reset(&mut self, now: C::Instant) {
+        self.bucket.reset(now);
+        self.established.reset(now);
         self.pending.store(0, Ordering::Relaxed);
     }
 }
@@ -435,14 +466,14 @@ impl HandshakeRateLimiter {
 const SETUP_BUCKET_IDLE: Duration = Duration::from_secs(300);
 
 /// One link peer's pair of session-setup buckets.
-struct LinkBuckets {
+struct LinkBuckets<C: Clock> {
     /// Setup messages that would create a new half-open session entry.
-    stranger: TokenBucket,
+    stranger: TokenBucket<C>,
     /// Setup messages naming a peer this node already has a session with:
     /// rekey and restart traffic, which creates no new entry.
-    established: TokenBucket,
+    established: TokenBucket<C>,
     /// Last time this peer was charged, for idle pruning.
-    seen: Instant,
+    seen: C::Instant,
 }
 
 /// Rate limiter for inbound FSP SessionSetup messages, keyed on the link peer.
@@ -471,65 +502,54 @@ struct LinkBuckets {
 /// the limit, and it cannot be farmed: earning a fresh bucket costs a full
 /// [`SETUP_BUCKET_IDLE`] of silence on that link, which at any sane sizing is
 /// a far lower sustained rate than simply waiting for the bucket to refill.
-pub struct SessionSetupRateLimiter {
+pub struct SessionSetupRateLimiter<C: Clock = crate::time::HostClock> {
     /// Per-link-peer buckets, created on first use.
-    buckets: HashMap<NodeAddr, LinkBuckets>,
+    buckets: BTreeMap<NodeAddr, LinkBuckets<C>>,
     /// Burst and refill rate for a new link's stranger bucket.
     stranger: (u32, f64),
     /// Burst and refill rate for a new link's established bucket.
     established: (u32, f64),
-    /// Where the limiter reads the time. `Instant::now` outside tests.
-    clock: fn() -> Instant,
 }
 
-impl SessionSetupRateLimiter {
+impl<C: Clock> SessionSetupRateLimiter<C> {
     /// Create a limiter whose per-link buckets take the given parameters.
     ///
     /// Each pair is `(burst, tokens per second)`.
     pub fn with_params(stranger: (u32, f64), established: (u32, f64)) -> Self {
         Self {
-            buckets: HashMap::new(),
+            buckets: BTreeMap::new(),
             stranger,
             established,
-            clock: Instant::now,
         }
     }
 
-    /// Charge one setup message of `class` to `link_peer`.
+    /// Charge one setup message of `class` to `link_peer` at `now`.
     ///
     /// Returns `false` when the class's bucket for that link is empty, in
     /// which case the caller must drop the message before doing any work.
-    pub fn try_admit(&mut self, link_peer: &NodeAddr, class: Msg1Class) -> bool {
-        let now = (self.clock)();
+    pub fn try_admit(&mut self, link_peer: &NodeAddr, class: Msg1Class, now: C::Instant) -> bool {
         let stranger = self.stranger;
         let established = self.established;
         let link = self
             .buckets
             .entry(*link_peer)
             .or_insert_with(|| LinkBuckets {
-                stranger: TokenBucket::with_params_at(stranger.0, stranger.1, now),
-                established: TokenBucket::with_params_at(established.0, established.1, now),
+                stranger: TokenBucket::with_params(stranger.0, stranger.1, now),
+                established: TokenBucket::with_params(established.0, established.1, now),
                 seen: now,
             });
         link.seen = now;
 
         let admitted = match class {
-            Msg1Class::Stranger => link.stranger.try_acquire_at(now),
-            Msg1Class::EstablishedLink => link.established.try_acquire_at(now),
+            Msg1Class::Stranger => link.stranger.try_acquire(now),
+            Msg1Class::EstablishedLink => link.established.try_acquire(now),
         };
 
         if admitted {
             self.buckets
-                .retain(|_, link| now.duration_since(link.seen) < SETUP_BUCKET_IDLE);
+                .retain(|_, link| now.saturating_duration_since(link.seen) < SETUP_BUCKET_IDLE);
         }
         admitted
-    }
-
-    /// Read the time from `clock` instead of `Instant::now`, so a test can
-    /// drive the refill.
-    #[cfg(test)]
-    pub fn set_clock(&mut self, clock: fn() -> Instant) {
-        self.clock = clock;
     }
 
     /// Number of link peers currently holding buckets.
@@ -581,20 +601,20 @@ const SIGN_MAX_AGE: Duration = Duration::from_secs(300);
 /// legitimate bursts of lookups for itself through the few link peers that
 /// lead to it, and a min interval refuses all but the first of each burst.
 /// A bucket absorbs the burst and paces the sustained rate.
-pub struct LookupSignRateLimiter {
-    buckets: HashMap<NodeAddr, SignBucket>,
+pub struct LookupSignRateLimiter<C: Clock = crate::time::HostClock> {
+    buckets: BTreeMap<NodeAddr, SignBucket<C>>,
     burst: f64,
     rate: f64,
 }
 
-struct SignBucket {
+struct SignBucket<C: Clock> {
     /// Tokens remaining, at most `burst`.
     tokens: f64,
     /// When `tokens` was last refilled.
-    updated: Instant,
+    updated: C::Instant,
 }
 
-impl LookupSignRateLimiter {
+impl<C: Clock> LookupSignRateLimiter<C> {
     /// Create with default burst and refill rate.
     pub fn new() -> Self {
         Self::with_params(DEFAULT_SIGN_BURST, DEFAULT_SIGN_RATE)
@@ -603,29 +623,29 @@ impl LookupSignRateLimiter {
     /// Create with a custom burst and refill rate.
     pub fn with_params(burst: f64, rate: f64) -> Self {
         Self {
-            buckets: HashMap::new(),
+            buckets: BTreeMap::new(),
             burst,
             rate,
         }
     }
 
-    /// Spend one token for `from`, or report that its budget is exhausted.
+    /// Spend one token for `from` at `now`, or report that its budget is
+    /// exhausted.
     ///
     /// Returns true when the signature may be produced. A zero burst is
     /// read as "unlimited" rather than "refuse everything", so a
     /// misconfiguration cannot make this node unresolvable.
-    pub fn should_sign(&mut self, from: &NodeAddr) -> bool {
+    pub fn should_sign(&mut self, from: &NodeAddr, now: C::Instant) -> bool {
         if self.burst <= 0.0 {
             return true;
         }
-        let now = Instant::now();
         let burst = self.burst;
         let rate = self.rate;
         let bucket = self.buckets.entry(*from).or_insert(SignBucket {
             tokens: burst,
             updated: now,
         });
-        let elapsed = now.duration_since(bucket.updated).as_secs_f64();
+        let elapsed = now.saturating_duration_since(bucket.updated).as_secs_f64();
         bucket.tokens = (bucket.tokens + elapsed * rate).min(burst);
         bucket.updated = now;
         if bucket.tokens < 1.0 {
@@ -638,9 +658,9 @@ impl LookupSignRateLimiter {
 
     /// Drop buckets untouched for longer than [`SIGN_MAX_AGE`]; a full
     /// bucket carries no state worth keeping.
-    fn cleanup(&mut self, now: Instant) {
+    fn cleanup(&mut self, now: C::Instant) {
         self.buckets
-            .retain(|_, b| now.duration_since(b.updated) < SIGN_MAX_AGE);
+            .retain(|_, b| now.saturating_duration_since(b.updated) < SIGN_MAX_AGE);
     }
 
     #[cfg(test)]
@@ -649,7 +669,7 @@ impl LookupSignRateLimiter {
     }
 }
 
-impl Default for LookupSignRateLimiter {
+impl<C: Clock> Default for LookupSignRateLimiter<C> {
     fn default() -> Self {
         Self::new()
     }

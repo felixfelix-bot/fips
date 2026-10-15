@@ -15,8 +15,10 @@ use crate::proto::lookup::{
 };
 use crate::proto::probe::LookupOutcomeKind;
 use crate::proto::stp::TreeState;
+use crate::time::HostClock;
 use crate::transport::{TransportAddr, TransportId};
 use crate::{NodeAddr, PeerIdentity};
+use fips_core::time::Clock as _;
 use std::collections::HashMap;
 use tracing::{debug, info, trace, warn};
 
@@ -189,7 +191,10 @@ impl Node {
                 // rate. The dedup entry the core recorded stays regardless,
                 // so a refused request still occupies its id and a retry,
                 // which carries a fresh id, is unaffected.
-                if !self.discovery_sign_limiter.should_sign(from) {
+                if !self
+                    .discovery_sign_limiter
+                    .should_sign(from, HostClock.now())
+                {
                     self.metrics()
                         .lookup
                         .record_reject(DiscoveryReject::ReqSignRateLimited);
