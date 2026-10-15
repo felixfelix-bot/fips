@@ -15,8 +15,7 @@ use super::peering::reconcile::{
 use super::peering::retry::MAX_RETRY_CONNECTIONS_PER_TICK;
 
 use crate::config::{ConnectPolicy, PeerAddress, PeerConfig};
-use crate::ipv6tun::lifecycle::{TunThreads, open_tun};
-use crate::ipv6tun::tun::TunState;
+use crate::ipv6tun::lifecycle::TunThreads;
 use crate::node::acl::PeerAclContext;
 use crate::node::dataplane::PeerActionCtx;
 use crate::nostr::{BootstrapEvent, NostrRendezvous};
@@ -1915,7 +1914,8 @@ impl Node {
                     // Initialize TUN interface after transports and peers are
                     // ready.
                     let address = *self.identity().address();
-                    match open_tun(&self.config().tun, address).await {
+                    let config = &self.context.config;
+                    match self.supervisor.ipv6tun.open_tun(&config.tun, address).await {
                         Some(device) => {
                             // Seed the shared MSS ceiling from whatever is bound
                             // right now. Both TUN threads read it live from here
@@ -1931,17 +1931,13 @@ impl Node {
                                 exit_tx: self.child_exit_tx.clone(),
                             };
                             self.supervisor.ipv6tun.spawn_tun(device, threads)?;
-                            self.tun_state = TunState::Active;
                             #[cfg(target_os = "linux")]
                             if let Some(tun) = self.tun_name() {
                                 crate::control::firewall_state::spawn_scope_check(tun);
                             }
                             Event::SubstrateUp { child }
                         }
-                        None => {
-                            self.tun_state = TunState::Failed;
-                            Event::SubstrateFailed { child }
-                        }
+                        None => Event::SubstrateFailed { child },
                     }
                 }
                 Child::Dns => {
@@ -2199,9 +2195,7 @@ impl Node {
                 }
                 Child::Tun => {
                     // Shutdown TUN interface
-                    if self.supervisor.ipv6tun.stop_tun().await {
-                        self.tun_state = TunState::Disabled;
-                    }
+                    self.supervisor.ipv6tun.stop_tun().await;
                 }
                 Child::EncryptWorkers | Child::DecryptWorkers => {
                     // Worker pools are never torn down in stop() (matches

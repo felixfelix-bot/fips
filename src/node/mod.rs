@@ -49,7 +49,6 @@ use self::reloadable::Reloadable;
 pub(crate) const REKEY_JITTER_SECS: i64 = 15;
 use crate::cache::{CoordCache, Funding, Placed};
 use crate::hosts::HostMap;
-use crate::ipv6tun::icmp_rate_limit::IcmpRateLimiter;
 use crate::ipv6tun::tun::{TunError, TunOutboundTx, TunState, TunTx};
 use crate::node::session::SessionEntry;
 use crate::peer::machine::{PeerMachine, TimerKind};
@@ -769,10 +768,6 @@ pub struct Node {
     /// the registry itself cannot be shared instead.
     native_snapshot: std::sync::Arc<arc_swap::ArcSwap<crate::control::snapshot::NativeSnapshot>>,
 
-    // === TUN Interface ===
-    /// TUN device state.
-    tun_state: TunState,
-
     /// Slot the embedder installs its BLE radio into, armed by
     /// [`Self::enable_app_owned_ble_radio`]. `None` unless armed.
     ///
@@ -826,8 +821,6 @@ pub struct Node {
     msg1_rate_limiter: HandshakeRateLimiter,
     /// Rate limiter for inbound FSP SessionSetup, keyed on the link peer.
     setup_rate_limiter: SessionSetupRateLimiter,
-    /// Rate limiter for ICMP Packet Too Big messages.
-    icmp_rate_limiter: IcmpRateLimiter,
     /// Budget bounding the routing errors one authenticated link peer can
     /// induce this node to emit. Keyed on the link peer because that is the
     /// only value at the emission point a sender cannot mint; the
@@ -999,12 +992,6 @@ impl Node {
         };
         bloom_state.set_update_debounce_ms(config.node.bloom.update_debounce_ms);
 
-        let tun_state = if config.tun.enabled {
-            TunState::Configured
-        } else {
-            TunState::Disabled
-        };
-
         // Initialize tree state with signed self-declaration
         let tree_now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1060,7 +1047,12 @@ impl Node {
 
         Ok(Self {
             context,
-            supervisor: lifecycle::supervisor::Supervisor::new(),
+            supervisor: lifecycle::supervisor::Supervisor::new(
+                crate::ipv6tun::lifecycle::Handles::new(
+                    identity.address().to_ipv6(),
+                    config.tun.enabled,
+                ),
+            ),
             tree_state,
             bloom_state,
             coord_cache,
@@ -1105,7 +1097,6 @@ impl Node {
             native_snapshot: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
                 crate::control::snapshot::NativeSnapshot::empty(),
             )),
-            tun_state,
             #[cfg(all(ble_available, any(target_os = "android", test)))]
             ble_radio: None,
             index_allocator: IndexAllocator::new(),
@@ -1120,7 +1111,6 @@ impl Node {
             replayed_msg1s: Default::default(),
             msg1_rate_limiter,
             setup_rate_limiter,
-            icmp_rate_limiter: IcmpRateLimiter::new(),
             peer_error_budget: PeerBudget::new(),
             coord_hint_budget: PeerBudget::coord_hints(),
             routing: Router::new(),
@@ -1180,12 +1170,6 @@ impl Node {
         let mut startup_epoch = [0u8; 8];
         rand::rng().fill_bytes(&mut startup_epoch);
 
-        let tun_state = if config.tun.enabled {
-            TunState::Configured
-        } else {
-            TunState::Disabled
-        };
-
         // Initialize tree state with signed self-declaration
         let tree_now_secs = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -1241,7 +1225,12 @@ impl Node {
 
         Ok(Self {
             context,
-            supervisor: lifecycle::supervisor::Supervisor::new(),
+            supervisor: lifecycle::supervisor::Supervisor::new(
+                crate::ipv6tun::lifecycle::Handles::new(
+                    identity.address().to_ipv6(),
+                    config.tun.enabled,
+                ),
+            ),
             tree_state,
             bloom_state,
             coord_cache,
@@ -1286,7 +1275,6 @@ impl Node {
             native_snapshot: std::sync::Arc::new(arc_swap::ArcSwap::from_pointee(
                 crate::control::snapshot::NativeSnapshot::empty(),
             )),
-            tun_state,
             #[cfg(all(ble_available, any(target_os = "android", test)))]
             ble_radio: None,
             index_allocator: IndexAllocator::new(),
@@ -1301,7 +1289,6 @@ impl Node {
             replayed_msg1s: Default::default(),
             msg1_rate_limiter,
             setup_rate_limiter,
-            icmp_rate_limiter: IcmpRateLimiter::new(),
             peer_error_budget: PeerBudget::new(),
             coord_hint_budget: PeerBudget::coord_hints(),
             routing: Router::new(),
@@ -2208,7 +2195,7 @@ impl Node {
             history: std::sync::Arc::new(self.stats_history.clone()),
             estimated_mesh_size: self.estimated_mesh_size,
             state: self.supervisor.state,
-            tun_state: self.tun_state,
+            tun_state: self.supervisor.ipv6tun.tun_state(),
             tun_name: self.supervisor.ipv6tun.tun_name.clone(),
             effective_ipv6_mtu: self.effective_ipv6_mtu(),
             connection_count: self.connection_count(),
@@ -2930,7 +2917,7 @@ impl Node {
 
     /// Get the TUN state.
     pub fn tun_state(&self) -> TunState {
-        self.tun_state
+        self.supervisor.ipv6tun.tun_state()
     }
 
     /// Get the TUN interface name, if active.
@@ -3977,9 +3964,7 @@ impl Node {
         let (outbound_tx, outbound_rx) = tokio::sync::mpsc::channel(tun_channel_size);
         // mesh → app: the node writes inbound packets to `tun_tx`; the app pulls.
         let (tun_tx, tun_rx) = std::sync::mpsc::channel();
-        self.supervisor.ipv6tun.tun_tx = Some(tun_tx);
-        self.supervisor.ipv6tun.tun_outbound_rx = Some(outbound_rx);
-        self.tun_state = TunState::Active;
+        self.supervisor.ipv6tun.install_app_tun(tun_tx, outbound_rx);
         (outbound_tx, tun_rx)
     }
 

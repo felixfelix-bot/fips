@@ -811,8 +811,9 @@ pub(crate) struct Supervisor {
     /// Packet sender for transports.
     pub(in crate::node) packet_tx: Option<PacketTx>,
 
-    /// TUN and DNS child handles: the TUN device name, channels, reader and
-    /// writer threads and (macOS/FreeBSD) shutdown pipe, and the DNS
+    /// TUN and DNS child state and handles: our address, the TUN state and
+    /// the ICMPv6 rate limiter; the TUN device name, channels, reader and
+    /// writer threads and (macOS/FreeBSD) shutdown pipe; and the DNS
     /// responder task, identity receiver, bound address and peer-alias
     /// sender.
     pub(in crate::node) ipv6tun: crate::ipv6tun::lifecycle::Handles,
@@ -885,12 +886,14 @@ pub(in crate::node) struct StagedPools {
 
 impl Supervisor {
     /// A fresh supervisor with all handles empty and the FSM in `Created`,
-    /// matching the field initializers `Node::new` previously used.
-    pub(crate) fn new() -> Self {
+    /// matching the field initializers `Node::new` previously used. The
+    /// TUN and DNS state, built by the node from its identity and config,
+    /// is handed in.
+    pub(crate) fn new(ipv6tun: crate::ipv6tun::lifecycle::Handles) -> Self {
         Self {
             state: NodeState::Created,
             packet_tx: None,
-            ipv6tun: Default::default(),
+            ipv6tun,
             #[cfg(unix)]
             udp_fd_tx: None,
             nostr_rendezvous: crate::nostr::RendezvousDriver::default(),
