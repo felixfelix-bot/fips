@@ -19,7 +19,7 @@ use secp256k1::PublicKey;
 use tracing::{debug, info};
 
 use crate::node::Node;
-use crate::node::session::SessionEntry;
+use crate::node::session::{SessionEntry, SessionInstant};
 use crate::proto::probe::{
     Budgets, LeftIntact, LookupOutcomeKind, MAX_CONCURRENT_PROBES, NextHopFacts, NoHopReason,
     Observation, Preflight, Probe, ProbeAction, REAP_MS, RttCounters, describe_path,
@@ -52,8 +52,8 @@ pub(crate) struct ProbeJob {
     /// `created_at` of the entry `initiate_session` inserted for us. The
     /// teardown identity check is an equality against this, not an inequality
     /// against the start time — a `>=` still admits a replacement entry.
-    owned_created_at: Option<u64>,
-    activity_at_establish: Option<u64>,
+    owned_created_at: Option<SessionInstant>,
+    activity_at_establish: Option<SessionInstant>,
     traffic_at_establish: Option<(u64, u64, u64, u64)>,
     lookup_outcome: Option<LookupOutcomeKind>,
     lookup_fanout: Option<usize>,

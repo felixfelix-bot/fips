@@ -65,7 +65,7 @@ use crate::proto::lookup::{Lookup, LookupBackoff, LookupForwardRateLimiter};
 use crate::proto::mmp::Mmp;
 use crate::proto::routing::{self, Router, RoutingErrorRateLimiter};
 use crate::proto::stp::TreeState;
-use crate::time::HostClock;
+use crate::time::{HostClock, WallStamp};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::transport::ethernet::EthernetTransport;
 use crate::transport::nym::NymTransport;
@@ -2724,7 +2724,7 @@ impl Node {
 
                 let resend_count = (!entry.is_established()).then(|| entry.resend_count());
                 let established = entry.is_established().then(|| snap::SessionEstablished {
-                    session_start_ms: entry.session_start_ms(),
+                    session_start_ms: entry.session_start().map_or(0, WallStamp::wall_ms),
                     current_k_bit: entry.current_k_bit(),
                     coords_warmup_remaining: entry.coords_warmup_remaining(),
                     is_draining: entry.is_draining(),
@@ -2742,7 +2742,7 @@ impl Node {
                     display_name: self.peer_display_name(addr),
                     state,
                     is_initiator: entry.is_initiator(),
-                    last_activity_ms: entry.last_activity(),
+                    last_activity_ms: entry.last_activity().wall_ms(),
                     npub: crate::identity::encode_npub(&xonly),
                     stats: snap::SessionStats {
                         packets_sent: pkts_tx,

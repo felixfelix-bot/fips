@@ -1,7 +1,7 @@
 //! End-to-end session establishment tests.
 
 use super::*;
-use crate::node::session::EndToEndState;
+use crate::node::session::{EndToEndState, session_after, session_at, session_before};
 use crate::node::tests::spanning_tree::{
     TestNode, cleanup_nodes, drain_all_packets, generate_random_edges, initiate_handshake,
     lock_large_network_test, make_test_node_with_config, populate_all_coord_caches,
@@ -37,15 +37,15 @@ fn test_session_entry_new_initiating() {
         *identity_b.node_addr(),
         identity_b.pubkey_full(),
         EndToEndState::Initiating(handshake),
-        1000,
+        session_at(1000),
         true,
     );
 
     assert!(entry.state().is_initiating());
     assert!(!entry.state().is_established());
     assert!(!entry.state().is_awaiting_msg3());
-    assert_eq!(entry.created_at(), 1000);
-    assert_eq!(entry.last_activity(), 1000);
+    assert_eq!(entry.created_at(), session_at(1000));
+    assert_eq!(entry.last_activity(), session_at(1000));
 }
 
 #[test]
@@ -64,7 +64,7 @@ fn test_session_entry_rekey_jitter_in_range() {
             *identity_b.node_addr(),
             identity_b.pubkey_full(),
             EndToEndState::Initiating(handshake),
-            1000,
+            session_at(1000),
             true,
         );
         let j = entry.rekey_jitter_secs();
@@ -96,7 +96,7 @@ fn test_session_entry_rekey_jitter_mean_near_zero() {
             *identity_b.node_addr(),
             identity_b.pubkey_full(),
             EndToEndState::Initiating(handshake),
-            1000,
+            session_at(1000),
             true,
         );
         sum += entry.rekey_jitter_secs();
@@ -123,13 +123,13 @@ fn test_session_entry_touch() {
         *identity_b.node_addr(),
         identity_b.pubkey_full(),
         EndToEndState::Initiating(handshake),
-        1000,
+        session_at(1000),
         true,
     );
 
-    entry.touch(2000);
-    assert_eq!(entry.last_activity(), 2000);
-    assert_eq!(entry.created_at(), 1000);
+    entry.touch(session_at(2000));
+    assert_eq!(entry.last_activity(), session_at(2000));
+    assert_eq!(entry.created_at(), session_at(1000));
 }
 
 /// A clock step back past the session's start must not wrap the inner
@@ -146,13 +146,13 @@ fn session_timestamp_is_zero_when_now_precedes_the_session_start() {
         *identity_b.node_addr(),
         identity_b.pubkey_full(),
         EndToEndState::Initiating(handshake),
-        10_000,
+        session_at(10_000),
         true,
     );
-    entry.mark_established(10_000);
+    entry.mark_established(session_at(10_000));
 
-    assert_eq!(entry.session_timestamp(11_500), 1_500);
-    assert_eq!(entry.session_timestamp(9_000), 0);
+    assert_eq!(entry.session_timestamp(session_at(11_500)), 1_500);
+    assert_eq!(entry.session_timestamp(session_at(9_000)), 0);
 }
 
 #[test]
@@ -170,7 +170,7 @@ fn test_session_table_operations() {
         dest_addr,
         identity_b.pubkey_full(),
         EndToEndState::Initiating(handshake),
-        1000,
+        session_at(1000),
         true,
     );
 
@@ -3615,7 +3615,7 @@ fn test_purge_idle_sessions_removes_expired() {
         remote_addr,
         remote.pubkey_full(),
         EndToEndState::Established(session),
-        1000, // created at t=1000ms
+        session_at(1000), // created at t=1000ms
         true,
     );
 
@@ -3625,7 +3625,7 @@ fn test_purge_idle_sessions_removes_expired() {
 
     // Purge at t=92s — should exceed default 90s idle timeout
     let now_ms = 1000 + 92_000;
-    node.purge_idle_sessions(now_ms);
+    node.purge_idle_sessions(session_at(now_ms));
 
     assert_eq!(node.session_count(), 0, "Idle session should be purged");
 }
@@ -3641,18 +3641,18 @@ fn test_purge_idle_sessions_keeps_active() {
         remote_addr,
         remote.pubkey_full(),
         EndToEndState::Established(session),
-        1000,
+        session_at(1000),
         true,
     );
 
     // Touch at t=80s — recent activity
-    entry.touch(81_000);
+    entry.touch(session_at(81_000));
 
     node.sessions.insert(remote_addr, entry);
 
     // Purge at t=92s — only 11s since last activity, well within 90s timeout
     let now_ms = 92_000;
-    node.purge_idle_sessions(now_ms);
+    node.purge_idle_sessions(session_at(now_ms));
 
     assert_eq!(
         node.session_count(),
@@ -3674,7 +3674,7 @@ fn test_purge_idle_sessions_ignores_initiating() {
         remote_addr,
         remote.pubkey_full(),
         EndToEndState::Initiating(handshake),
-        1000,
+        session_at(1000),
         true,
     );
 
@@ -3682,7 +3682,7 @@ fn test_purge_idle_sessions_ignores_initiating() {
 
     // Purge well past the idle timeout — Initiating sessions should not be touched
     let now_ms = 1000 + 200_000;
-    node.purge_idle_sessions(now_ms);
+    node.purge_idle_sessions(session_at(now_ms));
 
     assert_eq!(
         node.session_count(),
@@ -3702,7 +3702,7 @@ fn test_purge_idle_sessions_cleans_pending_packets() {
         remote_addr,
         remote.pubkey_full(),
         EndToEndState::Established(session),
-        1000,
+        session_at(1000),
         true,
     );
 
@@ -3716,7 +3716,7 @@ fn test_purge_idle_sessions_cleans_pending_packets() {
 
     // Purge after idle timeout
     let now_ms = 1000 + 92_000;
-    node.purge_idle_sessions(now_ms);
+    node.purge_idle_sessions(session_at(now_ms));
 
     assert_eq!(node.session_count(), 0);
     assert!(
@@ -3739,7 +3739,7 @@ fn test_purge_idle_sessions_disabled_when_zero() {
         remote_addr,
         remote.pubkey_full(),
         EndToEndState::Established(session),
-        1000,
+        session_at(1000),
         true,
     );
 
@@ -3747,7 +3747,7 @@ fn test_purge_idle_sessions_disabled_when_zero() {
 
     // Even way past any timeout, sessions should survive when disabled
     let now_ms = 1000 + 1_000_000;
-    node.purge_idle_sessions(now_ms);
+    node.purge_idle_sessions(session_at(now_ms));
 
     assert_eq!(
         node.session_count(),
@@ -3767,7 +3767,7 @@ fn test_purge_idle_sessions_mmp_activity_does_not_prevent_purge() {
         remote_addr,
         remote.pubkey_full(),
         EndToEndState::Established(session),
-        1000, // created at t=1s
+        session_at(1000), // created at t=1s
         true,
     );
 
@@ -3780,7 +3780,7 @@ fn test_purge_idle_sessions_mmp_activity_does_not_prevent_purge() {
     // Even though MMP reports would have been flowing, they no longer
     // reset the idle timer.
     let now_ms = 92_000;
-    node.purge_idle_sessions(now_ms);
+    node.purge_idle_sessions(session_at(now_ms));
 
     assert_eq!(
         node.session_count(),
@@ -3806,7 +3806,7 @@ fn test_coords_warmup_counter_default_zero_on_new() {
         *identity_b.node_addr(),
         identity_b.pubkey_full(),
         EndToEndState::Initiating(handshake),
-        1000,
+        session_at(1000),
         true,
     );
 
@@ -3828,7 +3828,7 @@ fn test_coords_warmup_counter_set_and_get() {
         remote_addr,
         remote.pubkey_full(),
         EndToEndState::Established(session),
-        1000,
+        session_at(1000),
         true,
     );
 
@@ -3852,7 +3852,7 @@ fn test_coords_warmup_counter_decrement() {
         remote_addr,
         remote.pubkey_full(),
         EndToEndState::Established(session),
-        1000,
+        session_at(1000),
         true,
     );
 
@@ -3963,22 +3963,22 @@ fn test_session_entry_handshake_payload_storage() {
         *identity_b.node_addr(),
         identity_b.pubkey_full(),
         EndToEndState::Initiating(handshake),
-        1000,
+        session_at(1000),
         true,
     );
 
     // Initially no handshake payload
     assert!(entry.handshake_payload().is_none());
     assert_eq!(entry.resend_count(), 0);
-    assert_eq!(entry.next_resend_at_ms(), 0);
+    assert_eq!(entry.next_resend_at(), None);
 
     // Store a handshake payload
     let payload = vec![0x01, 0x02, 0x03, 0x04];
-    entry.set_handshake_payload(payload.clone(), 2000);
+    entry.set_handshake_payload(payload.clone(), session_at(2000));
 
     assert_eq!(entry.handshake_payload().unwrap(), &payload);
     assert_eq!(entry.resend_count(), 0);
-    assert_eq!(entry.next_resend_at_ms(), 2000);
+    assert_eq!(entry.next_resend_at(), Some(session_at(2000)));
 }
 
 /// Test that resend_count and next_resend_at_ms track correctly on SessionEntry.
@@ -3995,21 +3995,21 @@ fn test_session_entry_resend_tracking() {
         *identity_b.node_addr(),
         identity_b.pubkey_full(),
         EndToEndState::Initiating(handshake),
-        1000,
+        session_at(1000),
         true,
     );
 
-    entry.set_handshake_payload(vec![0x01], 2000);
+    entry.set_handshake_payload(vec![0x01], session_at(2000));
 
     // Record first resend
-    entry.record_resend(4000);
+    entry.record_resend(session_at(4000));
     assert_eq!(entry.resend_count(), 1);
-    assert_eq!(entry.next_resend_at_ms(), 4000);
+    assert_eq!(entry.next_resend_at(), Some(session_at(4000)));
 
     // Record second resend
-    entry.record_resend(8000);
+    entry.record_resend(session_at(8000));
     assert_eq!(entry.resend_count(), 2);
-    assert_eq!(entry.next_resend_at_ms(), 8000);
+    assert_eq!(entry.next_resend_at(), Some(session_at(8000)));
 }
 
 /// Test that clear_handshake_payload clears payload and resets timer.
@@ -4026,19 +4026,19 @@ fn test_session_entry_clear_handshake_payload() {
         *identity_b.node_addr(),
         identity_b.pubkey_full(),
         EndToEndState::Initiating(handshake),
-        1000,
+        session_at(1000),
         true,
     );
 
-    entry.set_handshake_payload(vec![0x01, 0x02], 2000);
-    entry.record_resend(4000);
+    entry.set_handshake_payload(vec![0x01, 0x02], session_at(2000));
+    entry.record_resend(session_at(4000));
     assert!(entry.handshake_payload().is_some());
     assert_eq!(entry.resend_count(), 1);
 
     // Clear on Established transition
     entry.clear_handshake_payload();
     assert!(entry.handshake_payload().is_none());
-    assert_eq!(entry.next_resend_at_ms(), 0);
+    assert_eq!(entry.next_resend_at(), None);
     // resend_count is NOT reset — it's a historical record
     assert_eq!(entry.resend_count(), 1);
 }
@@ -4061,7 +4061,7 @@ async fn test_session_handshake_timeout() {
         dest_addr,
         identity_b.pubkey_full(),
         EndToEndState::Initiating(handshake),
-        1000,
+        session_at(1000),
         true,
     );
     node.sessions.insert(dest_addr, entry);
@@ -4071,7 +4071,8 @@ async fn test_session_handshake_timeout() {
     // Before timeout: session should remain
     let timeout_secs = node.config().node.rate_limit.handshake_timeout_secs;
     let before_timeout = 1000 + timeout_secs * 1000 - 1;
-    node.resend_pending_session_handshakes(before_timeout).await;
+    node.resend_pending_session_handshakes(session_at(before_timeout))
+        .await;
     assert!(
         node.sessions.contains_key(&dest_addr),
         "Session should survive before timeout"
@@ -4079,7 +4080,8 @@ async fn test_session_handshake_timeout() {
 
     // After timeout: session should be removed
     let after_timeout = 1000 + timeout_secs * 1000 + 1;
-    node.resend_pending_session_handshakes(after_timeout).await;
+    node.resend_pending_session_handshakes(session_at(after_timeout))
+        .await;
     assert!(
         !node.sessions.contains_key(&dest_addr),
         "Timed-out session should be removed"
@@ -4105,7 +4107,7 @@ async fn test_session_awaiting_msg3_timeout() {
         src_addr,
         identity_a.pubkey_full(),
         EndToEndState::AwaitingMsg3(handshake),
-        1000,
+        session_at(1000),
         false,
     );
     node.sessions.insert(src_addr, entry);
@@ -4115,7 +4117,8 @@ async fn test_session_awaiting_msg3_timeout() {
     // After timeout: session should be removed
     let timeout_secs = node.config().node.rate_limit.handshake_timeout_secs;
     let after_timeout = 1000 + timeout_secs * 1000 + 1;
-    node.resend_pending_session_handshakes(after_timeout).await;
+    node.resend_pending_session_handshakes(session_at(after_timeout))
+        .await;
     assert!(
         !node.sessions.contains_key(&src_addr),
         "Timed-out AwaitingMsg3 session should be removed"
@@ -4471,7 +4474,7 @@ fn install_halfopen(node: &mut Node, claimed: NodeAddr) {
         claimed,
         placeholder,
         EndToEndState::AwaitingMsg3(handshake),
-        1000,
+        session_at(1000),
         false,
     );
     node.sessions.insert(claimed, entry);
@@ -4500,7 +4503,7 @@ fn install_initiating(node: &mut Node, remote: &Identity) {
         remote_addr,
         remote.pubkey_full(),
         EndToEndState::Initiating(handshake),
-        1000,
+        session_at(1000),
         true,
     );
     node.sessions.insert(remote_addr, entry);
@@ -5485,7 +5488,7 @@ fn install_established_session_with_mmp(node: &mut Node, remote: &Identity) {
         remote_addr,
         remote.pubkey_full(),
         EndToEndState::Established(session),
-        1000,
+        session_at(1000),
         true,
     );
     entry.init_mmp(&node.config().node.session_mmp);
@@ -5687,12 +5690,12 @@ async fn test_idle_session_purge_keeps_link_peer_path_mtu_seed() {
         remote_addr,
         remote.pubkey_full(),
         EndToEndState::Established(session),
-        1000,
+        session_at(1000),
         true,
     );
     node.sessions.insert(remote_addr, entry);
 
-    node.purge_idle_sessions(1000 + 92_000);
+    node.purge_idle_sessions(session_at(1000 + 92_000));
     assert_eq!(node.session_count(), 0, "precondition: the session expired");
 
     assert_eq!(
@@ -5765,12 +5768,15 @@ async fn test_session_msg3_rejects_spoofed_source_address() {
     let (responder, msg3) = drive_xk_to_msg3(&attacker, node.identity());
 
     // Half-open session recorded under the victim's address, as
-    // handle_session_setup would have done from the claimed source.
+    // handle_session_setup would have done from the claimed source, a
+    // handshake timeout ago, so its hold does not keep the entry once the
+    // msg3 drops the candidate.
+    let timeout_ms = node.config().node.rate_limit.handshake_timeout_secs * 1000;
     let entry = crate::node::session::SessionEntry::new(
         victim_addr,
         node.identity().pubkey_full(),
         EndToEndState::AwaitingMsg3(responder),
-        1000,
+        session_before(Node::session_now(), timeout_ms + 1_000),
         false,
     );
     node.sessions.insert(victim_addr, entry);
@@ -5809,7 +5815,7 @@ async fn test_session_msg3_accepts_matching_source_address() {
         peer_addr,
         node.identity().pubkey_full(),
         EndToEndState::AwaitingMsg3(responder),
-        1000,
+        session_at(1000),
         false,
     );
     node.sessions.insert(peer_addr, entry);
@@ -5845,10 +5851,10 @@ async fn test_rekey_msg3_rejects_different_static_key() {
         peer_addr,
         legit.pubkey_full(),
         EndToEndState::Established(session),
-        1000,
+        session_at(1000),
         true,
     );
-    entry.mark_established(1000);
+    entry.mark_established(session_at(1000));
 
     // Responder-side rekey armed, but driven by a different identity.
     let (responder, msg3) = drive_xk_to_msg3(&attacker, node.identity());
@@ -5888,10 +5894,10 @@ async fn test_rekey_msg3_accepts_established_peer_key() {
         peer_addr,
         legit.pubkey_full(),
         EndToEndState::Established(session),
-        1000,
+        session_at(1000),
         true,
     );
-    entry.mark_established(1000);
+    entry.mark_established(session_at(1000));
 
     let (responder, msg3) = drive_xk_to_msg3(&legit, node.identity());
     entry.set_rekey_state(responder, false);
@@ -5933,10 +5939,10 @@ async fn test_rekey_msg3_accepts_odd_parity_peer_stored_as_even() {
         peer_addr,
         stored_pubkey,
         EndToEndState::Established(session),
-        1000,
+        session_at(1000),
         true,
     );
-    entry.mark_established(1000);
+    entry.mark_established(session_at(1000));
 
     let (responder, msg3) = drive_xk_to_msg3(&legit, node.identity());
     entry.set_rekey_state(responder, false);
@@ -5993,14 +5999,14 @@ fn arm_stranger_handshake_beside_stale_pending(
     let (responder, msg3) = drive_xk_to_msg3(stranger, node.identity());
 
     let idle_ms = node.config().node.session.idle_timeout_secs * 1000;
-    let now_ms = wall_clock_ms();
+    let now = Node::session_now();
     let entry = node.sessions.get_mut(peer_addr).unwrap();
     entry.set_pending_session(pending);
     // Stale enough that `pending_stale` is true, which is what lets a forged
     // setup arm the handshake this state starts from.
-    entry.set_rekey_completed_ms(now_ms - idle_ms - 60_000);
+    entry.set_rekey_completed(session_before(now, idle_ms + 60_000));
     entry.set_rekey_state(responder, false);
-    entry.record_peer_rekey(now_ms);
+    entry.record_peer_rekey(now);
 
     msg3
 }
@@ -6013,7 +6019,7 @@ async fn test_forged_msg3_against_a_peer_armed_handshake_leaves_the_completed_ep
         install_stale_pending_beside_a_stranger_armed_handshake(&peer, &stranger);
     // Backdate the stamp the handshake's deadline runs from, so a restore
     // that restamped it to the current time could not match by accident.
-    let armed_at = wall_clock_ms() - 5_000;
+    let armed_at = session_before(Node::session_now(), 5_000);
     node.sessions
         .get_mut(&peer_addr)
         .unwrap()
@@ -6026,8 +6032,8 @@ async fn test_forged_msg3_against_a_peer_armed_handshake_leaves_the_completed_ep
 
     let entry = node.sessions.get(&peer_addr).expect("session present");
     assert_eq!(
-        entry.last_peer_rekey_ms(),
-        armed_at,
+        entry.last_peer_rekey(),
+        Some(armed_at),
         "the restore must not restamp the handshake's deadline, or a spray \
          would hold it open"
     );
@@ -6711,10 +6717,10 @@ async fn test_the_session_table_admits_again_after_the_handshake_reaper_drains_i
         .rate_limit
         .handshake_timeout_secs
         * 1000;
-    let now_ms = Node::now_ms();
+    let now = Node::session_now();
     nodes[1]
         .node
-        .resend_pending_session_handshakes(now_ms + timeout_ms + 1)
+        .resend_pending_session_handshakes(session_after(now, timeout_ms + 1))
         .await;
     assert_eq!(
         nodes[1].node.sessions.len(),
@@ -7051,7 +7057,7 @@ async fn a_lost_initial_msg3_is_resent_and_the_responder_completes_the_session()
         .handshake_resend_interval_ms;
     nodes[0]
         .node
-        .resend_pending_session_handshakes(Node::now_ms() + interval_ms + 1)
+        .resend_pending_session_handshakes(session_after(Node::session_now(), interval_ms + 1))
         .await;
     pump_until_quiet(&mut nodes).await;
 
@@ -7104,7 +7110,7 @@ async fn an_initiator_stops_resending_msg3_once_a_responder_frame_authenticates(
 
     // Control: before the responder has sent anything, the sweep does resend,
     // so a silent sweep at the end is the release and not a dead driver.
-    let t1 = Node::now_ms() + interval_ms + 1;
+    let t1 = session_after(Node::session_now(), interval_ms + 1);
     nodes[0].node.resend_pending_session_handshakes(t1).await;
     assert_eq!(
         drain_queued(&mut nodes[1]),
@@ -7125,7 +7131,7 @@ async fn an_initiator_stops_resending_msg3_once_a_responder_frame_authenticates(
 
     nodes[0]
         .node
-        .resend_pending_session_handshakes(t1 + 64_000)
+        .resend_pending_session_handshakes(session_after(t1, 64_000))
         .await;
     assert_eq!(
         nodes[1].packet_rx.len(),
@@ -7162,7 +7168,7 @@ async fn a_resent_msg3_reaching_an_established_responder_is_refused_and_the_sess
 
     nodes[0]
         .node
-        .resend_pending_session_handshakes(Node::now_ms() + interval_ms + 1)
+        .resend_pending_session_handshakes(session_after(Node::session_now(), interval_ms + 1))
         .await;
     assert_eq!(
         nodes[1].packet_rx.len(),
@@ -7210,10 +7216,10 @@ async fn initial_msg3_resends_stop_at_the_budget_and_release_the_payload() {
     // 64 s steps pass any single backoff interval at stock settings, so each
     // step is due. Node 0 holds only its established entry, so the sweep's
     // timeout pass cannot remove anything on it.
-    let mut now = Node::now_ms();
+    let mut now = Node::session_now();
     let mut sent = Vec::new();
     for _ in 0..(max_resends + 2) {
-        now += 64_000;
+        now = session_after(now, 64_000);
         nodes[0].node.resend_pending_session_handshakes(now).await;
         sent.push(drain_queued(&mut nodes[1]));
     }
@@ -7361,13 +7367,13 @@ async fn test_forged_session_ack_leaves_the_rekey_able_to_complete_on_the_genuin
 
     // node 0 cuts over on its liveness timer, and data decodes both ways on
     // the new epoch.
-    let now_ms = wall_clock_ms();
+    let now = Node::session_now();
     nodes[0]
         .node
         .sessions
         .get_mut(&node1_addr)
         .unwrap()
-        .set_rekey_completed_ms(now_ms - 10_000);
+        .set_rekey_completed(session_before(now, 10_000));
     nodes[0].node.check_session_rekey().await;
     assert!(
         nodes[0]
@@ -7884,10 +7890,10 @@ fn install_established_peer(node: &mut Node, peer: &Identity) -> crate::NodeAddr
         peer_addr,
         peer.pubkey_full(),
         EndToEndState::Established(session),
-        1000,
+        session_at(1000),
         true,
     );
-    entry.mark_established(1000);
+    entry.mark_established(session_at(1000));
     node.sessions.insert(peer_addr, entry);
     peer_addr
 }
@@ -8085,9 +8091,9 @@ async fn test_a_responder_handshake_with_no_peer_rekey_stamp_is_not_expired_by_t
     let stranger = Identity::generate();
     let (mut node, peer_addr) = make_node_with_established_peer(false, &peer);
 
-    // Arm a responder-side handshake but leave `last_peer_rekey_ms` at zero.
-    // The expiry predicate's `!= 0` conjunct is what stops that unstamped
-    // zero being read as an age of the whole Unix epoch. This pins a
+    // Arm a responder-side handshake but leave `last_peer_rekey` unset.
+    // The expiry predicate's "stamp present" conjunct is what stops that
+    // unset stamp being read as infinitely old. This pins a
     // defence-in-depth guard: the state is unreachable in production, since
     // the only responder arming stamps the field on the adjacent line.
     let (responder, _msg3) = drive_xk_to_msg3(&stranger, node.identity());
@@ -8096,8 +8102,8 @@ async fn test_a_responder_handshake_with_no_peer_rekey_stamp_is_not_expired_by_t
         .unwrap()
         .set_rekey_state(responder, false);
     assert_eq!(
-        node.sessions.get(&peer_addr).unwrap().last_peer_rekey_ms(),
-        0,
+        node.sessions.get(&peer_addr).unwrap().last_peer_rekey(),
+        None,
         "test fixture must actually leave the stamp unset"
     );
 
@@ -8111,6 +8117,41 @@ async fn test_a_responder_handshake_with_no_peer_rekey_stamp_is_not_expired_by_t
         "an unstamped handshake must not be read as infinitely old"
     );
     assert_eq!(node.stats().session.rekey_expired, 0);
+}
+
+/// The counterpart for a handshake this node armed: with no `initiated`
+/// stamp it reads as expired, deliberately, since dropping it costs a retry
+/// and keeping it stops rotation.
+#[tokio::test]
+async fn an_initiator_rekey_without_a_stamp_reads_as_expired() {
+    let peer = Identity::generate();
+    let (mut node, peer_addr) = make_node_with_established_peer(false, &peer);
+
+    let ours = crate::noise::HandshakeState::new_xk_initiator(
+        node.identity().keypair(),
+        peer.pubkey_full(),
+    );
+    node.sessions
+        .get_mut(&peer_addr)
+        .unwrap()
+        .set_rekey_state(ours, true);
+    assert_eq!(
+        node.sessions.get(&peer_addr).unwrap().initiated(),
+        None,
+        "test fixture must actually leave the stamp unset"
+    );
+
+    node.check_session_rekey().await;
+
+    assert!(
+        !node
+            .sessions
+            .get(&peer_addr)
+            .unwrap()
+            .has_rekey_in_progress(),
+        "an unstamped handshake this node armed must be retired"
+    );
+    assert_eq!(node.stats().session.rekey_unanswered, 1);
 }
 
 /// Wall-clock milliseconds, matching the clock the tick loop reads.
@@ -8130,7 +8171,7 @@ async fn test_superseded_key_epoch_is_drained_with_rekey_disabled() {
     node.sessions
         .get_mut(&peer_addr)
         .unwrap()
-        .set_previous_session_for_test(old, 1000);
+        .set_previous_session_for_test(old, session_at(1000));
     assert!(node.sessions.get(&peer_addr).unwrap().is_draining());
 
     node.check_session_rekey().await;
@@ -8150,10 +8191,10 @@ async fn test_abandoned_peer_armed_rekey_expires_with_rekey_disabled() {
 
     // A setup message armed a responder-side handshake whose msg3 never came.
     let (responder, _msg3) = drive_xk_to_msg3(&attacker, node.identity());
-    let now_ms = wall_clock_ms();
+    let now = Node::session_now();
     let entry = node.sessions.get_mut(&peer_addr).unwrap();
     entry.set_rekey_state(responder, false);
-    entry.record_peer_rekey(now_ms - 31_000);
+    entry.record_peer_rekey(session_before(now, 31_000));
 
     node.check_session_rekey().await;
 
@@ -8248,11 +8289,11 @@ async fn test_completed_peer_rekey_session_is_never_expired_by_the_tick_loop() {
     // to, so no amount of waiting may discard them.
     let pending = make_noise_session(node.identity(), &peer);
     let idle_ms = node.config().node.session.idle_timeout_secs * 1000;
-    let now_ms = wall_clock_ms();
+    let now = Node::session_now();
     let entry = node.sessions.get_mut(&peer_addr).unwrap();
     entry.set_pending_session(pending);
-    entry.set_rekey_completed_ms(now_ms - idle_ms - 60_000);
-    entry.record_peer_rekey(now_ms - idle_ms - 60_000);
+    entry.set_rekey_completed(session_before(now, idle_ms + 60_000));
+    entry.record_peer_rekey(session_before(now, idle_ms + 60_000));
 
     for _ in 0..3 {
         node.check_session_rekey().await;
@@ -8290,12 +8331,12 @@ async fn test_expiring_an_armed_handshake_keeps_the_completed_session_beside_it(
     // came. Expiring the handshake must not take the keys with it.
     let pending = make_noise_session(node.identity(), &peer);
     let (responder, _msg3) = drive_xk_to_msg3(&peer, node.identity());
-    let now_ms = wall_clock_ms();
+    let now = Node::session_now();
     let entry = node.sessions.get_mut(&peer_addr).unwrap();
     entry.set_pending_session(pending);
-    entry.set_rekey_completed_ms(now_ms - 120_000);
+    entry.set_rekey_completed(session_before(now, 120_000));
     entry.set_rekey_state(responder, false);
-    entry.record_peer_rekey(now_ms - 31_000);
+    entry.record_peer_rekey(session_before(now, 31_000));
 
     node.check_session_rekey().await;
 
@@ -8322,10 +8363,10 @@ async fn test_fresh_peer_armed_rekey_is_not_expired() {
     let (mut node, peer_addr) = make_node_with_established_peer(false, &peer);
 
     let (responder, _msg3) = drive_xk_to_msg3(&peer, node.identity());
-    let now_ms = wall_clock_ms();
+    let now = Node::session_now();
     let entry = node.sessions.get_mut(&peer_addr).unwrap();
     entry.set_rekey_state(responder, false);
-    entry.record_peer_rekey(now_ms);
+    entry.record_peer_rekey(now);
 
     node.check_session_rekey().await;
 
@@ -8763,7 +8804,7 @@ async fn cut_over_initiator(nodes: &mut [TestNode], init: usize, resp_addr: &Nod
         .sessions
         .get_mut(resp_addr)
         .unwrap()
-        .set_rekey_completed_ms(wall_clock_ms() - 10_000);
+        .set_rekey_completed(session_before(Node::session_now(), 10_000));
     nodes[init].node.check_session_rekey().await;
     let entry = nodes[init].node.get_session(resp_addr).unwrap();
     entry.pending_new_session().is_none() && !entry.has_rekey_in_progress()
@@ -8876,11 +8917,11 @@ async fn rekey_with_window_forgery(forgery: WindowForgery) -> (WindowOutcome, St
         .node
         .rate_limit
         .handshake_max_resends;
-    let base_ms = Node::now_ms();
+    let base = Node::session_now();
     for step in 1..=u64::from(max_resends) + 1 {
         nodes[init]
             .node
-            .resend_pending_session_msg3(base_ms + step * 64_000)
+            .resend_pending_session_msg3(session_after(base, step * 64_000))
             .await;
         pump_all(&mut nodes).await;
     }
@@ -8895,7 +8936,7 @@ async fn rekey_with_window_forgery(forgery: WindowForgery) -> (WindowOutcome, St
         .sessions
         .get_mut(&init_addr)
         .unwrap()
-        .record_peer_rekey(wall_clock_ms() - 60_000);
+        .record_peer_rekey(session_before(Node::session_now(), 60_000));
     nodes[resp].node.check_session_rekey().await;
     assert!(
         rekey_initiated(&nodes[resp], &init_addr),
@@ -9009,12 +9050,8 @@ async fn test_an_unreadable_session_ack_does_not_push_out_the_rekey_deadline() {
     let node1_addr = *nodes[1].node.node_addr();
 
     start_rekey(&mut nodes, 0).await;
-    let armed_at = nodes[0]
-        .node
-        .get_session(&node1_addr)
-        .unwrap()
-        .initiated_ms();
-    assert_ne!(armed_at, 0, "arming must stamp the deadline");
+    let armed_at = nodes[0].node.get_session(&node1_addr).unwrap().initiated();
+    assert_ne!(armed_at, None, "arming must stamp the deadline");
 
     tokio::time::sleep(Duration::from_millis(5)).await;
     let forged = forged_session_ack(&nodes[1]);
@@ -9028,11 +9065,7 @@ async fn test_an_unreadable_session_ack_does_not_push_out_the_rekey_deadline() {
         "the unreadable ack must have put the handshake back"
     );
     assert_eq!(
-        nodes[0]
-            .node
-            .get_session(&node1_addr)
-            .unwrap()
-            .initiated_ms(),
+        nodes[0].node.get_session(&node1_addr).unwrap().initiated(),
         armed_at,
         "the restore must not restamp the deadline"
     );
@@ -9054,12 +9087,8 @@ async fn test_a_fresh_initiated_rekey_is_not_retired_on_the_peers_older_rekey_st
         .sessions
         .get_mut(&node1_addr)
         .unwrap()
-        .record_peer_rekey(wall_clock_ms() - 60_000);
-    let armed_at = nodes[0]
-        .node
-        .get_session(&node1_addr)
-        .unwrap()
-        .initiated_ms();
+        .record_peer_rekey(session_before(Node::session_now(), 60_000));
+    let armed_at = nodes[0].node.get_session(&node1_addr).unwrap().initiated();
 
     nodes[0].node.check_session_rekey().await;
 
@@ -9068,11 +9097,7 @@ async fn test_a_fresh_initiated_rekey_is_not_retired_on_the_peers_older_rekey_st
         "a fresh rekey this node initiated must not be retired on the peer's clock"
     );
     assert_eq!(
-        nodes[0]
-            .node
-            .get_session(&node1_addr)
-            .unwrap()
-            .initiated_ms(),
+        nodes[0].node.get_session(&node1_addr).unwrap().initiated(),
         armed_at,
         "the rekey must be the same one, not retired and re-armed"
     );
@@ -9134,15 +9159,15 @@ async fn test_silent_peers_cutover_still_lands_after_the_idle_timeout_has_passed
     // Node 0 emits nothing for longer than the idle timeout — with MMP in
     // minimal mode and traffic flowing one way, nothing authenticates
     // against node 1's pending slot in that time.
-    let now_ms = wall_clock_ms();
+    let now = Node::session_now();
     let idle_ms = nodes[1].node.config().node.session.idle_timeout_secs * 1000;
-    let stamp = now_ms - idle_ms - 10_000;
+    let stamp = session_before(now, idle_ms + 10_000);
     nodes[1]
         .node
         .sessions
         .get_mut(&node0_addr)
         .unwrap()
-        .set_rekey_completed_ms(stamp);
+        .set_rekey_completed(stamp);
     nodes[1]
         .node
         .sessions
@@ -9159,7 +9184,7 @@ async fn test_silent_peers_cutover_still_lands_after_the_idle_timeout_has_passed
         .sessions
         .get_mut(&node1_addr)
         .unwrap()
-        .set_rekey_completed_ms(now_ms - 10_000);
+        .set_rekey_completed(session_before(now, 10_000));
     nodes[0].node.check_session_rekey().await;
     let recv_before = nodes[1]
         .node
@@ -9778,7 +9803,7 @@ fn age_entry(nodes: &mut [TestNode], i: usize, addr: &NodeAddr, by_ms: u64) {
 }
 
 /// Past `HALF_OPEN_MIN_AGE`, with a margin.
-const PAST_MIN_AGE_MS: u64 = crate::node::session::HALF_OPEN_MIN_AGE_MS + 100;
+const PAST_MIN_AGE_MS: u64 = crate::node::session::HALF_OPEN_MIN_AGE.as_millis() as u64 + 100;
 
 #[tokio::test]
 async fn outbound_traffic_behind_an_aged_half_open_entry_initiates_a_session() {
@@ -9871,13 +9896,13 @@ async fn a_responder_that_receives_one_setup_sends_exactly_one_ack_across_the_ha
     // node with no transit traffic and no established session.
     let originated_before = nodes[1].node.metrics().forwarding.originated_packets.get();
     deliver_forged_setup_naming(&mut nodes, 0, 1).await;
-    let t0 = Node::now_ms();
+    let t0 = Node::session_now();
 
     // Run the handshake timer across the whole handshake timeout and past
     // it, with no further setup arriving.
     let mut now = t0;
-    while now <= t0 + timeout_ms + 1_000 {
-        now += 250;
+    while now <= session_after(t0, timeout_ms + 1_000) {
+        now = session_after(now, 250);
         nodes[1].node.resend_pending_session_handshakes(now).await;
     }
     assert!(
@@ -9995,7 +10020,7 @@ async fn losing_the_tie_break_to_a_forged_setup_after_our_first_setup_was_lost_s
     age_entry(&mut nodes, victim, &owner_addr, PAST_MIN_AGE_MS);
     nodes[victim]
         .node
-        .resend_pending_session_handshakes(Node::now_ms())
+        .resend_pending_session_handshakes(Node::session_now())
         .await;
     drain_to_quiescence(&mut nodes).await;
 
@@ -10103,7 +10128,7 @@ async fn a_forger_completing_its_own_candidate_does_not_drop_the_owners() {
         owner_addr,
         node.identity().pubkey_full(),
         EndToEndState::AwaitingMsg3(forger_leg),
-        Node::now_ms(),
+        Node::session_now(),
         false,
     );
     entry.add_candidate(
@@ -10112,7 +10137,7 @@ async fn a_forger_completing_its_own_candidate_does_not_drop_the_owners() {
             vec![0x01],
             Vec::new(),
             stub_link_peer(),
-            Node::now_ms(),
+            Node::session_now(),
         ),
         CandidateAdmission::Room,
     );
@@ -10346,7 +10371,7 @@ async fn a_msg3_reaches_a_candidate_beside_our_initiator_leg() {
         peer_addr,
         peer.pubkey_full(),
         EndToEndState::Initiating(ours),
-        Node::now_ms(),
+        Node::session_now(),
         true,
     );
     entry.add_candidate(
@@ -10355,7 +10380,7 @@ async fn a_msg3_reaches_a_candidate_beside_our_initiator_leg() {
             vec![0x01],
             Vec::new(),
             stub_link_peer(),
-            Node::now_ms(),
+            Node::session_now(),
         ),
         CandidateAdmission::Room,
     );
@@ -10471,7 +10496,7 @@ async fn simultaneous_initiation_converges_with_no_rekey_armed() {
     process_available_packets(&mut nodes).await;
     nodes[loser]
         .node
-        .resend_pending_session_handshakes(Node::now_ms() + 2_000)
+        .resend_pending_session_handshakes(session_after(Node::session_now(), 2_000))
         .await;
     drain_to_quiescence(&mut nodes).await;
 
@@ -10508,7 +10533,7 @@ async fn honest_simultaneous_initiation_never_resumes_the_paused_leg() {
     // Well past the minimum age, nothing resumes.
     nodes[loser]
         .node
-        .resend_pending_session_handshakes(Node::now_ms() + PAST_MIN_AGE_MS)
+        .resend_pending_session_handshakes(session_after(Node::session_now(), PAST_MIN_AGE_MS))
         .await;
     drain_to_quiescence(&mut nodes).await;
     assert_eq!(
@@ -10570,7 +10595,7 @@ async fn a_late_msg3_after_this_node_initiated_leaves_one_established_epoch() {
     // The initiator's msg3 resend arrives late.
     nodes[initiator]
         .node
-        .resend_pending_session_handshakes(Node::now_ms() + 1_500)
+        .resend_pending_session_handshakes(session_after(Node::session_now(), 1_500))
         .await;
     drain_to_quiescence(&mut nodes).await;
 
@@ -10631,7 +10656,7 @@ async fn a_winner_whose_setup_went_unanswered_converges_with_the_peers_own_initi
         .expect("the loser's initiation must start");
     nodes[winner]
         .node
-        .resend_pending_session_handshakes(Node::now_ms() + 1_500)
+        .resend_pending_session_handshakes(session_after(Node::session_now(), 1_500))
         .await;
     drain_to_quiescence(&mut nodes).await;
 
@@ -10694,7 +10719,7 @@ async fn a_setup_after_every_candidate_expired_does_not_inherit_their_age() {
     // The forged candidate passes the handshake timeout; the leg lives on.
     nodes[large]
         .node
-        .resend_pending_session_handshakes(Node::now_ms() + 5_000)
+        .resend_pending_session_handshakes(session_after(Node::session_now(), 5_000))
         .await;
     lose_queued(&mut nodes, small);
     let entry = nodes[large].node.get_session(&small_addr).unwrap();
@@ -10720,7 +10745,7 @@ async fn a_setup_after_every_candidate_expired_does_not_inherit_their_age() {
 
     nodes[large]
         .node
-        .resend_pending_session_handshakes(Node::now_ms())
+        .resend_pending_session_handshakes(Node::session_now())
         .await;
     assert!(
         nodes[large]
@@ -10787,7 +10812,7 @@ async fn a_lost_first_ack_is_recovered_by_the_initiators_resent_setup() {
 
     nodes[0]
         .node
-        .resend_pending_session_handshakes(Node::now_ms() + 1_500)
+        .resend_pending_session_handshakes(session_after(Node::session_now(), 1_500))
         .await;
     drain_to_quiescence(&mut nodes).await;
 
@@ -10886,7 +10911,7 @@ async fn a_forger_completing_its_candidate_beside_a_paused_leg_does_not_strand_i
     // next resend sweep resumes the leg without waiting for the minimum age.
     nodes[victim]
         .node
-        .resend_pending_session_handshakes(Node::now_ms())
+        .resend_pending_session_handshakes(Node::session_now())
         .await;
     drain_to_quiescence(&mut nodes).await;
 
@@ -10957,12 +10982,13 @@ async fn a_forger_dropping_its_candidate_with_a_msg3_does_not_restart_the_hold()
         // A reaper tick between the msg3 and the next setup.
         nodes[victim]
             .node
-            .resend_pending_session_handshakes(Node::now_ms())
+            .resend_pending_session_handshakes(Node::session_now())
             .await;
     }
 
     assert!(
-        initiated_at_ms.is_some_and(|t| t <= 2 * crate::node::session::HALF_OPEN_MIN_AGE_MS),
+        initiated_at_ms
+            .is_some_and(|t| t <= 2 * crate::node::session::HALF_OPEN_MIN_AGE.as_millis() as u64),
         "the victim must initiate itself once its traffic has been held behind \
          forged setups for the minimum age, whatever the forger sends; after \
          {elapsed_ms} ms it initiated at {initiated_at_ms:?} (address \
@@ -10975,11 +11001,11 @@ async fn a_forger_dropping_its_candidate_with_a_msg3_does_not_restart_the_hold()
 #[test]
 fn a_full_entry_evicts_the_newcomers_own_links_aged_candidate_before_an_older_one() {
     use crate::node::session::{
-        CandidateAdmission, HALF_OPEN_MIN_AGE_MS, ResponderCandidate, admit_candidate,
+        CandidateAdmission, HALF_OPEN_MIN_AGE, ResponderCandidate, admit_candidate,
     };
     use crate::noise::HandshakeState;
 
-    let now = 100_000u64;
+    let now = session_at(100_000);
     let own_link = *Identity::generate().node_addr();
     let other_link = *Identity::generate().node_addr();
     let candidate = |link: NodeAddr, age_ms: u64| {
@@ -10988,10 +11014,10 @@ fn a_full_entry_evicts_the_newcomers_own_links_aged_candidate_before_an_older_on
             vec![0x01],
             Vec::new(),
             link,
-            now - age_ms,
+            session_before(now, age_ms),
         )
     };
-    let aged = HALF_OPEN_MIN_AGE_MS;
+    let aged = HALF_OPEN_MIN_AGE.as_millis() as u64;
     // The oldest aged candidate arrived over another link; an older-than-
     // minimum one arrived over the newcomer's own link.
     let candidates = vec![
@@ -11140,7 +11166,7 @@ async fn a_native_send_to_an_uncached_key_behind_an_aged_hold_establishes_after_
             node2_addr,
             placeholder,
             EndToEndState::AwaitingMsg3(handshake),
-            Node::now_ms(),
+            Node::session_now(),
             false,
         );
         node.sessions.insert(node2_addr, entry);
@@ -11421,7 +11447,7 @@ async fn a_candidate_kept_beside_the_losers_session_expires_on_its_own_deadline(
     age_entry(&mut nodes, victim, &owner_addr, timeout_ms + 1_000);
     nodes[victim]
         .node
-        .resend_pending_session_handshakes(Node::now_ms())
+        .resend_pending_session_handshakes(Node::session_now())
         .await;
 
     let entry = nodes[victim].node.get_session(&owner_addr);

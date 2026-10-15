@@ -10,8 +10,47 @@ use crate::config::SessionMmpConfig;
 use crate::node::REKEY_JITTER_SECS;
 use crate::noise::{HandshakeState, NoiseSession};
 use crate::proto::mmp::MmpSessionState;
+use crate::time::WallStamp;
+use fips_core::time::{Clock, Instant};
 use rand::RngExt;
 use secp256k1::PublicKey;
+use std::time::Duration;
+
+/// The clock the session table measures its timers on.
+///
+/// Still the wall clock, as before the table took the core's time type: a
+/// separate change moves it onto the monotonic clock.
+pub(crate) type SessionClock = crate::time::WallClock;
+
+/// An instant on [`SessionClock`].
+pub(crate) type SessionInstant = <SessionClock as Clock>::Instant;
+
+/// The session clock's instant `ms` milliseconds after its test epoch.
+#[cfg(test)]
+pub(crate) fn session_at(ms: u64) -> SessionInstant {
+    crate::time::at::<SessionClock>(ms)
+}
+
+/// `ms` milliseconds after `t`, for tests that name an instant relative to
+/// another.
+#[cfg(test)]
+pub(crate) fn session_after(t: SessionInstant, ms: u64) -> SessionInstant {
+    t.checked_add(Duration::from_millis(ms))
+        .expect("a test instant fits the clock's range")
+}
+
+/// `ms` milliseconds before `t`, for tests that backdate a stamp.
+#[cfg(test)]
+pub(crate) fn session_before(t: SessionInstant, ms: u64) -> SessionInstant {
+    t.checked_sub(Duration::from_millis(ms))
+        .expect("a test instant fits the clock's range")
+}
+
+/// Time from `earlier` to `now` in whole milliseconds, zero when `earlier`
+/// is the later one.
+pub(crate) fn age_ms(now: SessionInstant, earlier: SessionInstant) -> u64 {
+    now.saturating_duration_since(earlier).as_millis() as u64
+}
 
 /// Draw a fresh per-session rekey jitter from `[-REKEY_JITTER_SECS, +REKEY_JITTER_SECS]`.
 fn draw_rekey_jitter() -> i64 {
@@ -73,10 +112,7 @@ pub(crate) const MAX_HALF_OPEN_RESPONDERS: usize = 4;
 /// hold lasts at least a handshake timeout from its first setup; to keep the
 /// owner's own setups refused it must refresh every candidate slot within
 /// this age. No measured basis.
-pub(crate) const HALF_OPEN_MIN_AGE: std::time::Duration = std::time::Duration::from_secs(5);
-
-/// `HALF_OPEN_MIN_AGE` in the session table's millisecond clock.
-pub(crate) const HALF_OPEN_MIN_AGE_MS: u64 = HALF_OPEN_MIN_AGE.as_millis() as u64;
+pub(crate) const HALF_OPEN_MIN_AGE: Duration = Duration::from_secs(5);
 
 /// One responder handshake held for a SessionSetup naming the entry's
 /// address, awaiting the msg3 that would prove who sent it.
@@ -90,8 +126,8 @@ pub(crate) struct ResponderCandidate {
     ack: Option<Vec<u8>>,
     /// The link peer the setup arrived over, if known.
     link_peer: Option<NodeAddr>,
-    /// When the setup was admitted (Unix ms).
-    received_at: u64,
+    /// When the setup was admitted.
+    received_at: SessionInstant,
 }
 
 impl ResponderCandidate {
@@ -101,7 +137,7 @@ impl ResponderCandidate {
         msg1: Vec<u8>,
         ack: Vec<u8>,
         link_peer: NodeAddr,
-        received_at: u64,
+        received_at: SessionInstant,
     ) -> Self {
         Self {
             handshake,
@@ -136,17 +172,17 @@ pub(crate) enum CandidateAdmission {
     Refuse,
 }
 
-/// Decide where a candidate arriving over `link_peer` at `now_ms` goes.
+/// Decide where a candidate arriving over `link_peer` at `now` goes.
 pub(crate) fn admit_candidate(
     candidates: &[ResponderCandidate],
     link_peer: &NodeAddr,
-    now_ms: u64,
+    now: SessionInstant,
 ) -> CandidateAdmission {
     if candidates.len() < MAX_HALF_OPEN_RESPONDERS {
         return CandidateAdmission::Room;
     }
     let aged =
-        |c: &&ResponderCandidate| now_ms.saturating_sub(c.received_at) >= HALF_OPEN_MIN_AGE_MS;
+        |c: &&ResponderCandidate| now.saturating_duration_since(c.received_at) >= HALF_OPEN_MIN_AGE;
     let oldest = |same_link: bool| {
         candidates
             .iter()
@@ -215,28 +251,28 @@ pub(crate) struct SessionEntry {
     /// node that lost the initiation tie-break they are also kept beside the
     /// session its own leg established, and one completing replaces it.
     candidates: Vec<ResponderCandidate>,
-    /// When this entry first held a responder candidate (Unix ms). Never
+    /// When this entry first held a responder candidate. Never
     /// refreshed by later candidates, so a forger cannot hold this node's own
     /// initiation back by forging again. Kept when a msg3 drops the last
     /// candidate, so the hold outlives the candidates a forger can remove at
     /// will; cleared once no candidate is left and it is a handshake timeout
     /// old, or when a leg completes.
-    opened_at: Option<u64>,
+    opened_at: Option<SessionInstant>,
     /// This node's initiator leg lost a simultaneous-initiation tie-break and
     /// its setup resends are paused: the winner dropped our setup, and a
     /// resend reaching it after it established would arm a spurious rekey.
     initiator_paused: bool,
-    /// When the session was created (Unix milliseconds).
+    /// When the session was created.
     #[cfg_attr(not(test), allow(dead_code))]
-    created_at: u64,
-    /// Last application data activity timestamp (Unix milliseconds).
+    created_at: SessionInstant,
+    /// Last application data activity timestamp.
     /// Only updated for DataPacket send/receive and session establishment.
     /// MMP reports do not update this field. Used for idle session timeout.
-    last_activity: u64,
-    /// When the session transitioned to Established (Unix milliseconds).
+    last_activity: SessionInstant,
+    /// When the session transitioned to Established.
     /// Used to compute session-relative timestamps for the FSP inner header.
-    /// Set to 0 until the session is established.
-    session_start_ms: u64,
+    /// `None` until the session is established.
+    session_start: Option<SessionInstant>,
     /// Remaining data packets that should include COORDS_PRESENT.
     /// Initialized from config when session becomes Established;
     /// reset on CoordsRequired receipt.
@@ -276,19 +312,19 @@ pub(crate) struct SessionEntry {
     handshake_payload: Option<Vec<u8>>,
     /// Number of resends performed.
     resend_count: u32,
-    /// When the next resend should fire (Unix ms). 0 = no resend scheduled.
-    next_resend_at_ms: u64,
+    /// When the next resend should fire. `None` = no resend scheduled.
+    next_resend_at: Option<SessionInstant>,
 
     // === Rekey (Key Rotation) ===
     /// Current K-bit epoch value (alternates each rekey).
     current_k_bit: bool,
     /// Previous NoiseSession during drain window after cutover.
     previous_noise_session: Option<NoiseSession>,
-    /// When drain window started (Unix ms). 0 = no drain.
-    drain_started_ms: u64,
+    /// When drain window started. `None` = no drain.
+    drain_started: Option<SessionInstant>,
     /// Last time an inbound frame authenticated against the `previous`
-    /// slot (Unix ms). 0 = the `previous` slot has not been used since
-    /// the drain began.
+    /// slot. `None` = the `previous` slot has not been used since the
+    /// drain began.
     ///
     /// Drives peer-progress-aware retirement of the old epoch: the drain
     /// window does not expire until `DRAIN_WINDOW_SECS` have elapsed
@@ -299,25 +335,25 @@ pub(crate) struct SessionEntry {
     /// while the peer (having never received msg3) was still sealing
     /// every frame in the old epoch, leaving the trial-decrypt cascade
     /// with no slot that could decrypt them.
-    previous_last_used_ms: u64,
+    previous_last_used: Option<SessionInstant>,
     /// In-progress rekey state (runs alongside Established session).
     rekey_state: Option<HandshakeState>,
     /// Pending completed session awaiting K-bit cutover.
     pending_new_session: Option<NoiseSession>,
     /// Whether we initiated the current rekey.
     rekey_initiator: bool,
-    /// Dampening: last time peer sent us a rekey msg1 (Unix ms).
-    last_peer_rekey_ms: u64,
-    /// When this node armed its current rekey handshake as initiator (Unix
-    /// ms), which bounds how long that handshake waits for a SessionAck.
+    /// Dampening: last time peer sent us a rekey msg1.
+    last_peer_rekey: Option<SessionInstant>,
+    /// When this node armed its current rekey handshake as initiator, which
+    /// bounds how long that handshake waits for a SessionAck.
     ///
     /// Written only by `begin_rekey`, so putting the handshake back after
     /// an unreadable SessionAck does not move it. Read only while a
     /// handshake is armed and `rekey_initiator` is set, which is why it is
     /// never cleared.
-    initiated_ms: u64,
+    initiated: Option<SessionInstant>,
     /// When this side's FSP rekey handshake completed and produced the
-    /// `pending` session (Unix ms): the initiator sending msg3, or the
+    /// `pending` session: the initiator sending msg3, or the
     /// responder accepting it. Cleared on cutover.
     ///
     /// On the initiator it drives the liveness-bound cutover timer, which
@@ -325,7 +361,7 @@ pub(crate) struct SessionEntry {
     /// any cutover skew, so it only bounds how long the initiator
     /// advertises the old K-bit. On the responder it dates the wait for the
     /// peer's cut-over (`pending_stale`) and never expires the keys.
-    rekey_completed_ms: u64,
+    rekey_completed: Option<SessionInstant>,
     /// Encoded SessionMsg3 payload retained for retransmission (initiator).
     /// Set when the rekey initiator sends msg3; cleared once the responder
     /// is confirmed on the new epoch (an authenticated peer frame against
@@ -333,9 +369,9 @@ pub(crate) struct SessionEntry {
     /// Retransmission lifetime is tied to responder reception of msg3,
     /// decoupled from the initiator's own cutover.
     rekey_msg3_payload: Option<Vec<u8>>,
-    /// When the next rekey msg3 retransmission should fire (Unix ms).
-    /// 0 = no retransmission scheduled.
-    rekey_msg3_next_resend_ms: u64,
+    /// When the next rekey msg3 retransmission should fire.
+    /// `None` = no retransmission scheduled.
+    rekey_msg3_next_resend: Option<SessionInstant>,
     /// Number of rekey msg3 retransmissions performed so far.
     rekey_msg3_resend_count: u32,
     /// Whether the rekey peer has been observed on the new epoch — set
@@ -356,7 +392,7 @@ impl SessionEntry {
         remote_addr: NodeAddr,
         remote_pubkey: PublicKey,
         state: EndToEndState,
-        now_ms: u64,
+        now: SessionInstant,
         is_initiator: bool,
     ) -> Self {
         let (state, candidates, opened_at) = match state {
@@ -367,9 +403,9 @@ impl SessionEntry {
                     msg1: Vec::new(),
                     ack: None,
                     link_peer: None,
-                    received_at: now_ms,
+                    received_at: now,
                 }],
-                Some(now_ms),
+                Some(now),
             ),
             other => (other, Vec::new(), None),
         };
@@ -380,9 +416,9 @@ impl SessionEntry {
             candidates,
             opened_at,
             initiator_paused: false,
-            created_at: now_ms,
-            last_activity: now_ms,
-            session_start_ms: 0,
+            created_at: now,
+            last_activity: now,
+            session_start: None,
             coords_warmup_remaining: 0,
             is_initiator,
             max_sent_wire_len: 0,
@@ -393,19 +429,19 @@ impl SessionEntry {
             bytes_recv: 0,
             handshake_payload: None,
             resend_count: 0,
-            next_resend_at_ms: 0,
+            next_resend_at: None,
             current_k_bit: false,
             previous_noise_session: None,
-            drain_started_ms: 0,
-            previous_last_used_ms: 0,
+            drain_started: None,
+            previous_last_used: None,
             rekey_state: None,
             pending_new_session: None,
             rekey_initiator: false,
-            last_peer_rekey_ms: 0,
-            initiated_ms: 0,
-            rekey_completed_ms: 0,
+            last_peer_rekey: None,
+            initiated: None,
+            rekey_completed: None,
             rekey_msg3_payload: None,
-            rekey_msg3_next_resend_ms: 0,
+            rekey_msg3_next_resend: None,
             rekey_msg3_resend_count: 0,
             peer_new_epoch_confirmed: false,
             rekey_jitter_secs: draw_rekey_jitter(),
@@ -456,8 +492,8 @@ impl SessionEntry {
     ///
     /// Only call for DataPacket send/receive and session establishment,
     /// not for MMP reports. Used by the idle session timeout.
-    pub(crate) fn touch(&mut self, now_ms: u64) {
-        self.last_activity = now_ms;
+    pub(crate) fn touch(&mut self, now: SessionInstant) {
+        self.last_activity = now;
     }
 
     /// Check if the session is established.
@@ -499,18 +535,18 @@ impl SessionEntry {
     /// `HALF_OPEN_MIN_AGE` ago, by `opened_at`, with no leg completed. The
     /// hold's age counts whether or not its candidates are still here: a
     /// forger can drop its own candidate with a msg3 whenever it likes.
-    pub(crate) fn responder_hold_aged(&self, now_ms: u64) -> bool {
+    pub(crate) fn responder_hold_aged(&self, now: SessionInstant) -> bool {
         self.opened_at
-            .is_some_and(|t| now_ms.saturating_sub(t) >= HALF_OPEN_MIN_AGE_MS)
+            .is_some_and(|t| now.saturating_duration_since(t) >= HALF_OPEN_MIN_AGE)
     }
 
     /// Whether a received setup opened a hold on this entry less than
-    /// `timeout_ms` ago. Such an entry is kept even with no leg left in it,
+    /// `timeout` ago. Such an entry is kept even with no leg left in it,
     /// so the next setup for the address joins the same hold instead of
     /// opening a fresh one.
-    pub(crate) fn responder_hold_open(&self, now_ms: u64, timeout_ms: u64) -> bool {
+    pub(crate) fn responder_hold_open(&self, now: SessionInstant, timeout: Duration) -> bool {
         self.opened_at
-            .is_some_and(|t| now_ms.saturating_sub(t) <= timeout_ms)
+            .is_some_and(|t| now.saturating_duration_since(t) <= timeout)
     }
 
     /// How much of the half-open share this entry takes: one per responder
@@ -525,8 +561,8 @@ impl SessionEntry {
     /// Whether the entry has no initiator leg and a hold at least
     /// `HALF_OPEN_MIN_AGE` old, so this node should stop waiting for the
     /// responder candidates and initiate itself.
-    pub(crate) fn responder_hold_expired(&self, now_ms: u64) -> bool {
-        !self.has_initiator_leg() && self.responder_hold_aged(now_ms)
+    pub(crate) fn responder_hold_expired(&self, now: SessionInstant) -> bool {
+        !self.has_initiator_leg() && self.responder_hold_aged(now)
     }
 
     /// The stored ack of the candidate whose setup carried `msg1`, if any.
@@ -537,13 +573,13 @@ impl SessionEntry {
             .and_then(|c| c.ack.as_deref())
     }
 
-    /// Where a candidate arriving over `link_peer` at `now_ms` would go.
+    /// Where a candidate arriving over `link_peer` at `now` would go.
     pub(crate) fn candidate_admission(
         &self,
         link_peer: &NodeAddr,
-        now_ms: u64,
+        now: SessionInstant,
     ) -> CandidateAdmission {
-        admit_candidate(&self.candidates, link_peer, now_ms)
+        admit_candidate(&self.candidates, link_peer, now)
     }
 
     /// Hold `candidate`, placed as `admission` decided. The entry's
@@ -574,13 +610,13 @@ impl SessionEntry {
         self.candidates = candidates;
     }
 
-    /// Drop candidates whose setup was admitted more than `timeout_ms`
-    /// before `now_ms`. Returns how many went.
-    pub(crate) fn expire_candidates(&mut self, now_ms: u64, timeout_ms: u64) -> usize {
+    /// Drop candidates whose setup was admitted more than `timeout`
+    /// before `now`. Returns how many went.
+    pub(crate) fn expire_candidates(&mut self, now: SessionInstant, timeout: Duration) -> usize {
         let before = self.candidates.len();
         self.candidates
-            .retain(|c| now_ms.saturating_sub(c.received_at) <= timeout_ms);
-        self.settle_opened(now_ms, timeout_ms);
+            .retain(|c| now.saturating_duration_since(c.received_at) <= timeout);
+        self.settle_opened(now, timeout);
         before - self.candidates.len()
     }
 
@@ -591,8 +627,8 @@ impl SessionEntry {
     /// clears it: a forger cannot hasten that, while dropping its own
     /// candidate with a msg3 is something it can do as often as it likes,
     /// and must not restart the hold.
-    fn settle_opened(&mut self, now_ms: u64, timeout_ms: u64) {
-        if self.candidates.is_empty() && !self.responder_hold_open(now_ms, timeout_ms) {
+    fn settle_opened(&mut self, now: SessionInstant, timeout: Duration) {
+        if self.candidates.is_empty() && !self.responder_hold_open(now, timeout) {
             self.opened_at = None;
         }
     }
@@ -608,16 +644,16 @@ impl SessionEntry {
         handshake: HandshakeState,
         remote_pubkey: PublicKey,
         setup_payload: Vec<u8>,
-        now_ms: u64,
-        next_resend_at_ms: u64,
+        now: SessionInstant,
+        next_resend_at: SessionInstant,
     ) {
         self.state = Some(EndToEndState::Initiating(handshake));
         self.remote_pubkey = remote_pubkey;
         self.is_initiator = true;
-        self.created_at = now_ms;
-        self.last_activity = now_ms;
+        self.created_at = now;
+        self.last_activity = now;
         self.initiator_paused = false;
-        self.set_handshake_payload(setup_payload, next_resend_at_ms);
+        self.set_handshake_payload(setup_payload, next_resend_at);
     }
 
     /// Pause this node's own setup resends: it lost the simultaneous
@@ -631,10 +667,10 @@ impl SessionEntry {
         self.initiator_paused
     }
 
-    /// Resume this node's own setup resends, due at `next_resend_at_ms`.
-    pub(crate) fn resume_initiator(&mut self, next_resend_at_ms: u64) {
+    /// Resume this node's own setup resends, due at `next_resend_at`.
+    pub(crate) fn resume_initiator(&mut self, next_resend_at: SessionInstant) {
         self.initiator_paused = false;
-        self.next_resend_at_ms = next_resend_at_ms;
+        self.next_resend_at = Some(next_resend_at);
     }
 
     /// Drop this node's initiator leg (including one already taken out of
@@ -651,24 +687,29 @@ impl SessionEntry {
     /// past. Test-only: stands for that much time passing.
     #[cfg(test)]
     pub(crate) fn backdate_handshake(&mut self, by_ms: u64) {
+        use crate::time::TestEpoch;
+        let back = |t: SessionInstant| {
+            t.checked_sub(Duration::from_millis(by_ms))
+                .unwrap_or_else(SessionClock::epoch)
+        };
         for c in &mut self.candidates {
-            c.received_at = c.received_at.saturating_sub(by_ms);
+            c.received_at = back(c.received_at);
         }
         if let Some(t) = self.opened_at.as_mut() {
-            *t = t.saturating_sub(by_ms);
+            *t = back(*t);
         }
-        self.created_at = self.created_at.saturating_sub(by_ms);
-        self.last_activity = self.last_activity.saturating_sub(by_ms);
+        self.created_at = back(self.created_at);
+        self.last_activity = back(self.last_activity);
     }
 
     /// Get creation time. Used as the probe's session-identity check: an
     /// entry with a different creation stamp is a replacement, not ours.
-    pub(crate) fn created_at(&self) -> u64 {
+    pub(crate) fn created_at(&self) -> SessionInstant {
         self.created_at
     }
 
     /// Get last activity time.
-    pub(crate) fn last_activity(&self) -> u64 {
+    pub(crate) fn last_activity(&self) -> SessionInstant {
         self.last_activity
     }
 
@@ -708,17 +749,22 @@ impl SessionEntry {
     ///
     /// Records the current time as the session start for computing
     /// session-relative timestamps in the FSP inner header.
-    pub(crate) fn mark_established(&mut self, now_ms: u64) {
-        self.session_start_ms = now_ms;
+    pub(crate) fn mark_established(&mut self, now: SessionInstant) {
+        self.session_start = Some(now);
     }
 
     /// Compute a session-relative timestamp for the FSP inner header.
     ///
-    /// Returns `(now_ms - session_start_ms)` truncated to u32, or 0 when
-    /// `now_ms` reads before the session start. Wraps naturally at ~49.7
-    /// days, which is fine for relative timing.
-    pub(crate) fn session_timestamp(&self, now_ms: u64) -> u32 {
-        now_ms.saturating_sub(self.session_start_ms) as u32
+    /// Returns the milliseconds from the session start to `now` truncated
+    /// to u32, or 0 when `now` reads before the session start. Wraps
+    /// naturally at ~49.7 days, which is fine for relative timing. Before
+    /// the session is established it is `now`'s Unix milliseconds truncated
+    /// the same way, as when an unset start read as zero.
+    pub(crate) fn session_timestamp(&self, now: SessionInstant) -> u32 {
+        match self.session_start {
+            Some(start) => age_ms(now, start) as u32,
+            None => now.wall_ms() as u32,
+        }
     }
 
     /// Whether this node initiated the Noise handshake.
@@ -779,10 +825,14 @@ impl SessionEntry {
     /// SessionMsg3 payload bytes, held until the responder is heard from.
     /// The payload is re-wrapped in a fresh SessionDatagram on each resend
     /// so routing can adapt to topology changes.
-    pub(crate) fn set_handshake_payload(&mut self, payload: Vec<u8>, next_resend_at_ms: u64) {
+    pub(crate) fn set_handshake_payload(
+        &mut self,
+        payload: Vec<u8>,
+        next_resend_at: SessionInstant,
+    ) {
         self.handshake_payload = Some(payload);
         self.resend_count = 0;
-        self.next_resend_at_ms = next_resend_at_ms;
+        self.next_resend_at = Some(next_resend_at);
     }
 
     /// Get the stored handshake payload for resend.
@@ -794,7 +844,7 @@ impl SessionEntry {
     /// the session, or the msg3 resend budget is spent).
     pub(crate) fn clear_handshake_payload(&mut self) {
         self.handshake_payload = None;
-        self.next_resend_at_ms = 0;
+        self.next_resend_at = None;
     }
 
     /// Number of resends performed so far.
@@ -802,15 +852,15 @@ impl SessionEntry {
         self.resend_count
     }
 
-    /// When the next resend should fire (Unix ms). 0 = no resend scheduled.
-    pub(crate) fn next_resend_at_ms(&self) -> u64 {
-        self.next_resend_at_ms
+    /// When the next resend should fire. `None` = no resend scheduled.
+    pub(crate) fn next_resend_at(&self) -> Option<SessionInstant> {
+        self.next_resend_at
     }
 
     /// Record a resend and schedule the next one.
-    pub(crate) fn record_resend(&mut self, next_resend_at_ms: u64) {
+    pub(crate) fn record_resend(&mut self, next_resend_at: SessionInstant) {
         self.resend_count += 1;
-        self.next_resend_at_ms = next_resend_at_ms;
+        self.next_resend_at = Some(next_resend_at);
     }
 
     // === Rekey (Key Rotation) ===
@@ -836,38 +886,39 @@ impl SessionEntry {
     }
 
     /// Check if rekey initiation is dampened.
-    pub(crate) fn is_rekey_dampened(&self, now_ms: u64, dampening_ms: u64) -> bool {
-        if self.last_peer_rekey_ms == 0 {
+    pub(crate) fn is_rekey_dampened(&self, now: SessionInstant, dampening: Duration) -> bool {
+        let Some(last) = self.last_peer_rekey else {
             return false;
-        }
-        now_ms.saturating_sub(self.last_peer_rekey_ms) < dampening_ms
+        };
+        now.saturating_duration_since(last) < dampening
     }
 
-    /// When the peer last initiated a rekey, or 0 if it never has.
+    /// When the peer last initiated a rekey, or `None` if it never has.
     ///
     /// Bounds the age of any rekey state armed by the peer's setup message,
     /// including a pending session derived from it.
-    pub(crate) fn last_peer_rekey_ms(&self) -> u64 {
-        self.last_peer_rekey_ms
+    pub(crate) fn last_peer_rekey(&self) -> Option<SessionInstant> {
+        self.last_peer_rekey
     }
 
-    /// When this node armed its current rekey handshake as initiator, or 0
-    /// if it never has.
+    /// When this node armed its current rekey handshake as initiator, or
+    /// `None` if it never has.
     ///
     /// Bounds the age of a handshake this node armed, independently of any
     /// rekey the peer started.
-    pub(crate) fn initiated_ms(&self) -> u64 {
-        self.initiated_ms
+    pub(crate) fn initiated(&self) -> Option<SessionInstant> {
+        self.initiated
     }
 
     /// Record that the peer initiated a rekey (for dampening).
-    pub(crate) fn record_peer_rekey(&mut self, now_ms: u64) {
-        self.last_peer_rekey_ms = now_ms;
+    pub(crate) fn record_peer_rekey(&mut self, now: SessionInstant) {
+        self.last_peer_rekey = Some(now);
     }
 
-    /// When the session transitioned to Established (for rekey timer).
-    pub(crate) fn session_start_ms(&self) -> u64 {
-        self.session_start_ms
+    /// When the session transitioned to Established (for rekey timer), or
+    /// `None` before it has.
+    pub(crate) fn session_start(&self) -> Option<SessionInstant> {
+        self.session_start
     }
 
     /// Get the current send counter from the established NoiseSession.
@@ -880,8 +931,8 @@ impl SessionEntry {
 
     /// When this side's FSP rekey handshake completed: the initiator
     /// sending msg3, or the responder accepting it.
-    pub(crate) fn rekey_completed_ms(&self) -> u64 {
-        self.rekey_completed_ms
+    pub(crate) fn rekey_completed(&self) -> Option<SessionInstant> {
+        self.rekey_completed
     }
 
     /// Per-session symmetric rekey-timer jitter offset (seconds).
@@ -896,8 +947,8 @@ impl SessionEntry {
 
     /// Record when this side's FSP rekey handshake completed and the
     /// `pending` session appeared.
-    pub(crate) fn set_rekey_completed_ms(&mut self, ms: u64) {
-        self.rekey_completed_ms = ms;
+    pub(crate) fn set_rekey_completed(&mut self, at: SessionInstant) {
+        self.rekey_completed = Some(at);
     }
 
     // === Rekey msg3 Retransmission (Initiator, liveness-only) ===
@@ -910,9 +961,13 @@ impl SessionEntry {
     /// eventually receive msg3 to derive the new session. It runs until
     /// the peer is confirmed on the new epoch, independent of the
     /// initiator's own cutover.
-    pub(crate) fn set_rekey_msg3_payload(&mut self, payload: Vec<u8>, next_resend_at_ms: u64) {
+    pub(crate) fn set_rekey_msg3_payload(
+        &mut self,
+        payload: Vec<u8>,
+        next_resend_at: SessionInstant,
+    ) {
         self.rekey_msg3_payload = Some(payload);
-        self.rekey_msg3_next_resend_ms = next_resend_at_ms;
+        self.rekey_msg3_next_resend = Some(next_resend_at);
         self.rekey_msg3_resend_count = 0;
         self.peer_new_epoch_confirmed = false;
     }
@@ -922,9 +977,10 @@ impl SessionEntry {
         self.rekey_msg3_payload.as_deref()
     }
 
-    /// When the next rekey msg3 retransmission should fire (Unix ms).
-    pub(crate) fn rekey_msg3_next_resend_ms(&self) -> u64 {
-        self.rekey_msg3_next_resend_ms
+    /// When the next rekey msg3 retransmission should fire, or `None` if
+    /// none is scheduled.
+    pub(crate) fn rekey_msg3_next_resend(&self) -> Option<SessionInstant> {
+        self.rekey_msg3_next_resend
     }
 
     /// Number of rekey msg3 retransmissions performed so far.
@@ -933,16 +989,16 @@ impl SessionEntry {
     }
 
     /// Record a rekey msg3 retransmission and schedule the next one.
-    pub(crate) fn record_rekey_msg3_resend(&mut self, next_resend_at_ms: u64) {
+    pub(crate) fn record_rekey_msg3_resend(&mut self, next_resend_at: SessionInstant) {
         self.rekey_msg3_resend_count += 1;
-        self.rekey_msg3_next_resend_ms = next_resend_at_ms;
+        self.rekey_msg3_next_resend = Some(next_resend_at);
     }
 
     /// Clear the retained rekey msg3 payload (responder confirmed on the
     /// new epoch, or the cycle abandoned).
     pub(crate) fn clear_rekey_msg3_payload(&mut self) {
         self.rekey_msg3_payload = None;
-        self.rekey_msg3_next_resend_ms = 0;
+        self.rekey_msg3_next_resend = None;
         self.rekey_msg3_resend_count = 0;
     }
 
@@ -1005,7 +1061,7 @@ impl SessionEntry {
         counter: u64,
         aad: &[u8],
         received_k_bit: bool,
-        now_ms: u64,
+        now: SessionInstant,
     ) -> Option<(Vec<u8>, EpochSlot)> {
         // Hint: if the received K-bit differs from our current epoch and
         // we hold a pending session, the peer has likely cut over — try
@@ -1033,7 +1089,7 @@ impl SessionEntry {
                 // push the drain deadline out so the `previous` slot
                 // is not retired out from under a peer still using it.
                 if slot == EpochSlot::Previous {
-                    self.refresh_previous_use(now_ms);
+                    self.refresh_previous_use(now);
                 }
                 return Some((pt, slot));
             }
@@ -1055,14 +1111,14 @@ impl SessionEntry {
 
     /// Arm a rekey handshake this node initiated, and stamp its deadline.
     ///
-    /// The only writer of `initiated_ms`. The restore after an unreadable
+    /// The only writer of `initiated`. The restore after an unreadable
     /// SessionAck goes through `set_rekey_state` instead and must stay
     /// there: a restamping restore would let a stream of forged acks hold
     /// the rekey open for good.
-    pub(crate) fn begin_rekey(&mut self, state: HandshakeState, now_ms: u64) {
+    pub(crate) fn begin_rekey(&mut self, state: HandshakeState, now: SessionInstant) {
         self.rekey_state = Some(state);
         self.rekey_initiator = true;
-        self.initiated_ms = now_ms;
+        self.initiated = Some(now);
     }
 
     /// Take the rekey state for processing.
@@ -1077,7 +1133,7 @@ impl SessionEntry {
     /// Shared by both cutover triggers: the initiator's liveness timer
     /// (`cutover_to_new_session`) and a successful `pending` trial-decrypt
     /// (`handle_peer_kbit_flip`).
-    fn promote_pending(&mut self, now_ms: u64) -> bool {
+    fn promote_pending(&mut self, now: SessionInstant) -> bool {
         let new_session = match self.pending_new_session.take() {
             Some(s) => s,
             None => return false,
@@ -1087,19 +1143,19 @@ impl SessionEntry {
         if let Some(EndToEndState::Established(old)) = self.state.take() {
             self.previous_noise_session = Some(old);
         }
-        self.drain_started_ms = now_ms;
+        self.drain_started = Some(now);
         // Fresh drain: no `previous`-slot use observed yet. The drain
         // deadline starts from the cutover and is pushed out by any
         // subsequent `previous`-slot decrypt.
-        self.previous_last_used_ms = 0;
+        self.previous_last_used = None;
 
         // Promote pending to current
         self.state = Some(EndToEndState::Established(new_session));
         self.current_k_bit = !self.current_k_bit;
-        self.session_start_ms = now_ms;
+        self.session_start = Some(now);
         self.rekey_state = None;
         self.rekey_initiator = false;
-        self.rekey_completed_ms = 0;
+        self.rekey_completed = None;
         self.rekey_jitter_secs = draw_rekey_jitter();
 
         // Reset MMP counters to avoid metric discontinuity
@@ -1118,8 +1174,8 @@ impl SessionEntry {
     /// skew between the two endpoints' cutovers. It does NOT confirm the
     /// peer is on the new epoch — the responder may still be awaiting
     /// msg3 — so msg3 retransmission must continue past this cutover.
-    pub(crate) fn cutover_to_new_session(&mut self, now_ms: u64) -> bool {
-        self.promote_pending(now_ms)
+    pub(crate) fn cutover_to_new_session(&mut self, now: SessionInstant) -> bool {
+        self.promote_pending(now)
     }
 
     /// Promote the pending session because a peer frame authenticated
@@ -1130,16 +1186,16 @@ impl SessionEntry {
     /// This unifies the trigger: the header K-bit is only a hint, the
     /// authenticated decrypt is the actual proof. Used by the
     /// trial-decrypt cascade on a successful `pending` decrypt.
-    pub(crate) fn handle_peer_kbit_flip(&mut self, now_ms: u64) -> bool {
-        self.promote_pending(now_ms)
+    pub(crate) fn handle_peer_kbit_flip(&mut self, now: SessionInstant) -> bool {
+        self.promote_pending(now)
     }
 
     /// Check if the drain window has expired.
     ///
-    /// Peer-progress-aware: the deadline is `drain_ms` after the LATER
-    /// of the cutover (`drain_started_ms`) and the last inbound frame
+    /// Peer-progress-aware: the deadline is `drain` after the LATER
+    /// of the cutover (`drain_started`) and the last inbound frame
     /// that authenticated against the `previous` slot
-    /// (`previous_last_used_ms`). The old epoch is therefore retired
+    /// (`previous_last_used`). The old epoch is therefore retired
     /// only once the peer has been silent on it for a full drain
     /// window — never while the peer is still transmitting on it.
     ///
@@ -1152,7 +1208,7 @@ impl SessionEntry {
     /// is instead handled by the FSP session liveness path (fresh
     /// handshake / teardown of a genuinely dead link).
     ///
-    /// `max_drain_ms` is an absolute ceiling measured from the cutover
+    /// `max_drain` is an absolute ceiling measured from the cutover
     /// alone, so the sliding deadline delays erasure by a bounded amount
     /// rather than preventing it: the only party that can push the
     /// deadline out is the authenticated peer holding the old key, and
@@ -1162,40 +1218,47 @@ impl SessionEntry {
     /// undecryptable until its own rekey retry re-converges the epochs.
     /// It must therefore stay above the worst-case legitimate recovery;
     /// see `DRAIN_MAX_RETENTION_SECS`.
-    pub(crate) fn drain_expired(&self, now_ms: u64, drain_ms: u64, max_drain_ms: u64) -> bool {
-        if self.drain_started_ms == 0 {
+    pub(crate) fn drain_expired(
+        &self,
+        now: SessionInstant,
+        drain: Duration,
+        max_drain: Duration,
+    ) -> bool {
+        let Some(started) = self.drain_started else {
             return false;
-        }
-        if now_ms.saturating_sub(self.drain_started_ms) >= max_drain_ms {
+        };
+        if now.saturating_duration_since(started) >= max_drain {
             return true;
         }
-        let deadline_anchor = self.drain_started_ms.max(self.previous_last_used_ms);
-        now_ms.saturating_sub(deadline_anchor) >= drain_ms
+        let deadline_anchor = self
+            .previous_last_used
+            .map_or(started, |used| used.max(started));
+        now.saturating_duration_since(deadline_anchor) >= drain
     }
 
     /// Whether a drain is in progress.
     pub(crate) fn is_draining(&self) -> bool {
-        self.drain_started_ms > 0
+        self.drain_started.is_some()
     }
 
     /// Refresh the drain deadline because an inbound frame authenticated
     /// against the `previous` slot — the peer is still using the old
     /// epoch, so it must stay retained. No-op if no drain is in
     /// progress (a `previous` slot installed only for test purposes).
-    pub(crate) fn refresh_previous_use(&mut self, now_ms: u64) {
-        if self.drain_started_ms > 0 {
-            self.previous_last_used_ms = now_ms;
+    pub(crate) fn refresh_previous_use(&mut self, now: SessionInstant) {
+        if self.drain_started.is_some() {
+            self.previous_last_used = Some(now);
         }
     }
 
     /// Complete the drain: drop previous session.
     pub(crate) fn complete_drain(&mut self) {
         self.previous_noise_session = None;
-        self.drain_started_ms = 0;
-        self.previous_last_used_ms = 0;
+        self.drain_started = None;
+        self.previous_last_used = None;
     }
 
-    /// Whether a completed rekey session has waited longer than `stale_ms`
+    /// Whether a completed rekey session has waited longer than `stale`
     /// for the cut-over that would consume it.
     ///
     /// This is a staleness question about the *wait*, never a licence to
@@ -1207,10 +1270,11 @@ impl SessionEntry {
     /// False when no pending session is held, and false while the entry
     /// carries no completion stamp, so an unstamped pending is treated as
     /// freshly completed.
-    pub(crate) fn pending_stale(&self, now_ms: u64, stale_ms: u64) -> bool {
+    pub(crate) fn pending_stale(&self, now: SessionInstant, stale: Duration) -> bool {
         self.pending_new_session.is_some()
-            && self.rekey_completed_ms != 0
-            && now_ms.saturating_sub(self.rekey_completed_ms) > stale_ms
+            && self
+                .rekey_completed
+                .is_some_and(|done| now.saturating_duration_since(done) > stale)
     }
 
     /// Abandon an in-progress rekey handshake, keeping any completed
@@ -1240,7 +1304,7 @@ impl SessionEntry {
         self.rekey_state = None;
         self.pending_new_session = None;
         self.rekey_initiator = false;
-        self.rekey_completed_ms = 0;
+        self.rekey_completed = None;
         self.clear_rekey_msg3_payload();
         self.peer_new_epoch_confirmed = false;
     }
@@ -1249,9 +1313,13 @@ impl SessionEntry {
 
     /// Install a session directly in the `previous` (draining) slot.
     #[cfg(test)]
-    pub(crate) fn set_previous_session_for_test(&mut self, session: NoiseSession, now_ms: u64) {
+    pub(crate) fn set_previous_session_for_test(
+        &mut self,
+        session: NoiseSession,
+        now: SessionInstant,
+    ) {
         self.previous_noise_session = Some(session);
-        self.drain_started_ms = now_ms;
+        self.drain_started = Some(now);
     }
 
     /// Read the highest received counter of the `previous` slot, if any.
@@ -1287,6 +1355,11 @@ mod overlapping_epoch_tests {
     use crate::noise::HandshakeState;
     use crate::proto::fsp::wire::{FSP_FLAG_K, build_fsp_header};
     use secp256k1::{Keypair, Secp256k1, SecretKey};
+
+    /// A duration of `ms` milliseconds.
+    fn ms(ms: u64) -> Duration {
+        Duration::from_millis(ms)
+    }
 
     /// Deterministic keypair from a single seed byte.
     fn keypair(seed: u8) -> Keypair {
@@ -1338,10 +1411,10 @@ mod overlapping_epoch_tests {
             addr,
             pubkey,
             EndToEndState::Established(session),
-            1_000,
+            session_at(1_000),
             true,
         );
-        entry.mark_established(1_000);
+        entry.mark_established(session_at(1_000));
         entry
     }
 
@@ -1355,11 +1428,11 @@ mod overlapping_epoch_tests {
 
         let mut entry = entry_with_current(cur_recv);
         entry.set_pending_session(p_recv);
-        entry.set_previous_session_for_test(o_recv, 1_000);
+        entry.set_previous_session_for_test(o_recv, session_at(1_000));
 
         let (ct, counter, hdr) = seal(&mut cur_send, b"steady-state", false);
         let (pt, slot) = entry
-            .fsp_trial_decrypt(&ct, counter, &hdr, false, 2_000)
+            .fsp_trial_decrypt(&ct, counter, &hdr, false, session_at(2_000))
             .expect("current frame must decrypt");
 
         assert_eq!(pt, b"steady-state");
@@ -1383,13 +1456,13 @@ mod overlapping_epoch_tests {
         // Peer sealed in the new epoch with the flipped K-bit.
         let (ct, counter, hdr) = seal(&mut p_send, b"new-epoch", !k_before);
         let (pt, slot) = entry
-            .fsp_trial_decrypt(&ct, counter, &hdr, !k_before, 2_000)
+            .fsp_trial_decrypt(&ct, counter, &hdr, !k_before, session_at(2_000))
             .expect("pending frame must decrypt");
         assert_eq!(pt, b"new-epoch");
         assert_eq!(slot, EpochSlot::Pending);
 
         // Receive path promotes on a pending hit.
-        entry.handle_peer_kbit_flip(2_000);
+        entry.handle_peer_kbit_flip(session_at(2_000));
         assert!(entry.pending_new_session().is_none());
         assert!(entry.previous_highest_counter().is_some());
         assert_ne!(entry.current_k_bit(), k_before);
@@ -1404,13 +1477,13 @@ mod overlapping_epoch_tests {
 
         // Start with the old session, install the new as pending, cut over.
         let mut entry = entry_with_current(new_recv);
-        entry.set_previous_session_for_test(old_recv, 1_500);
+        entry.set_previous_session_for_test(old_recv, session_at(1_500));
         let k_after = entry.current_k_bit();
 
         // Old-epoch straggler still in flight after our cutover.
         let (ct, counter, hdr) = seal(&mut old_send, b"old-straggler", !k_after);
         let (pt, slot) = entry
-            .fsp_trial_decrypt(&ct, counter, &hdr, !k_after, 3_000)
+            .fsp_trial_decrypt(&ct, counter, &hdr, !k_after, session_at(3_000))
             .expect("previous frame must decrypt");
 
         assert_eq!(pt, b"old-straggler");
@@ -1435,15 +1508,15 @@ mod overlapping_epoch_tests {
         // New-epoch frame promotes the entry.
         let (ct_new, c_new, hdr_new) = seal(&mut p_send, b"after-cutover", !k_before);
         let (_pt, slot) = entry
-            .fsp_trial_decrypt(&ct_new, c_new, &hdr_new, !k_before, 2_000)
+            .fsp_trial_decrypt(&ct_new, c_new, &hdr_new, !k_before, session_at(2_000))
             .unwrap();
         assert_eq!(slot, EpochSlot::Pending);
-        entry.handle_peer_kbit_flip(2_000);
+        entry.handle_peer_kbit_flip(session_at(2_000));
 
         // Now an OLD-epoch straggler arrives reordered after cutover.
         let (ct_old, c_old, hdr_old) = seal(&mut cur_send, b"reordered-old", k_before);
         let (pt, slot) = entry
-            .fsp_trial_decrypt(&ct_old, c_old, &hdr_old, k_before, 2_500)
+            .fsp_trial_decrypt(&ct_old, c_old, &hdr_old, k_before, session_at(2_500))
             .expect("reordered old-epoch frame must still decrypt");
         assert_eq!(pt, b"reordered-old");
         assert_eq!(slot, EpochSlot::Previous);
@@ -1465,14 +1538,14 @@ mod overlapping_epoch_tests {
         // First delivery on `current`.
         let (ct, counter, hdr) = seal(&mut cur_send, b"first", k_before);
         let (_pt, slot) = entry
-            .fsp_trial_decrypt(&ct, counter, &hdr, k_before, 2_000)
+            .fsp_trial_decrypt(&ct, counter, &hdr, k_before, session_at(2_000))
             .unwrap();
         assert_eq!(slot, EpochSlot::Current);
 
         // Replaying the exact same `current` frame: all slots fail.
         assert!(
             entry
-                .fsp_trial_decrypt(&ct, counter, &hdr, k_before, 2_100)
+                .fsp_trial_decrypt(&ct, counter, &hdr, k_before, session_at(2_100))
                 .is_none(),
             "a genuine replay must be rejected by every slot"
         );
@@ -1486,7 +1559,7 @@ mod overlapping_epoch_tests {
         let (ct_p, c_p, hdr_p) = seal(&mut p_send, b"pending-c0", !k_before);
         assert_eq!(c_p, 0);
         let (pt, slot) = entry
-            .fsp_trial_decrypt(&ct_p, c_p, &hdr_p, !k_before, 2_200)
+            .fsp_trial_decrypt(&ct_p, c_p, &hdr_p, !k_before, session_at(2_200))
             .expect("pending frame must decrypt despite current replay overlap");
         assert_eq!(pt, b"pending-c0");
         assert_eq!(slot, EpochSlot::Pending);
@@ -1503,7 +1576,7 @@ mod overlapping_epoch_tests {
         let mut entry = entry_with_current(cur_recv);
         let k_before = entry.current_k_bit();
         entry.set_pending_session(p_recv);
-        entry.set_previous_session_for_test(o_recv, 1_000);
+        entry.set_previous_session_for_test(o_recv, session_at(1_000));
 
         // Advance the pending sender so its frame carries a non-zero
         // counter — the cascade will still try (and fail) `current` and
@@ -1515,7 +1588,7 @@ mod overlapping_epoch_tests {
         assert_eq!(counter, 4);
 
         let (_pt, slot) = entry
-            .fsp_trial_decrypt(&ct, counter, &hdr, false, 2_000) // hint says "current first"
+            .fsp_trial_decrypt(&ct, counter, &hdr, false, session_at(2_000)) // hint says "current first"
             .expect("pending frame must decrypt");
         assert_eq!(slot, EpochSlot::Pending);
 
@@ -1537,12 +1610,12 @@ mod overlapping_epoch_tests {
 
         let mut entry = entry_with_current(cur_recv);
         entry.set_pending_session(p_recv);
-        entry.set_rekey_completed_ms(1_000);
-        entry.set_rekey_msg3_payload(vec![0xAB; 73], 1_500);
+        entry.set_rekey_completed(session_at(1_000));
+        entry.set_rekey_msg3_payload(vec![0xAB; 73], session_at(1_500));
 
         // The initiator's own liveness-timer cutover must NOT clear the
         // retained msg3 payload — the responder may not have it yet.
-        assert!(entry.cutover_to_new_session(2_000));
+        assert!(entry.cutover_to_new_session(session_at(2_000)));
         assert!(
             entry.rekey_msg3_payload().is_some(),
             "cutover alone must not stop msg3 retransmission"
@@ -1554,7 +1627,7 @@ mod overlapping_epoch_tests {
         let (ct, counter, hdr) = seal(&mut p_send, b"peer-on-new-epoch", entry.current_k_bit());
         let k_now = entry.current_k_bit();
         let (_pt, slot) = entry
-            .fsp_trial_decrypt(&ct, counter, &hdr, k_now, 2_500)
+            .fsp_trial_decrypt(&ct, counter, &hdr, k_now, session_at(2_500))
             .unwrap();
         assert_eq!(slot, EpochSlot::Current);
         // Receive-path logic: current hit + retained payload + no pending
@@ -1574,13 +1647,13 @@ mod overlapping_epoch_tests {
 
         let mut entry = entry_with_current(cur_recv);
         entry.set_pending_session(p_recv);
-        entry.set_rekey_completed_ms(1_000);
-        entry.set_rekey_msg3_payload(vec![0xCD; 73], 1_500);
+        entry.set_rekey_completed(session_at(1_000));
+        entry.set_rekey_msg3_payload(vec![0xCD; 73], session_at(1_500));
 
         // Simulate the resend driver exhausting its budget.
         let max_resends = 8;
         for i in 0..max_resends {
-            entry.record_rekey_msg3_resend(2_000 + i as u64 * 100);
+            entry.record_rekey_msg3_resend(session_at(2_000 + i as u64 * 100));
         }
         assert_eq!(entry.rekey_msg3_resend_count(), max_resends);
 
@@ -1609,10 +1682,10 @@ mod overlapping_epoch_tests {
         // msg3 payload, then cuts over on its own liveness timer before
         // the responder has received msg3.
         let mut a = entry_with_current(old_a);
-        a.set_rekey_completed_ms(1_000);
-        a.set_rekey_msg3_payload(vec![0xEE; 73], 1_500);
+        a.set_rekey_completed(session_at(1_000));
+        a.set_rekey_msg3_payload(vec![0xEE; 73], session_at(1_500));
         a.set_pending_session(new_a);
-        assert!(a.cutover_to_new_session(2_000));
+        assert!(a.cutover_to_new_session(session_at(2_000)));
         // A now: current = new_a, previous = old_a, K-bit flipped, msg3
         // payload still retained (responder not yet confirmed).
         assert!(a.rekey_msg3_payload().is_some());
@@ -1626,7 +1699,7 @@ mod overlapping_epoch_tests {
         // retransmission. Confirm it is a clean drop, not a panic.
         let (ct_new, c_new, hdr_new) = seal(&mut new_b, b"new-from-a", true);
         assert!(
-            b.fsp_trial_decrypt(&ct_new, c_new, &hdr_new, true, 2_100)
+            b.fsp_trial_decrypt(&ct_new, c_new, &hdr_new, true, session_at(2_100))
                 .is_none(),
             "responder without msg3 drops the new-epoch frame cleanly"
         );
@@ -1639,7 +1712,7 @@ mod overlapping_epoch_tests {
             seal(b_old, b"old-from-b", false)
         };
         let (pt, slot) = a
-            .fsp_trial_decrypt(&ct_old, c_old, &hdr_old, false, 2_200)
+            .fsp_trial_decrypt(&ct_old, c_old, &hdr_old, false, session_at(2_200))
             .expect("initiator must still decrypt the responder's old-epoch frame");
         assert_eq!(pt, b"old-from-b");
         assert_eq!(slot, EpochSlot::Previous);
@@ -1650,7 +1723,7 @@ mod overlapping_epoch_tests {
         b.set_pending_session(new_a2);
         let (ct_new2, c_new2, hdr_new2) = seal(&mut new_b2, b"new-from-a-2", true);
         let (pt, slot) = b
-            .fsp_trial_decrypt(&ct_new2, c_new2, &hdr_new2, true, 2_300)
+            .fsp_trial_decrypt(&ct_new2, c_new2, &hdr_new2, true, session_at(2_300))
             .expect("responder must decrypt new-epoch frame once pending is installed");
         assert_eq!(pt, b"new-from-a-2");
         assert_eq!(slot, EpochSlot::Pending);
@@ -1679,7 +1752,7 @@ mod overlapping_epoch_tests {
         let (_new_send, new_recv) = xk_pair(3, 4);
         let mut entry = entry_with_current(old_recv);
         entry.set_pending_session(new_recv);
-        assert!(entry.cutover_to_new_session(cutover_ms));
+        assert!(entry.cutover_to_new_session(session_at(cutover_ms)));
         assert!(entry.is_draining());
 
         // The peer (responder) is still on the OLD epoch — it never
@@ -1691,13 +1764,13 @@ mod overlapping_epoch_tests {
         for &t in &[5_000u64, 15_000, 25_000] {
             let (ct, counter, hdr) = seal(&mut old_send, b"still-old-epoch", k_old);
             let (_pt, slot) = entry
-                .fsp_trial_decrypt(&ct, counter, &hdr, k_old, t)
+                .fsp_trial_decrypt(&ct, counter, &hdr, k_old, session_at(t))
                 .expect("old-epoch frame must still decrypt while peer uses it");
             assert_eq!(slot, EpochSlot::Previous);
             // Even though `now - drain_started_ms` exceeds DRAIN_MS, the
             // window is NOT expired: the peer just used `previous`.
             assert!(
-                !entry.drain_expired(t, DRAIN_MS, MAX_MS),
+                !entry.drain_expired(session_at(t), ms(DRAIN_MS), ms(MAX_MS)),
                 "previous slot must not be retired while peer keeps using it (t={t})"
             );
             assert!(
@@ -1710,11 +1783,11 @@ mod overlapping_epoch_tests {
         // last `previous`-slot use was at t=25_000; the window now
         // elapses DRAIN_MS after that, NOT DRAIN_MS after the cutover.
         assert!(
-            !entry.drain_expired(34_999, DRAIN_MS, MAX_MS),
+            !entry.drain_expired(session_at(34_999), ms(DRAIN_MS), ms(MAX_MS)),
             "window must not expire before DRAIN_MS past the last previous use"
         );
         assert!(
-            entry.drain_expired(35_000, DRAIN_MS, MAX_MS),
+            entry.drain_expired(session_at(35_000), ms(DRAIN_MS), ms(MAX_MS)),
             "window must expire DRAIN_MS after the last previous-slot decrypt"
         );
 
@@ -1739,16 +1812,20 @@ mod overlapping_epoch_tests {
         let (_new_send, new_recv) = xk_pair(3, 4);
         let mut entry = entry_with_current(old_recv);
         entry.set_pending_session(new_recv);
-        assert!(entry.cutover_to_new_session(cutover_ms));
+        assert!(entry.cutover_to_new_session(session_at(cutover_ms)));
 
         // No old-epoch frames ever arrive: `previous_last_used_ms` stays
         // 0, the deadline anchor is the cutover time.
         assert!(
-            !entry.drain_expired(cutover_ms + DRAIN_MS - 1, DRAIN_MS, MAX_MS),
+            !entry.drain_expired(
+                session_at(cutover_ms + DRAIN_MS - 1),
+                ms(DRAIN_MS),
+                ms(MAX_MS)
+            ),
             "window must not expire early"
         );
         assert!(
-            entry.drain_expired(cutover_ms + DRAIN_MS, DRAIN_MS, MAX_MS),
+            entry.drain_expired(session_at(cutover_ms + DRAIN_MS), ms(DRAIN_MS), ms(MAX_MS)),
             "window must expire on the plain wall-clock timer when peer is off the old epoch"
         );
     }
@@ -1772,24 +1849,24 @@ mod overlapping_epoch_tests {
         let (_new_send, new_recv) = xk_pair(3, 4);
         let mut entry = entry_with_current(old_recv);
         entry.set_pending_session(new_recv);
-        assert!(entry.cutover_to_new_session(1));
+        assert!(entry.cutover_to_new_session(session_at(1)));
 
         // One old-epoch frame every half window, which is what a peer
         // pinning the drain deadline actually does.
         let mut t = 1u64;
         while t < MAX_MS {
-            entry.refresh_previous_use(t);
+            entry.refresh_previous_use(session_at(t));
             assert!(
-                !entry.drain_expired(t, DRAIN_MS, MAX_MS),
+                !entry.drain_expired(session_at(t), ms(DRAIN_MS), ms(MAX_MS)),
                 "ceiling fired before the peer's grace ran out (t={t})"
             );
             t += DRAIN_MS / 2;
         }
 
         // Still refreshing, so the sliding deadline is nowhere near due.
-        entry.refresh_previous_use(MAX_MS + 1);
+        entry.refresh_previous_use(session_at(MAX_MS + 1));
         assert!(
-            entry.drain_expired(MAX_MS + 1, DRAIN_MS, MAX_MS),
+            entry.drain_expired(session_at(MAX_MS + 1), ms(DRAIN_MS), ms(MAX_MS)),
             "a peer pinning the old epoch retained the retired key past the ceiling"
         );
     }
@@ -1806,16 +1883,20 @@ mod overlapping_epoch_tests {
         let (_new_send, new_recv) = xk_pair(3, 4);
         let mut entry = entry_with_current(old_recv);
         entry.set_pending_session(new_recv);
-        assert!(entry.cutover_to_new_session(CUTOVER_MS));
+        assert!(entry.cutover_to_new_session(session_at(CUTOVER_MS)));
         assert!(entry.is_draining());
 
         // A peer that lost msg3 and is still catching up sends one
         // old-epoch frame part-way through the window.
         let last_use = CUTOVER_MS + DRAIN_MS / 2;
-        entry.refresh_previous_use(last_use);
-        assert!(!entry.drain_expired(CUTOVER_MS + DRAIN_MS, DRAIN_MS, MAX_MS));
-        assert!(!entry.drain_expired(last_use + DRAIN_MS - 1, DRAIN_MS, MAX_MS));
-        assert!(entry.drain_expired(last_use + DRAIN_MS, DRAIN_MS, MAX_MS));
+        entry.refresh_previous_use(session_at(last_use));
+        assert!(!entry.drain_expired(session_at(CUTOVER_MS + DRAIN_MS), ms(DRAIN_MS), ms(MAX_MS)));
+        assert!(!entry.drain_expired(
+            session_at(last_use + DRAIN_MS - 1),
+            ms(DRAIN_MS),
+            ms(MAX_MS)
+        ));
+        assert!(entry.drain_expired(session_at(last_use + DRAIN_MS), ms(DRAIN_MS), ms(MAX_MS)));
     }
 
     // 14. The shipped ceiling has to clear the worst-case legitimate
@@ -1837,12 +1918,16 @@ mod overlapping_epoch_tests {
         let (_new_send, new_recv) = xk_pair(3, 4);
         let mut entry = entry_with_current(old_recv);
         entry.set_pending_session(new_recv);
-        assert!(entry.cutover_to_new_session(CUTOVER_MS));
+        assert!(entry.cutover_to_new_session(session_at(CUTOVER_MS)));
         assert!(entry.is_draining());
 
-        entry.refresh_previous_use(CUTOVER_MS + RECOVERY_MS);
+        entry.refresh_previous_use(session_at(CUTOVER_MS + RECOVERY_MS));
         assert!(
-            !entry.drain_expired(CUTOVER_MS + RECOVERY_MS, DRAIN_MS, max_ms),
+            !entry.drain_expired(
+                session_at(CUTOVER_MS + RECOVERY_MS),
+                ms(DRAIN_MS),
+                ms(max_ms)
+            ),
             "ceiling fires inside the msg3 recovery budget"
         );
     }

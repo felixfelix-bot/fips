@@ -3236,10 +3236,10 @@ fn install_end_to_end_session(node: &mut Node, initiator: &Node) {
         node_addr_of(initiator),
         initiator.identity().pubkey_full(),
         EndToEndState::Established(session),
-        Node::now_ms(),
+        Node::session_now(),
         false,
     );
-    entry.touch(Node::now_ms());
+    entry.touch(Node::session_now());
     node.sessions.insert(node_addr_of(initiator), entry);
 }
 

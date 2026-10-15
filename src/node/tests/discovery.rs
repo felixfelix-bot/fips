@@ -2446,7 +2446,10 @@ async fn native_datagrams_held_for_an_initiating_session_are_kept_and_released_a
     let timeout_ms = rate_limit.handshake_timeout_secs * 1000;
     nodes[0]
         .node
-        .resend_pending_session_handshakes(last_activity + timeout_ms + 1_000)
+        .resend_pending_session_handshakes(crate::node::session::session_after(
+            last_activity,
+            timeout_ms + 1_000,
+        ))
         .await;
     assert!(
         nodes[0].node.get_session(&node1_addr).is_none(),
@@ -2943,7 +2946,7 @@ async fn a_lookup_that_completes_without_starting_a_session_releases_the_held_pa
             *other.node_addr(),
             other.pubkey_full(),
             crate::node::session::EndToEndState::Initiating(handshake),
-            1000,
+            crate::node::session::session_at(1000),
             true,
         ),
     );
@@ -3356,7 +3359,7 @@ async fn a_lookup_answer_for_a_destination_with_a_session_entry_but_no_cached_id
             dest_addr,
             dest.pubkey_full(),
             crate::node::session::EndToEndState::Initiating(handshake),
-            1000,
+            crate::node::session::session_at(1000),
             true,
         ),
     );
@@ -3410,7 +3413,7 @@ async fn a_failed_session_retry_after_a_lookup_answer_leaves_packets_held_behind
             crate::node::session::EndToEndState::AwaitingMsg3(
                 crate::noise::HandshakeState::new_xk_responder(node.identity().keypair()),
             ),
-            Node::now_ms(),
+            Node::session_now(),
             false,
         ),
     );

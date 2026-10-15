@@ -6,7 +6,7 @@
 use crate::identity::{NodeAddr, PeerIdentity, encode_npub};
 use crate::node::Node;
 use crate::node::stats_history::{ALL_METRICS, ALL_PEER_METRICS, Granularity, Metric, PeerMetric};
-use crate::time::HostClock;
+use crate::time::{HostClock, WallStamp};
 use fips_core::time::{Clock as _, Instant as _};
 use serde_json::{Value, json};
 use std::str::FromStr;
@@ -766,7 +766,7 @@ pub fn show_sessions(node: &Node) -> Value {
                 "display_name": node.peer_display_name(addr),
                 "state": state_str,
                 "is_initiator": entry.is_initiator(),
-                "last_activity_ms": entry.last_activity(),
+                "last_activity_ms": entry.last_activity().wall_ms(),
             });
 
             // Derive npub from session's remote public key
@@ -789,7 +789,8 @@ pub fn show_sessions(node: &Node) -> Value {
 
             // Rekey and session health (visible when established)
             if entry.is_established() {
-                session_json["session_start_ms"] = json!(entry.session_start_ms());
+                session_json["session_start_ms"] =
+                    json!(entry.session_start().map_or(0, WallStamp::wall_ms));
                 session_json["current_k_bit"] = json!(entry.current_k_bit());
                 session_json["coords_warmup_remaining"] = json!(entry.coords_warmup_remaining());
                 session_json["is_draining"] = json!(entry.is_draining());

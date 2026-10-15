@@ -23,7 +23,6 @@ static START: LazyLock<StdInstant> = LazyLock::new(StdInstant::now);
 
 /// The furthest a [`deadline`] reaches: 100 years, which neither host instant
 /// type can overflow from a current reading.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) const CEILING: Duration = Duration::from_secs(100 * 365 * 24 * 60 * 60);
 
 /// Monotonic millisecond clock for the MMP time seam.
@@ -102,7 +101,6 @@ impl From<HostInstant> for StdInstant {
 
 /// Unix milliseconds of an instant, for the control API and logs, which
 /// report times as wall-clock stamps.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) trait WallStamp {
     /// The instant as Unix time in milliseconds.
     fn wall_ms(self) -> u64;
@@ -135,7 +133,6 @@ impl WallStamp for WallMillis {
 /// Below the cap this is exactly `now + d`. An instant type whose range ends
 /// within the cap of `now` gets a deadline at or before that end instead of a
 /// panic: the step is halved until it fits.
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) fn deadline<I: Instant>(now: I, d: Duration) -> I {
     let mut step = d.min(CEILING);
     loop {

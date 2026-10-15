@@ -10,6 +10,8 @@ use crate::NodeAddr;
 use crate::node::Node;
 use crate::node::dataplane::PeerActionCtx;
 use crate::node::diag::{self, OrNone};
+use crate::node::handlers::timeout::resend_deadline;
+use crate::node::session::{SessionInstant, age_ms};
 use crate::noise::HandshakeState;
 use crate::peer::machine::PeerEvent;
 use crate::proto::fmp::wire::build_msg1;
@@ -18,7 +20,10 @@ use crate::proto::fsp::{
     FspAction, RekeyMsg3ResendSnapshot, SessionSetup, SessionSnapshot, cutover_timer_elapsed,
 };
 use crate::proto::link::SessionDatagram;
+use crate::time::WallStamp;
 use crate::transport::{TransportAddr, TransportId};
+use fips_core::time::Instant;
+use std::time::Duration;
 use tracing::{debug, info, trace, warn};
 
 /// Keep previous session alive for this long after cutover.
@@ -667,7 +672,7 @@ impl Node {
     /// pending session is dropped and the next cycle retries fresh. This
     /// is safe — an abandoned cycle never leaves a divergent unsafe
     /// state.
-    pub(in crate::node) async fn resend_pending_session_msg3(&mut self, now_ms: u64) {
+    pub(in crate::node) async fn resend_pending_session_msg3(&mut self, now: SessionInstant) {
         if !self.config().node.rekey.enabled || self.sessions.is_empty() {
             return;
         }
@@ -681,7 +686,7 @@ impl Node {
         // The shell snapshots each session retaining a msg3 payload (resend-due
         // predicate resolved here); the core classifies abandon-vs-resend,
         // abandons first.
-        let candidates = self.rekey_msg3_resend_snapshots(now_ms);
+        let candidates = self.rekey_msg3_resend_snapshots(now);
         for action in self.fsp.poll_rekey_msg3_resends(candidates, max_resends) {
             match action {
                 FspAction::AbandonRekey { addr } => {
@@ -717,8 +722,7 @@ impl Node {
 
                     if sent && let Some(entry) = self.sessions.get_mut(&addr) {
                         let count = entry.rekey_msg3_resend_count() + 1;
-                        let next =
-                            now_ms + (interval_ms as f64 * backoff.powi(count as i32)) as u64;
+                        let next = resend_deadline(now, interval_ms, backoff, count);
                         entry.record_rekey_msg3_resend(next);
                         trace!(
                             peer = %self.peer_display_name(&addr),
@@ -735,16 +739,15 @@ impl Node {
 
     /// Snapshot every session retaining a rekey-msg3 payload for the
     /// retransmission decision, pre-evaluating the resend-due predicate against
-    /// `now_ms` so the core reads no clock.
-    fn rekey_msg3_resend_snapshots(&self, now_ms: u64) -> Vec<RekeyMsg3ResendSnapshot> {
+    /// `now` so the core reads no clock.
+    fn rekey_msg3_resend_snapshots(&self, now: SessionInstant) -> Vec<RekeyMsg3ResendSnapshot> {
         self.sessions
             .iter()
             .filter(|(_, entry)| entry.rekey_msg3_payload().is_some())
             .map(|(node_addr, entry)| RekeyMsg3ResendSnapshot {
                 addr: *node_addr,
                 resend_count: entry.rekey_msg3_resend_count(),
-                resend_due: entry.rekey_msg3_next_resend_ms() != 0
-                    && now_ms >= entry.rekey_msg3_next_resend_ms(),
+                resend_due: entry.rekey_msg3_next_resend().is_some_and(|at| now >= at),
             })
             .collect()
     }
@@ -781,18 +784,18 @@ impl Node {
             after_secs: self.config().node.rekey.after_secs,
             after_messages: self.config().node.rekey.after_messages,
         };
-        let now_ms = Self::now_ms();
+        let now = Self::session_now();
 
         // The shell snapshots each established session's rekey ages/flags
         // (every clock read resolved here); the core decides
         // cutover/drain/abandon/trigger with no clock, phase-grouped to
         // preserve the pre-refactor execution order.
-        let snapshots = self.session_rekey_snapshots(now_ms);
+        let snapshots = self.session_rekey_snapshots(now);
         for action in self.fsp.poll_rekey(snapshots, &cfg) {
             match action {
                 FspAction::CutOver { addr } => {
                     if let Some(entry) = self.sessions.get_mut(&addr)
-                        && entry.cutover_to_new_session(now_ms)
+                        && entry.cutover_to_new_session(now)
                     {
                         debug!(
                             peer = %self.peer_display_name(&addr),
@@ -816,7 +819,11 @@ impl Node {
                     let age_ms = self
                         .sessions
                         .get(&addr)
-                        .map(|entry| now_ms.saturating_sub(entry.last_peer_rekey_ms()))
+                        .map(|entry| {
+                            entry
+                                .last_peer_rekey()
+                                .map_or_else(|| now.wall_ms(), |at| age_ms(now, at))
+                        })
                         .unwrap_or(0);
                     if let Some(entry) = self.sessions.get_mut(&addr) {
                         entry.abandon_handshake();
@@ -834,7 +841,11 @@ impl Node {
                     let age_ms = self
                         .sessions
                         .get(&addr)
-                        .map(|entry| now_ms.saturating_sub(entry.initiated_ms()))
+                        .map(|entry| {
+                            entry
+                                .initiated()
+                                .map_or_else(|| now.wall_ms(), |at| age_ms(now, at))
+                        })
                         .unwrap_or(0);
                     if let Some(entry) = self.sessions.get_mut(&addr) {
                         entry.abandon_handshake();
@@ -858,9 +869,9 @@ impl Node {
     /// Snapshot every established session for the FSP rekey decision,
     /// pre-computing its monotonic age and timer predicates so the pure core
     /// applies the thresholds without reading a clock (see [`SessionSnapshot`]).
-    fn session_rekey_snapshots(&self, now_ms: u64) -> Vec<SessionSnapshot> {
-        let drain_ms = crate::proto::fsp::limits::DRAIN_WINDOW_SECS * 1000;
-        let dampening_ms = crate::proto::fsp::limits::REKEY_DAMPENING_SECS * 1000;
+    fn session_rekey_snapshots(&self, now: SessionInstant) -> Vec<SessionSnapshot> {
+        let drain = Duration::from_secs(crate::proto::fsp::limits::DRAIN_WINDOW_SECS);
+        let dampening = Duration::from_secs(crate::proto::fsp::limits::REKEY_DAMPENING_SECS);
         // Bound for a responder-side handshake the peer armed and never
         // finished, anchored on the peer's last accepted setup message, which
         // is the only stamp that path writes. A *completed* rekey has no such
@@ -870,17 +881,19 @@ impl Node {
         // the setup this node sent, and neither clock may stand in for the
         // other: the peer's stamp says nothing about our setup, and ours
         // says nothing about the peer's. Unlike the peer predicate, ours has
-        // no `!= 0` conjunct, deliberately: an initiator handshake armed
-        // without the stamp reads as expired, because dropping one costs a
-        // retry and keeping one stops rotation.
-        let stale_handshake_ms = self.config().node.rate_limit.handshake_timeout_secs * 1000;
+        // no "stamp present" conjunct, deliberately: an initiator handshake
+        // armed without the stamp reads as expired, because dropping one
+        // costs a retry and keeping one stops rotation.
+        let stale_handshake =
+            Duration::from_secs(self.config().node.rate_limit.handshake_timeout_secs);
         // Absolute ceiling on `previous`-slot retention, measured from the
         // cutover. The sliding drain deadline is peer-progress-aware, so an
         // authenticated peer that keeps sealing in the old epoch can hold the
         // retired key indefinitely; this bounds that without shortening the
         // grace a peer that lost msg3 legitimately needs. Resolved here rather
         // than in the core, which reads no clock and no configuration.
-        let drain_max_ms = drain_max_retention_ms(&self.config().node.rate_limit);
+        let drain_max =
+            Duration::from_millis(drain_max_retention_ms(&self.config().node.rate_limit));
         self.sessions
             .iter()
             .filter(|(_, entry)| entry.is_established())
@@ -889,16 +902,31 @@ impl Node {
                 has_pending: entry.pending_new_session().is_some(),
                 rekey_in_progress: entry.has_rekey_in_progress(),
                 is_rekey_initiator: entry.is_rekey_initiator(),
-                cutover_timer_elapsed: cutover_timer_elapsed(now_ms, entry.rekey_completed_ms()),
+                // An unstamped completion reads as long ago, as a zero stamp
+                // did.
+                cutover_timer_elapsed: cutover_timer_elapsed(
+                    entry
+                        .rekey_completed()
+                        .map_or(u64::MAX, |done| age_ms(now, done)),
+                    0,
+                ),
                 is_draining: entry.is_draining(),
-                drain_expired: entry.drain_expired(now_ms, drain_ms, drain_max_ms),
+                drain_expired: entry.drain_expired(now, drain, drain_max),
                 has_rekey_msg3_payload: entry.rekey_msg3_payload().is_some(),
-                is_dampened: entry.is_rekey_dampened(now_ms, dampening_ms),
-                armed_handshake_expired: entry.last_peer_rekey_ms() != 0
-                    && now_ms.saturating_sub(entry.last_peer_rekey_ms()) > stale_handshake_ms,
-                initiation_expired: now_ms.saturating_sub(entry.initiated_ms())
-                    > stale_handshake_ms,
-                elapsed_secs: now_ms.saturating_sub(entry.session_start_ms()) / 1000,
+                is_dampened: entry.is_rekey_dampened(now, dampening),
+                armed_handshake_expired: entry
+                    .last_peer_rekey()
+                    .is_some_and(|at| now.saturating_duration_since(at) > stale_handshake),
+                initiation_expired: entry
+                    .initiated()
+                    .is_none_or(|at| now.saturating_duration_since(at) > stale_handshake),
+                // Only established sessions are snapshotted, and establishing
+                // stamps the start; without one the age reads as above any
+                // rekey threshold, as a zero stamp did.
+                elapsed_secs: entry
+                    .session_start()
+                    .map_or(u64::MAX, |start| age_ms(now, start))
+                    / 1000,
                 counter: entry.send_counter(),
                 jitter_secs: entry.rekey_jitter_secs(),
             })
@@ -979,7 +1007,7 @@ impl Node {
         // Store rekey state on the existing session entry. The deadline is
         // stamped only now, so it runs from the setup actually on the wire.
         if let Some(entry) = self.sessions.get_mut(dest_addr) {
-            entry.begin_rekey(handshake, Self::now_ms());
+            entry.begin_rekey(handshake, Self::session_now());
         }
 
         debug!(

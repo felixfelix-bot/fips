@@ -13,8 +13,8 @@ use crate::node::handlers::mmp::format_throughput;
 use crate::node::rate_limit::Msg1Class;
 use crate::node::reject::{RejectReason, SessionReject};
 use crate::node::session::{
-    CandidateAdmission, EndToEndState, EpochSlot, HALF_OPEN_MIN_AGE_MS, ResponderCandidate,
-    SessionEntry,
+    CandidateAdmission, EndToEndState, EpochSlot, HALF_OPEN_MIN_AGE, ResponderCandidate,
+    SessionClock, SessionEntry, SessionInstant,
 };
 use crate::node::{Node, NodeError};
 use crate::noise::{
@@ -49,10 +49,13 @@ use crate::proto::mmp::{MAX_SESSION_REPORT_INTERVAL_MS, MIN_SESSION_REPORT_INTER
 use crate::proto::probe::LookupOutcomeKind;
 use crate::proto::routing::{CoordsRequired, MtuExceeded, PathBroken, RoutingSignalType};
 use crate::proto::stp::{coords_wire_size, encode_coords};
+use crate::time::deadline;
 #[cfg(unix)]
 use crate::transport::TransportHandle;
 use fips_core::time::Clock as _;
+use fips_core::time::Instant;
 use secp256k1::PublicKey;
+use std::time::Duration;
 use tracing::{debug, info, trace, warn};
 
 /// Minimum interval between path-MTU releases driven by `PathBroken` for one
@@ -377,7 +380,7 @@ mod held_tests {
 struct PipelinedSend<'a> {
     dest_addr: &'a NodeAddr,
     payload: &'a [u8],
-    now_ms: u64,
+    now: SessionInstant,
     timestamp: u32,
     fsp_flags: u8,
     inner_plaintext: &'a [u8],
@@ -580,7 +583,7 @@ impl Node {
             None => return,
         };
 
-        let now_ms = Self::now_ms();
+        let now = Self::session_now();
 
         // Overlapping-epoch trial-decrypt: try current, pending and
         // previous so any epoch the peer might have sealed this frame in
@@ -594,7 +597,7 @@ impl Node {
             header.counter,
             &header.header_bytes,
             received_k_bit,
-            now_ms,
+            now,
         ) {
             Some(result) => result,
             None => {
@@ -641,7 +644,7 @@ impl Node {
                     "Peer FSP new-epoch frame authenticated, FSP rekey cutover complete, promoting new session"
                 );
                 entry.confirm_peer_new_epoch();
-                entry.handle_peer_kbit_flip(now_ms);
+                entry.handle_peer_kbit_flip(now);
             }
             EpochReaction::Promote => {
                 // Promote now: current → previous, pending → current, flip the
@@ -651,7 +654,7 @@ impl Node {
                     peer = %self.peer_display_name(src_addr),
                     "Peer FSP new-epoch frame authenticated, FSP rekey cutover complete, promoting new session"
                 );
-                entry.handle_peer_kbit_flip(now_ms);
+                entry.handle_peer_kbit_flip(now);
             }
             EpochReaction::ConfirmResponder => {
                 // We are the rekey initiator that already cut over on its own
@@ -821,7 +824,7 @@ impl Node {
             && let Some(entry) = self.sessions.get_mut(src_addr)
         {
             entry.record_recv(rest.len());
-            entry.touch(Self::now_ms());
+            entry.touch(Self::session_now());
         }
 
         // Flush any pending outbound packets (e.g., simultaneous initiation
@@ -967,8 +970,8 @@ impl Node {
             // below drops one either.
             let pending_outranks = existing.pending_new_session().is_some()
                 && !existing.pending_stale(
-                    Self::now_ms(),
-                    self.config().node.session.idle_timeout_secs * 1000,
+                    Self::session_now(),
+                    Duration::from_millis(self.config().node.session.idle_timeout_secs * 1000),
                 );
 
             // A handshake the peer armed is held until its msg3 or its
@@ -1073,10 +1076,10 @@ impl Node {
             }
 
             // Store rekey state on the existing entry
-            let now_ms = Self::now_ms();
+            let now = Self::session_now();
             let entry = self.sessions.get_mut(src_addr).unwrap();
             entry.set_rekey_state(handshake, false);
-            entry.record_peer_rekey(now_ms);
+            entry.record_peer_rekey(now);
             self.stats_mut().session.rekey_armed += 1;
 
             debug!(
@@ -1091,7 +1094,7 @@ impl Node {
         // of them may silence another setup naming the same address: the
         // owner's own setup is answered beside a forger's, each with its own
         // ack, and the first leg to complete establishes the session.
-        let now_ms = Self::now_ms();
+        let now = Self::session_now();
         let mut admission = CandidateAdmission::Room;
         let mut lost_tie_break = false;
         let mut yield_leg = false;
@@ -1122,8 +1125,9 @@ impl Node {
                 // different handshake.
                 let we_win =
                     crate::proto::fsp::initiation_winner(self.identity().node_addr(), src_addr);
-                let unanswered_ms = now_ms.saturating_sub(existing.created_at());
-                if we_win && unanswered_ms < HALF_OPEN_MIN_AGE_MS {
+                let unanswered = now.saturating_duration_since(existing.created_at());
+                let unanswered_ms = unanswered.as_millis() as u64;
+                if we_win && unanswered < HALF_OPEN_MIN_AGE {
                     debug!(
                         src = %self.peer_display_name(src_addr),
                         reason = "tie-break-won",
@@ -1149,7 +1153,7 @@ impl Node {
                     lost_tie_break = true;
                 }
             }
-            admission = existing.candidate_admission(link_peer, now_ms);
+            admission = existing.candidate_admission(link_peer, now);
             if admission == CandidateAdmission::Refuse {
                 debug!(
                     src = %self.peer_display_name(src_addr),
@@ -1214,7 +1218,7 @@ impl Node {
             setup.handshake_payload.clone(),
             ack_payload,
             *link_peer,
-            now_ms,
+            now,
         );
         if let Some(entry) = self.sessions.get_mut(src_addr) {
             if lost_tie_break {
@@ -1237,7 +1241,7 @@ impl Node {
                 *src_addr,
                 placeholder_pubkey,
                 EndToEndState::Responding,
-                now_ms,
+                now,
                 false,
             );
             entry.add_candidate(candidate, CandidateAdmission::Room);
@@ -1371,11 +1375,14 @@ impl Node {
             // cutover. The initiator may cut over on its liveness timer
             // before the responder receives msg3; overlapping-epoch
             // decrypt keeps both directions safe meanwhile.
-            let now_ms = Self::now_ms();
+            let now = Self::session_now();
             let resend_interval = self.config().node.rate_limit.handshake_resend_interval_ms;
             entry.set_pending_session(session);
-            entry.set_rekey_completed_ms(now_ms);
-            entry.set_rekey_msg3_payload(msg3_payload, now_ms + resend_interval);
+            entry.set_rekey_completed(now);
+            entry.set_rekey_msg3_payload(
+                msg3_payload,
+                deadline(now, Duration::from_millis(resend_interval)),
+            );
             self.sessions.insert(*src_addr, entry);
 
             debug!(
@@ -1479,12 +1486,13 @@ impl Node {
         } else {
             entry.take_candidates()
         };
+        let now = Self::session_now();
         let now_ms = Self::now_ms();
         let resend_interval = self.config().node.rate_limit.handshake_resend_interval_ms;
         entry.set_state(EndToEndState::Established(session));
         entry.restore_candidates(kept);
         entry.set_coords_warmup_remaining(self.config().node.session.coords_warmup_packets);
-        entry.mark_established(now_ms);
+        entry.mark_established(now);
         entry.init_mmp(&self.config().node.session_mmp);
         // Keep msg3 for resend. This end is established once msg3 leaves, the
         // responder only once it arrives, and nothing else repairs a lost
@@ -1496,8 +1504,11 @@ impl Node {
         // resends it until a frame from the peer authenticates on this
         // session or the resend budget is spent. The rekey arm keeps its
         // msg3 for the same reason.
-        entry.set_handshake_payload(msg3_payload, now_ms + resend_interval);
-        entry.touch(now_ms);
+        entry.set_handshake_payload(
+            msg3_payload,
+            deadline(now, Duration::from_millis(resend_interval)),
+        );
+        entry.touch(now);
         self.sessions.insert(*src_addr, entry);
         // Not charged to a link peer: this node started the handshake, and
         // msg2 has authenticated, so the write happens once per session.
@@ -1553,8 +1564,8 @@ impl Node {
     /// Whether `entry`'s responder hold is younger than the handshake
     /// timeout.
     fn hold_open(&self, entry: &SessionEntry) -> bool {
-        let timeout_ms = self.config().node.rate_limit.handshake_timeout_secs * 1000;
-        entry.responder_hold_open(Self::now_ms(), timeout_ms)
+        let timeout = Duration::from_secs(self.config().node.rate_limit.handshake_timeout_secs);
+        entry.responder_hold_open(Self::session_now(), timeout)
     }
 
     /// Handle an incoming SessionMsg3 (Noise XK msg3).
@@ -1695,7 +1706,7 @@ impl Node {
             // counted and logged rather than silent.
             let superseded = entry.pending_new_session().is_some();
             entry.set_pending_session(session);
-            entry.set_rekey_completed_ms(Self::now_ms());
+            entry.set_rekey_completed(Self::session_now());
             self.sessions.insert(*src_addr, entry);
             if superseded {
                 self.stats_mut().session.pending_replaced += 1;
@@ -1801,19 +1812,19 @@ impl Node {
             }
         };
 
-        let now_ms = Self::now_ms();
+        let now = Self::session_now();
         // Replace the placeholder pubkey with the real one
         let mut new_entry = SessionEntry::new(
             *src_addr,
             remote_pubkey,
             EndToEndState::Established(session),
-            now_ms,
+            now,
             false,
         );
         new_entry.set_coords_warmup_remaining(self.config().node.session.coords_warmup_packets);
-        new_entry.mark_established(now_ms);
+        new_entry.mark_established(now);
         new_entry.init_mmp(&self.config().node.session_mmp);
-        new_entry.touch(now_ms);
+        new_entry.touch(now);
         self.sessions.insert(*src_addr, new_entry);
 
         // Flush any pending packets
@@ -2077,7 +2088,7 @@ impl Node {
         // Convert to link-layer ReceiverReport for MmpMetrics processing
         let rr: ReceiverReport = ReceiverReport::from(&session_rr);
 
-        let now_ms = Self::now_ms();
+        let now = Self::session_now();
         let peer_name = self.peer_display_name(src_addr);
         let entry = match self.sessions.get_mut(src_addr) {
             Some(e) => e,
@@ -2089,7 +2100,7 @@ impl Node {
             }
         };
 
-        let our_timestamp_ms = entry.session_timestamp(now_ms);
+        let our_timestamp_ms = entry.session_timestamp(now);
 
         let Some(mmp) = entry.mmp_mut() else {
             return;
@@ -2942,25 +2953,20 @@ impl Node {
         self.register_identity(dest_addr, dest_pubkey);
 
         // Store session entry with handshake payload for potential resend
-        let now_ms = Self::now_ms();
+        let now = Self::session_now();
         let resend_interval = self.config().node.rate_limit.handshake_resend_interval_ms;
+        let next_resend = deadline(now, Duration::from_millis(resend_interval));
         if let Some(entry) = self.sessions.get_mut(&dest_addr) {
-            entry.attach_initiator(
-                handshake,
-                dest_pubkey,
-                setup_payload,
-                now_ms,
-                now_ms + resend_interval,
-            );
+            entry.attach_initiator(handshake, dest_pubkey, setup_payload, now, next_resend);
         } else {
             let mut entry = SessionEntry::new(
                 dest_addr,
                 dest_pubkey,
                 EndToEndState::Initiating(handshake),
-                now_ms,
+                now,
                 true,
             );
-            entry.set_handshake_payload(setup_payload, now_ms + resend_interval);
+            entry.set_handshake_payload(setup_payload, next_resend);
             self.sessions.insert(dest_addr, entry);
         }
 
@@ -2984,7 +2990,7 @@ impl Node {
         dst_port: u16,
         payload: &[u8],
     ) -> Result<(), NodeError> {
-        let now_ms = Self::now_ms();
+        let now = Self::session_now();
 
         // First borrow: read session metadata (NLL releases before coord decision)
         let entry = self
@@ -2995,7 +3001,7 @@ impl Node {
                 reason: "no session".into(),
             })?;
         let wants_coords = entry.coords_warmup_remaining() > 0;
-        let timestamp = entry.session_timestamp(now_ms);
+        let timestamp = entry.session_timestamp(now);
         let spin_bit = entry.mmp().is_some_and(|m| m.spin_bit.tx_bit());
         if !entry.is_established() {
             return Err(NodeError::SendFailed {
@@ -3073,7 +3079,7 @@ impl Node {
             .try_send_session_data_pipelined(PipelinedSend {
                 dest_addr,
                 payload,
-                now_ms,
+                now,
                 timestamp,
                 fsp_flags: flags,
                 inner_plaintext: &inner_plaintext,
@@ -3137,7 +3143,7 @@ impl Node {
             if let Some(mmp) = entry.mmp_mut() {
                 mmp.sender.record_sent(counter, timestamp, ciphertext.len());
             }
-            entry.touch(now_ms);
+            entry.touch(now);
         }
 
         Ok(())
@@ -3395,7 +3401,7 @@ impl Node {
                     send.inner_plaintext.len() + crate::noise::TAG_SIZE,
                 );
             }
-            entry.touch(send.now_ms);
+            entry.touch(send.now);
         }
 
         let dispatched = workers.dispatch(crate::node::encrypt_worker::FmpSendJob {
@@ -3495,7 +3501,7 @@ impl Node {
         msg_type: u8,
         payload: &[u8],
     ) -> Result<(), NodeError> {
-        let now_ms = Self::now_ms();
+        let now = Self::session_now();
 
         // Read spin bit and session timestamp from entry
         let entry = self
@@ -3505,7 +3511,7 @@ impl Node {
                 node_addr: *dest_addr,
                 reason: "no session".into(),
             })?;
-        let timestamp = entry.session_timestamp(now_ms);
+        let timestamp = entry.session_timestamp(now);
         let spin_bit = entry.mmp().is_some_and(|m| m.spin_bit.tx_bit());
 
         // Build inner flags with spin bit
@@ -3582,7 +3588,7 @@ impl Node {
         &mut self,
         dest_addr: &NodeAddr,
     ) -> Result<(), NodeError> {
-        let now_ms = Self::now_ms();
+        let now = Self::session_now();
 
         // A warmup's only content is the two coordinates; with none cached
         // for the destination, ours would stand in for its own.
@@ -3603,7 +3609,7 @@ impl Node {
                 node_addr: *dest_addr,
                 reason: "no session".into(),
             })?;
-        let timestamp = entry.session_timestamp(now_ms);
+        let timestamp = entry.session_timestamp(now);
         let spin_bit = entry.mmp().is_some_and(|m| m.spin_bit.tx_bit());
 
         // Get mutable access for encryption
@@ -3758,6 +3764,11 @@ impl Node {
         crate::time::wall_ms()
     }
 
+    /// Now on the session table's clock, [`SessionClock`].
+    pub(crate) fn session_now() -> SessionInstant {
+        SessionClock::default().now()
+    }
+
     /// The time the session-setup limiter is charged at: the host's
     /// monotonic clock, or in tests the clock a test set in `setup_clock`.
     fn setup_now(&self) -> crate::time::HostInstant {
@@ -3820,7 +3831,7 @@ impl Node {
             // setup nobody has proven, possibly forged. Once it has had the
             // minimum age to complete, this node initiates itself rather
             // than wait for the reap.
-            let initiate = entry.responder_hold_expired(Self::now_ms());
+            let initiate = entry.responder_hold_expired(Self::session_now());
             if initiate {
                 self.initiate_behind_candidates(dest_addr, dest_pubkey)
                     .await;
