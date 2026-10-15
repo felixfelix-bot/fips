@@ -99,3 +99,20 @@ fn ethernet_interface_name_errors_keep_their_messages() {
         Some(true)
     );
 }
+
+/// The kernel reads an interface name up to its first NUL, so
+/// `SO_BINDTODEVICE` with `lo\0x` binds to `lo`: the instance would run
+/// on an interface the config does not name.
+#[test]
+fn a_udp_instance_with_a_nul_in_its_interface_name_is_rejected() {
+    let err = validation_error("transports:\n  udp:\n    interface: \"lo\\0x\"\n")
+        .expect("an interface name holding a NUL must be refused");
+    assert!(err.contains("control character"), "{err}");
+}
+
+#[test]
+fn an_ethernet_interface_name_with_a_control_character_is_rejected() {
+    let err = validation_error("transports:\n  ethernet:\n    interface: \"eth\\x010\"\n")
+        .expect("an interface name holding a control character must be refused");
+    assert!(err.contains("control character"), "{err}");
+}

@@ -2232,6 +2232,13 @@ fn check_interface_name(label: &str, iface: &str) -> Result<(), ConfigError> {
              character no interface name may hold"
         )));
     }
+    // The kernel stops at the first NUL, so `lo\0x` would bind `lo`.
+    if iface.chars().any(char::is_control) {
+        return Err(ConfigError::Validation(format!(
+            "transport `{label}` interface {iface:?} contains a control \
+             character"
+        )));
+    }
     Ok(())
 }
 
