@@ -356,7 +356,7 @@ impl LookupForwardRateLimiter {
     }
 
     /// Remove expired entries and rebuild every peer's queue from the map,
-    /// at most once per [`FORWARD_SWEEP_INTERVAL_MS`].
+    /// at most once per `FORWARD_SWEEP_INTERVAL_MS`.
     ///
     /// The per-record purge only reaches the recording peer's own queue;
     /// this is what clears entries of peers that have gone quiet. The rebuild

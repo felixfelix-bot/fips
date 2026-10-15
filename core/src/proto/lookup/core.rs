@@ -136,7 +136,7 @@ pub fn plan_forward(
 /// Plan the transit forward of an inbound LookupRequest and record, on the
 /// request's recent-request entry, the link peers it was sent to.
 ///
-/// Runs [`plan_forward`]; on `Forward` it consults the forward limiter for
+/// Runs `plan_forward`; on `Forward` it consults the forward limiter for
 /// `(from, target)`, and when that admits the request the selected peers
 /// become the request's `forwarded_to`, the only peers a response to it is
 /// accepted from (see [`classify_response`]). `NoPeers`, `TtlExhausted` and
@@ -180,7 +180,7 @@ pub fn plan_transit_forward(
 /// when no tree peer matches; the shell treats that as an immediate failure.
 /// Pure — no I/O, metrics, or logs; the shell generates and signs the request.
 ///
-/// NOTE: unlike [`plan_forward`], this does NOT fall back to non-tree
+/// NOTE: unlike `plan_forward`, this does NOT fall back to non-tree
 /// (cross-link) bloom-matching peers. That asymmetry is preserved verbatim from
 /// the pre-sans-IO `initiate_lookup` to keep this extraction behavior-neutral;
 /// it is a known origination gap whose fix adds the fallback branch as a
