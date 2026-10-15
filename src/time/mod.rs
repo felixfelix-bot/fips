@@ -6,9 +6,6 @@
 //!   milliseconds for the cores that still take them.
 //! - [`wall_ms`] is Unix time in milliseconds, for wire timestamps and for
 //!   what the control API reports.
-//! - [`WallClock`] is a transitional clock over the wall clock, for code that
-//!   moves onto the core's time type before it moves onto the monotonic clock.
-//!   The peering retry schedule runs on it.
 
 use std::sync::LazyLock;
 use std::time::{Duration, Instant as StdInstant};
@@ -119,13 +116,6 @@ impl WallStamp for HostInstant {
     }
 }
 
-impl WallStamp for WallMillis {
-    /// The stored wall-clock milliseconds, unchanged.
-    fn wall_ms(self) -> u64 {
-        self.0
-    }
-}
-
 /// `now + d`, with `d` capped at [`CEILING`].
 ///
 /// Below the cap this is exactly `now + d`. An instant type whose range ends
@@ -141,46 +131,6 @@ pub(crate) fn deadline<I: Instant>(now: I, d: Duration) -> I {
             return now;
         }
         step /= 2;
-    }
-}
-
-/// A clock whose instants are the wall clock's Unix milliseconds.
-///
-/// **Not monotonic**, so it breaks [`Clock`]'s contract on purpose: a step of
-/// the system clock moves it either way. It exists so code that measures time
-/// on the wall clock today can move onto the core's time type without changing
-/// behaviour, before a separate change moves it onto [`HostClock`]. It goes
-/// when nothing uses it; the peering retry schedule still does.
-#[derive(Clone, Copy, Debug, Default)]
-pub(crate) struct WallClock;
-
-impl Clock for WallClock {
-    type Instant = WallMillis;
-
-    fn now(&self) -> WallMillis {
-        WallMillis(wall_ms())
-    }
-}
-
-/// An instant of [`WallClock`]: Unix milliseconds. Its arithmetic is `u64`
-/// millisecond arithmetic, the difference saturating at zero as
-/// `u64::saturating_sub` does.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-pub(crate) struct WallMillis(pub(crate) u64);
-
-impl Instant for WallMillis {
-    fn saturating_duration_since(self, earlier: Self) -> Duration {
-        Duration::from_millis(self.0.saturating_sub(earlier.0))
-    }
-
-    fn checked_add(self, d: Duration) -> Option<Self> {
-        let ms = u64::try_from(d.as_millis()).ok()?;
-        self.0.checked_add(ms).map(Self)
-    }
-
-    fn checked_sub(self, d: Duration) -> Option<Self> {
-        let ms = u64::try_from(d.as_millis()).ok()?;
-        self.0.checked_sub(ms).map(Self)
     }
 }
 
@@ -204,7 +154,7 @@ mod hooks {
 }
 
 /// Step this thread's wall clock by `ms` milliseconds, either way. Moves
-/// [`wall_ms`] and [`WallClock`], and not [`HostClock`] or [`mono_ms`].
+/// [`wall_ms`], and not [`HostClock`] or [`mono_ms`].
 #[cfg(test)]
 pub(crate) fn step_wall(ms: i64) {
     hooks::WALL_STEP.with(|s| s.set(s.get() + ms));
@@ -223,13 +173,6 @@ pub(crate) fn advance(d: Duration) {
 pub(crate) trait TestEpoch: Clock {
     /// The instant that [`at`] counts from.
     fn epoch() -> Self::Instant;
-}
-
-#[cfg(test)]
-impl TestEpoch for WallClock {
-    fn epoch() -> WallMillis {
-        WallMillis(0)
-    }
 }
 
 #[cfg(test)]

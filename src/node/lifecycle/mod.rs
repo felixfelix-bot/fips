@@ -1303,11 +1303,16 @@ impl Node {
                         // Push the next retry past the cooldown so the
                         // open-discovery sweep doesn't re-enqueue and the
                         // per-attempt backoff doesn't fire sooner. The cooldown is
-                        // a wall-clock deadline; an unset schedule (`None`, due)
+                        // a wall-clock deadline, so it enters the schedule as the
+                        // time left until it, from the same wall-clock read it
+                        // was computed against. An unset schedule (`None`, due)
                         // orders before any instant, so it takes the cooldown.
+                        let cooldown = std::time::Duration::from_millis(
+                            cooldown_until_ms.saturating_sub(now_ms),
+                        );
                         state.retry_after = state
                             .retry_after
-                            .max(Some(crate::time::WallMillis(cooldown_until_ms)));
+                            .max(Some(crate::time::deadline(peering_now, cooldown)));
                     }
                 }
             }

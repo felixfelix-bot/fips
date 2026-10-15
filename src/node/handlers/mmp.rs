@@ -705,10 +705,9 @@ impl Node {
     /// no-op, so we return; if the machine is absent (which should be impossible)
     /// we fall back to the byte-identical inline body under a `debug_assert`.
     ///
-    /// `now_ms` is the caller's hoisted wall-clock ms (the same value the old
-    /// reap fed `note_link_dead`); it flows to the executor `ReportLost` arm via
-    /// `ambient.now_ms`. Both callers hoist it once per batch, so every peer
-    /// removed in one pass carries the same instant.
+    /// `now_ms` is the caller's hoisted wall-clock ms; it flows to the peer
+    /// machine's ambient context. The reconnect schedule itself is on the
+    /// peering clock, which `note_link_dead`'s callers read.
     async fn route_link_dead(&mut self, node_addr: NodeAddr, now_ms: u64) {
         let link = match self.peers.get(&node_addr) {
             Some(peer) => peer.link_id(),
@@ -719,7 +718,7 @@ impl Node {
             let held = self.peer_link(&node_addr);
             self.remove_active_peer(&node_addr);
             self.relink(&node_addr, held, None).await;
-            self.note_link_dead(node_addr, crate::time::WallMillis(now_ms));
+            self.note_link_dead(node_addr, Self::peering_now());
             return;
         }
         let ambient = self.link_dead_ctx(&node_addr, now_ms);
@@ -730,12 +729,11 @@ impl Node {
     /// Ambient shell facts for the routed liveness reap. Mirrors
     /// [`rekey_cadence_ctx`](Node::rekey_cadence_ctx). The executor reads only
     /// `verified_identity` (`InvalidateSendState` → `remove_active_peer` resolves
-    /// its `NodeAddr` from it, so it must equal `node_addr`) and `now_ms`
-    /// (`ReportLost` → `note_link_dead`, the wall-clock reconnect basis). The
-    /// transport/index/direction fields are unused by these two arms and are
-    /// populated best-effort for coherence. `now_ms` is threaded in (rather than
-    /// re-read) so the value fed to `note_link_dead` is byte-identical to the old
-    /// reap's hoisted wall-clock for every peer in the sweep.
+    /// its `NodeAddr` from it, so it must equal `node_addr`). `ReportLost` →
+    /// `note_link_dead` schedules the reconnect on the peering clock, not on
+    /// `now_ms`. The transport/index/direction fields are unused by these two
+    /// arms and are populated best-effort for coherence; `now_ms` is threaded in
+    /// as the caller's hoisted wall-clock.
     fn link_dead_ctx(&self, node_addr: &NodeAddr, now_ms: u64) -> PeerActionCtx {
         let peer = &self.peers[node_addr];
         PeerActionCtx {

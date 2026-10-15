@@ -1039,6 +1039,97 @@ fn test_schedule_retry_increments() {
     assert_eq!(state.retry_after, Some(peering_at(11_000 + 20_000)));
 }
 
+/// A node with one auto-connect peer whose handshake has just timed out, so
+/// one retry is scheduled (retry_count 1, due after the 10 s first backoff),
+/// and the node running so the retry-dial phase acts.
+fn node_with_one_scheduled_retry() -> (Node, NodeAddr) {
+    let peer_npub = Identity::generate().npub();
+    let peer_node_addr = *PeerIdentity::from_npub(&peer_npub).unwrap().node_addr();
+    let mut config = Config::new();
+    config.peers.push(crate::config::PeerConfig::new(
+        peer_npub,
+        "udp",
+        "10.0.0.2:2121",
+    ));
+    let mut node = Node::new(config).unwrap();
+    node.note_handshake_timeout(peer_node_addr, Node::peering_now());
+    node.supervisor.state = NodeState::Running;
+    (node, peer_node_addr)
+}
+
+/// The retry count of the one scheduled retry: 1 while it waits, 2 once the
+/// retry-dial phase has attempted it (with no transport the dial fails at
+/// once and the reflex reschedules it with the next backoff).
+fn scheduled_retry_count(node: &Node, peer: &NodeAddr) -> u32 {
+    node.peering
+        .reconciler
+        .retry_pending
+        .get(peer)
+        .expect("the retry stays scheduled")
+        .retry_count
+}
+
+/// A backward step of the system clock must not hold a scheduled retry: the
+/// schedule measures elapsed time, which the step does not change.
+#[tokio::test]
+async fn a_scheduled_peer_retry_fires_on_time_after_a_backward_wall_clock_step() {
+    let (mut node, peer) = node_with_one_scheduled_retry();
+    assert_eq!(scheduled_retry_count(&node, &peer), 1);
+
+    // 11 s pass (past the 10 s backoff) on both clocks, and the wall clock is
+    // stepped back an hour.
+    let elapsed = std::time::Duration::from_secs(11);
+    crate::time::advance(elapsed);
+    crate::time::step_wall(elapsed.as_millis() as i64 - 3_600_000);
+    node.process_pending_retries(Node::peering_now()).await;
+
+    assert_eq!(
+        scheduled_retry_count(&node, &peer),
+        2,
+        "the retry is attempted once its backoff has elapsed"
+    );
+}
+
+/// A forward step of the system clock must not fire a scheduled retry before
+/// its backoff has elapsed.
+#[tokio::test]
+async fn a_forward_wall_clock_step_does_not_fire_a_peer_retry_early() {
+    let (mut node, peer) = node_with_one_scheduled_retry();
+    assert_eq!(scheduled_retry_count(&node, &peer), 1);
+
+    // 1 s passes (well inside the 10 s backoff) on both clocks, and the wall
+    // clock is stepped forward an hour.
+    let elapsed = std::time::Duration::from_secs(1);
+    crate::time::advance(elapsed);
+    crate::time::step_wall(elapsed.as_millis() as i64 + 3_600_000);
+    node.process_pending_retries(Node::peering_now()).await;
+
+    assert_eq!(
+        scheduled_retry_count(&node, &peer),
+        1,
+        "the retry waits for its backoff"
+    );
+}
+
+/// Without a clock step, a retry fires once its backoff has elapsed and not
+/// before: the healthy path both reproductions above depend on.
+#[tokio::test]
+async fn a_peer_retry_fires_after_its_backoff_and_not_before_without_a_clock_step() {
+    let (mut node, peer) = node_with_one_scheduled_retry();
+
+    let early = std::time::Duration::from_secs(1);
+    crate::time::advance(early);
+    crate::time::step_wall(early.as_millis() as i64);
+    node.process_pending_retries(Node::peering_now()).await;
+    assert_eq!(scheduled_retry_count(&node, &peer), 1, "not yet due");
+
+    let rest = std::time::Duration::from_secs(10);
+    crate::time::advance(rest);
+    crate::time::step_wall(rest.as_millis() as i64);
+    node.process_pending_retries(Node::peering_now()).await;
+    assert_eq!(scheduled_retry_count(&node, &peer), 2, "due and attempted");
+}
+
 /// Retry processing is paced so a large due set cannot start every
 /// handshake candidate in one maintenance tick.
 #[tokio::test]

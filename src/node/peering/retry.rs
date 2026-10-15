@@ -12,10 +12,10 @@
 use crate::config::PeerConfig;
 use fips_core::time::Clock;
 
-/// The clock the peering retry schedule is measured on. It is still the wall
-/// clock, as the schedule was before it took the core's time type; times the
-/// control API reports go through `WallStamp`.
-pub(crate) type PeeringClock = crate::time::WallClock;
+/// The clock the peering retry schedule is measured on: the monotonic host
+/// clock, so a step of the system clock neither holds a scheduled retry nor
+/// fires it early. Times the control API reports go through `WallStamp`.
+pub(crate) type PeeringClock = crate::time::HostClock;
 
 /// An instant on [`PeeringClock`].
 pub(crate) type PeeringInstant = <PeeringClock as Clock>::Instant;

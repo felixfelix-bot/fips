@@ -257,7 +257,7 @@ impl Node {
             };
             if reap {
                 if let Some(peer) = retry_peer {
-                    self.note_handshake_timeout(peer, crate::time::WallMillis(now_ms));
+                    self.note_handshake_timeout(peer, Self::peering_now());
                 }
                 debug!(link_id = %link, "Handshake connection timed out");
                 self.cleanup_stale_connection(link, now_ms).await;

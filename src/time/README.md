@@ -19,10 +19,6 @@ traits, is `fips_core::time` (`core/src/time/`).
     instant's monotonic age.
   - `deadline(now, d)`: `now + d`, with `d` capped at `CEILING` (100
     years) so it never overflows or panics.
-  - `WallClock` and `WallMillis`: a transitional clock over the wall
-    clock, for code moving onto the core's time type before it moves
-    onto the monotonic clock. Not monotonic; removed when unused. The
-    peering retry schedule (`src/node/peering/retry.rs`) runs on it.
   - Test only: `step_wall` and `advance`, per-thread offsets on the
     wall and monotonic clocks, and `TestEpoch` with `at::<C>(ms)`, an
     instant `ms` milliseconds after a clock's fixed test epoch.

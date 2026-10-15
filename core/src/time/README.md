@@ -36,8 +36,7 @@ tests use `testutil::TestClock`.
   embassy-time's tick count, converting durations at its own edge.
 - **Monotonic.** A `Clock`'s successive reads never go backwards. A
   host that adapts a clock that can step (a wall clock) breaks the
-  contract and must say so at the type, as the root crate's
-  transitional `WallClock` does.
+  contract and must say so at the type.
 - **Arithmetic saturates or reports.** A difference saturates at zero;
   an add or subtract past either end of the representation is `None`,
   never a panic or a wrap.
