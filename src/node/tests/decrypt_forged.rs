@@ -291,7 +291,7 @@ async fn twenty_five_forged_frames_on_a_second_tcp_connection_leave_a_tcp_held_p
     };
     let msg2_header = Msg2Header::parse(&wire_msg2).expect("a msg2 header");
     let (noise_msg3, _) = leg
-        .complete_handshake(msg2_header.noise_msg2(&wire_msg2), None, 1100)
+        .complete_handshake_accepting(msg2_header.noise_msg2(&wire_msg2), None, 1100)
         .expect("the peer completes the node's msg2");
     peer_conn
         .write_all(&build_msg3(

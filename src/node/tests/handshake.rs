@@ -3525,9 +3525,11 @@ async fn test_rekey_msg2_matching_static_installs() {
 // - the carve-out that keeps shared-media discovery working.
 // ===========================================================================
 
-/// A named dial answered by a foreign static must not promote, and must leave
-/// no residue behind: no machine, no leg, no link, no `pending_outbound`
-/// dispatch entry, and no orphaned session index.
+/// A named dial answered by a foreign static must not promote, and must not let
+/// the impostor end the dial: the msg2 is discarded and the attempt kept as it
+/// was, with its leg, machine, link, dispatch entry and index, and its expected
+/// identity still the peer it dialed, so that peer's own msg2 can still
+/// complete it. No msg3 goes to the impostor.
 #[tokio::test]
 async fn test_dial_msg2_foreign_static_rejected() {
     use std::time::Duration;
@@ -3590,32 +3592,46 @@ async fn test_dial_msg2_foreign_static_rejected() {
         "the dialed peer must not be credited with a handshake it never ran"
     );
 
-    // No registry residue: the leg, its machine, its link, its dispatch entry
-    // and its index are all gone.
+    // The attempt is kept for the dialed peer: its leg, machine, link,
+    // dispatch entry and index are all still there, and the impostor's static
+    // never reached the carrier.
     assert!(
-        !initiator.node.has_pending_leg(&leg_link),
-        "the rejected leg is torn down"
+        initiator.node.has_pending_leg(&leg_link),
+        "the impostor's msg2 must not end the attempt"
+    );
+    let machine = initiator
+        .node
+        .peer_machines
+        .get(&leg_link)
+        .expect("the attempt's machine is kept");
+    assert!(
+        machine
+            .leg()
+            .is_some_and(|leg| leg.noise_handshake.is_some()),
+        "the attempt keeps its handshake for the dialed peer's msg2"
+    );
+    assert!(!machine.has_session(), "no session with the impostor");
+    assert_eq!(
+        machine.conn_expected_identity().map(|id| *id.node_addr()),
+        Some(intended_addr),
+        "the attempt still expects the peer it dialed"
     );
     assert!(
-        !initiator.node.peer_machines.contains_key(&leg_link),
-        "the rejected leg's machine is disposed"
+        initiator.node.links.contains_key(&leg_link),
+        "the attempt's link is kept"
     );
-    assert!(
-        !initiator.node.links.contains_key(&leg_link),
-        "the rejected leg's link is removed"
-    );
-    assert!(
-        !initiator
+    assert_eq!(
+        initiator
             .node
             .pending_outbound
-            .contains_key(&(initiator.transport_id, leg_index.as_u32())),
-        "the rejected leg's dispatch entry must not survive, or a replayed \
-         msg2 could re-enter the dead leg"
+            .get(&(initiator.transport_id, leg_index.as_u32())),
+        Some(&leg_link),
+        "the attempt's dispatch entry is kept for the dialed peer's msg2"
     );
     assert_eq!(
         initiator.node.index_allocator.count(),
-        baseline,
-        "the rejected dial must free the index it allocated"
+        baseline + 1,
+        "the attempt keeps the index it allocated"
     );
     #[cfg(debug_assertions)]
     initiator.node.debug_assert_peer_maps_coherent();
@@ -3639,13 +3655,14 @@ async fn test_dial_msg2_foreign_static_rejected() {
     stop_hs(&mut attacker).await;
 }
 
-/// The rejected dial must stay on the dial schedule. Disposing the leg takes it
-/// out of both reapers, so the handshake-timeout sweep that normally reschedules
-/// a stuck outbound dial never sees it; the reject arm has to fire that reflex
-/// itself. Without it a configured peer is dialed once at startup and, after one
-/// substituted msg2, never again for the life of the process - a persistent
-/// outbound blackhole costing the attacker a single packet. The retry must also
-/// name the peer we dialed, not the static that answered.
+/// A dial answered only by an impostor must stay on the dial schedule, and the
+/// retry must name the peer we dialed, not the static that answered. The
+/// impostor's msg2 schedules nothing itself: the attempt is kept, and when no
+/// msg2 from the dialed peer arrives the ordinary handshake timeout ends it
+/// and reschedules the dial from the attempt's expected identity, which is
+/// still the dialed peer because the rejected msg2 never wrote its own.
+/// Without that reschedule a configured peer is dialed once at startup and,
+/// after one substituted msg2, never again for the life of the process.
 #[tokio::test]
 async fn test_dial_msg2_foreign_static_reschedules_dial() {
     let intended_local = Identity::generate();
@@ -3683,6 +3700,7 @@ async fn test_dial_msg2_foreign_static_reschedules_dial() {
         )
         .await
         .expect("named dial");
+    let leg_link = initiator.node.connections().next().unwrap().1.link_id();
 
     let msg1 = recv_phase(&mut attacker.packet_rx, 1, "msg1").await;
     attacker.node.handle_msg1(msg1).await;
@@ -3691,13 +3709,46 @@ async fn test_dial_msg2_foreign_static_reschedules_dial() {
 
     assert_eq!(initiator.node.peer_count(), 0, "no promotion");
     assert!(
+        initiator.node.peering.reconciler.retry_pending.is_empty(),
+        "the impostor's msg2 schedules nothing: the attempt is still running"
+    );
+    assert_eq!(
+        initiator
+            .node
+            .peer_machines
+            .get(&leg_link)
+            .expect("the attempt is kept")
+            .conn_expected_identity()
+            .map(|id| *id.node_addr()),
+        Some(intended_addr),
+        "the timeout sweep reschedules from this identity, so it must still be \
+         the dialed peer"
+    );
+
+    // No msg2 from the dialed peer arrives: run the handshake timeout sweep
+    // just past the attempt's deadline.
+    let timeout_ms = initiator
+        .node
+        .config()
+        .node
+        .rate_limit
+        .handshake_timeout_secs
+        * 1000;
+    let deadline = initiator.node.connection_last_activity(leg_link) + timeout_ms;
+    initiator.node.drive_peer_timers(deadline + 1).await;
+
+    assert!(
+        !initiator.node.peer_machines.contains_key(&leg_link),
+        "the attempt ends at its handshake timeout"
+    );
+    assert!(
         initiator
             .node
             .peering
             .reconciler
             .retry_pending
             .contains_key(&intended_addr),
-        "the rejected dial must leave the peer we dialed scheduled for retry, \
+        "the timed-out dial must leave the peer we dialed scheduled for retry, \
          or the configured peer is never dialed again"
     );
     assert!(
@@ -3889,7 +3940,7 @@ fn answer_with_msg3(
         .to_vec();
     let msg2_header = Msg2Header::parse(&wire_msg2).unwrap();
     let (noise_msg3, _) = conn_a
-        .complete_handshake(msg2_header.noise_msg2(&wire_msg2), negotiation, 1100)
+        .complete_handshake_accepting(msg2_header.noise_msg2(&wire_msg2), negotiation, 1100)
         .unwrap();
     noise_msg3
 }

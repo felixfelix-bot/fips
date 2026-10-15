@@ -922,7 +922,7 @@ fn test_promote_cleans_up_pending_outbound_to_same_peer() {
         .peer_machines
         .get_mut(&completing_link_id)
         .unwrap()
-        .complete_handshake(&msg2, None, completing_time_ms)
+        .complete_handshake_accepting(&msg2, None, completing_time_ms)
         .unwrap();
     resp_conn
         .complete_handshake_msg3(&msg3, completing_time_ms)
@@ -4394,9 +4394,11 @@ fn xx_handshake_records_each_learned_identity_on_the_carrier() {
     // The dial-time expectation is a third party: whoever actually answers
     // overwrites it here. The dial intent is not lost with it — it lives on in
     // the carrier's separate write-once `dialed_identity`, which `handle_msg2`
-    // holds the learned key up against before promoting. That comparison is the
-    // caller's; this crypto leaf performs the write regardless, which is what
-    // is asserted below.
+    // holds the learned key up against. That comparison is the caller's
+    // decision, run by `complete_handshake` before anything is consumed; this
+    // test's decision accepts, and the leaf performs the write once the
+    // decision accepts, which is what is asserted below. The sibling test after
+    // this one shows a rejecting decision leaves the decoy in place.
     let decoy = PeerIdentity::from_pubkey_full(Identity::generate().pubkey_full());
     assert_ne!(decoy, responder_identity);
 
@@ -4417,7 +4419,9 @@ fn xx_handshake_records_each_learned_identity_on_the_carrier() {
         "XX msg1 is ephemeral-only, so the responder learns no identity there"
     );
 
-    let (noise_msg3, _) = conn_i.complete_handshake(&noise_msg2, None, 1200).unwrap();
+    let (noise_msg3, _) = conn_i
+        .complete_handshake_accepting(&noise_msg2, None, 1200)
+        .unwrap();
     assert_eq!(
         conn_i.conn_expected_identity(),
         Some(&responder_identity),
@@ -4440,6 +4444,53 @@ fn xx_handshake_records_each_learned_identity_on_the_carrier() {
         conn_r.conn_expected_identity(),
         Some(&initiator_identity),
         "the identity learned from msg3 must be recorded on the surviving carrier"
+    );
+}
+
+/// The sibling of the test above with a decision that rejects the answering
+/// static: nothing learned from that msg2 reaches the carrier. The expected
+/// identity stays the dial-time value, no epoch is recorded, no session is
+/// made, and the handshake stays in the leg for the dialed peer's own msg2.
+#[test]
+fn xx_handshake_rejected_by_the_dial_decision_leaves_the_carrier_as_dialed() {
+    use crate::peer::machine::DialMsg2Step;
+    use crate::proto::fmp::{DialMsg2Decision, DialMsg2Reject};
+
+    let initiator = Identity::generate();
+    let responder = Identity::generate();
+    let decoy = PeerIdentity::from_pubkey_full(Identity::generate().pubkey_full());
+
+    let mut conn_i = outbound_leg(LinkId::new(1), decoy, 1000);
+    let mut conn_r = inbound_leg(LinkId::new(2), 1000);
+
+    let noise_msg1 = conn_i
+        .start_handshake(initiator.keypair(), [0x11; 8], 1000)
+        .unwrap();
+    let noise_msg2 = conn_r
+        .receive_handshake_init(responder.keypair(), [0x22; 8], &noise_msg1, None, 1100)
+        .unwrap();
+
+    let step = conn_i
+        .complete_handshake(&noise_msg2, None, 1200, |_| DialMsg2Decision::Reject {
+            reason: DialMsg2Reject::StaticMismatch,
+        })
+        .expect("a rejected msg2 leaves the leg able to continue");
+    assert!(
+        matches!(step, DialMsg2Step::Rejected { .. }),
+        "the decision rejected the msg2, got {step:?}"
+    );
+    assert_eq!(
+        conn_i.conn_expected_identity(),
+        Some(&decoy),
+        "a rejected msg2 must not write its identity onto the carrier"
+    );
+    assert_eq!(conn_i.conn_remote_epoch(), None);
+    assert!(!conn_i.has_session());
+    assert!(
+        conn_i
+            .leg()
+            .is_some_and(|leg| leg.noise_handshake.is_some()),
+        "the handshake stays in the leg"
     );
 }
 

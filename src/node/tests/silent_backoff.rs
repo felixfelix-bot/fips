@@ -79,7 +79,7 @@ fn msg3_for(leg: &mut PeerMachine, msg2: &[u8], index: u32) -> Vec<u8> {
     let header = Msg2Header::parse(msg2).expect("msg2 header");
     let neg = NegotiationPayload::fmp(1, 1, crate::proto::fmp::NodeProfile::Full).encode();
     let (noise_msg3, _) = leg
-        .complete_handshake(header.noise_msg2(msg2), Some(&neg), 1100)
+        .complete_handshake_accepting(header.noise_msg2(msg2), Some(&neg), 1100)
         .expect("the initiator reads node 1's msg2");
     build_msg3(SessionIndex::new(index), header.sender_idx, &noise_msg3)
 }

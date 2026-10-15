@@ -110,7 +110,7 @@ fn msg3_for(
     let header = Msg2Header::parse(msg2).expect("msg2 header");
     let neg = negotiation(rekey_of);
     let (noise_msg3, _) = leg
-        .complete_handshake(header.noise_msg2(msg2), Some(&neg), 1100)
+        .complete_handshake_accepting(header.noise_msg2(msg2), Some(&neg), 1100)
         .expect("the initiator reads the node's msg2");
     build_msg3(
         SessionIndex::new(sender_index),

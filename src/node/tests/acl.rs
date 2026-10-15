@@ -439,7 +439,7 @@ async fn test_acl_rejected_msg3_leaves_no_registry_trace() {
     // and therefore the denial — first reaches B.
     let msg2_header = Msg2Header::parse(&wire_msg2).unwrap();
     let (noise_msg3, _) = conn_a
-        .complete_handshake(msg2_header.noise_msg2(&wire_msg2), None, 1100)
+        .complete_handshake_accepting(msg2_header.noise_msg2(&wire_msg2), None, 1100)
         .unwrap();
 
     node_b

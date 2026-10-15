@@ -14,12 +14,13 @@ use crate::node::rate_limit::Msg1Class;
 use crate::node::reject::{HandshakeReject, RejectReason};
 use crate::node::{Node, NodeError};
 use crate::peer::machine::{
-    CrossConnOutcome, HandshakeCrypto, Msg3Error, PeerAction, PeerEvent, PeerMachine, TimerKind,
+    CrossConnOutcome, DialMsg2Step, HandshakeCrypto, Msg3Error, PeerAction, PeerEvent, PeerMachine,
+    TimerKind,
 };
 use crate::peer::{ActivePeer, RekeyMsg2Step};
 use crate::proto::fmp::wire::{Msg1Header, Msg2Header, Msg3Header, build_msg2, build_msg3};
 use crate::proto::fmp::{
-    DialMsg2Decision, DialMsg2Reject, DialMsg2Snapshot, Disconnect, DisconnectReason,
+    DialMsg2Reject, DialMsg2Snapshot, Disconnect, DisconnectReason,
     EPOCH_RESTART_MIN_INTERVAL_SECS, EstablishSnapshot, InboundDecision, InboundReject, Msg1Digest,
     NegotiationPayload, OutboundSnapshot, PromotionResult, RekeyClaim, RekeyMsg2Reject,
     RekeyMsg2Snapshot, WireOutcome, cross_connection_winner, decide_fmp_negotiation,
@@ -957,7 +958,7 @@ impl Node {
         }
 
         let our_profile = self.node_profile();
-        let (peer_identity, dialed_identity, msg3_bytes, our_index) = {
+        let (peer_identity, dialed_peer, msg3_bytes, our_index) = {
             let Some(machine) = self.peer_machines.get_mut(&link_id) else {
                 warn!(link_id = %link_id, "Connection removed during msg2 processing");
                 self.pending_outbound.remove(&key);
@@ -969,22 +970,88 @@ impl Node {
             // Create FMP negotiation payload for msg3 (includes profile, MMP bits, bloom TLV)
             let neg_payload = NegotiationPayload::fmp(1, 1, our_profile).encode();
 
+            // The dial intent, read off the carrier before the completion
+            // below can write the learned identity onto it. `None` on an
+            // anonymous shared-media leg.
+            let dialed_peer = machine.conn_dialed_identity().map(|id| *id.node_addr());
+
+            // Dial-identity gate. Under XX the responder's static arrives in
+            // msg2 rather than being pinned at dial (as IK pinned it), so any
+            // party that observes our msg1 can answer it with a msg2 that reads
+            // correctly under its own static. Crypto success therefore proves
+            // only that someone answered; the core decides whether that someone
+            // is who we dialed. The machine runs the decision after the read and
+            // before anything is consumed, so a substituted responder never gets
+            // a msg3 and its identity never reaches the carrier.
+            let fmp = &self.fmp;
+            let decide = |learned_peer| {
+                fmp.dial_outbound(&DialMsg2Snapshot {
+                    dialed_peer,
+                    learned_peer,
+                })
+            };
+
             // Process Noise msg2 and generate msg3
             let noise_msg2 = &packet.data[header.noise_msg2_offset..];
             let (msg3_bytes, received_negotiation) = match machine.complete_handshake(
                 noise_msg2,
                 Some(&neg_payload),
                 packet.timestamp_ms,
+                decide,
             ) {
-                Ok(result) => result,
+                Ok(DialMsg2Step::Completed(msg3, negotiation)) => (msg3, negotiation),
+                Ok(DialMsg2Step::Unreadable(e)) => {
+                    // The index this msg2 names travels in cleartext in our
+                    // msg1, so the msg2 may be a forgery rather than the peer's
+                    // corrupt reply. The machine restored the handshake and left
+                    // the carrier untouched, so keep the attempt with its
+                    // dispatch entry, resend schedule and deadline for the
+                    // genuine msg2. If none arrives, the handshake timeout ends
+                    // the attempt as it would for a lost one. Logged at debug: a
+                    // forger can send one of these per datagram.
+                    debug!(
+                        link_id = %link_id,
+                        error = %e,
+                        "msg2 did not authenticate, keeping the handshake attempt"
+                    );
+                    self.stats_mut()
+                        .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
+                    return;
+                }
+                Ok(DialMsg2Step::Rejected {
+                    reason: DialMsg2Reject::StaticMismatch,
+                    learned_peer,
+                }) => {
+                    // A msg2 that reads under a static other than the one
+                    // dialed: an on-path party raced the peer's answer, or the
+                    // address we dialed is no longer the peer we recorded there.
+                    // Either way this msg2 never completes the leg. The machine
+                    // restored the handshake and left the carrier's expected
+                    // identity at the dialed peer, so the attempt is kept as it
+                    // was for the dialed peer's own msg2; if none arrives, the
+                    // handshake timeout ends it and reschedules the dial against
+                    // the dialed peer. Logged at debug: any keyed node that sees
+                    // the msg1 can produce one of these per datagram.
+                    debug!(
+                        link_id = %link_id,
+                        dialed = ?dialed_peer,
+                        learned = %learned_peer,
+                        "msg2 answered by a different static than the one dialed, keeping the handshake attempt"
+                    );
+                    self.stats_mut()
+                        .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
+                    return;
+                }
                 Err(e) => {
                     warn!(
                         link_id = %link_id,
                         error = %e,
                         "Handshake completion failed"
                     );
-                    // Drop the Noise handle (byte-identical point) and record
-                    // the failure on the control machine as `send_failed` — the
+                    // The leg had no handshake to read with, or completing an
+                    // accepted msg2 failed after the handshake was taken: the
+                    // leg cannot continue. Drop the Noise handle and record the
+                    // failure on the control machine as `send_failed` — the
                     // failure state's home. The machine PHASE stays exactly
                     // where the old failure left it (`Handshaking{SentMsg1}`):
                     // the stale-connection sweep reclaims the handshake via the
@@ -1031,13 +1098,9 @@ impl Node {
                 }
             };
 
-            // The dial intent, read from the same carrier and untouched by the
-            // completion above. `None` on an anonymous shared-media leg.
-            let dialed_identity = machine.conn_dialed_identity().copied();
-
             let our_index = machine.our_index();
 
-            (peer_identity, dialed_identity, msg3_bytes, our_index)
+            (peer_identity, dialed_peer, msg3_bytes, our_index)
         };
 
         let peer_node_addr = *peer_identity.node_addr();
@@ -1046,69 +1109,6 @@ impl Node {
         // directly onto the surviving carrier by `complete_handshake` and
         // `process_fmp_negotiation` above, so last-activity advances at msg2
         // completion and the promotion hand-off reads the profile from it.
-
-        // Dial-identity gate. Under XX the responder's static arrives in msg2
-        // rather than being pinned at dial (as IK pinned it), so an on-path
-        // party that observes our msg1 and answers it first produces a
-        // perfectly valid handshake under its own static. Crypto success
-        // therefore proves only that someone answered — the core decides
-        // whether that someone is who we dialed. This sits ahead of every
-        // subsequent step, including the msg3 send, so a substituted responder
-        // never gets its handshake completed and nothing downstream ever sees
-        // its identity. Nothing outside the doomed machine has been mutated by
-        // the crypto above, which is why rejecting here needs only to dispose
-        // of the leg.
-        let dialed_peer = dialed_identity.map(|id| *id.node_addr());
-        let continuity = self.fmp.dial_outbound(&DialMsg2Snapshot {
-            dialed_peer,
-            learned_peer: peer_node_addr,
-        });
-        match continuity {
-            // The dial named nobody, or it named whoever answered: fall
-            // through to the ACL gate and promotion below, unchanged.
-            DialMsg2Decision::Accept => {}
-            DialMsg2Decision::Reject {
-                reason: DialMsg2Reject::StaticMismatch,
-            } => {
-                warn!(
-                    link_id = %link_id,
-                    dialed = ?dialed_peer,
-                    learned = %peer_node_addr,
-                    "msg2 answered by a different static than the one dialed, dropping the leg"
-                );
-                // Free everything this leg holds. `our_index` is the index WE
-                // allocated at msg1 preparation, read back off the machine —
-                // never the `receiver_idx` the msg2 header supplied, which an
-                // attacker chooses. Capture happened above, before the disposal
-                // that would make it unreadable.
-                self.pending_outbound.remove(&key);
-                self.remove_peer_machine(link_id);
-                self.remove_link(&link_id);
-                if let Some(idx) = our_index {
-                    let _ = self.index_allocator.free(idx);
-                }
-                // Put the dial back on the retry schedule. The disposal above
-                // takes the leg out of both reapers — its machine and its
-                // handshake timer are gone — so the stuck-leg sweep that
-                // normally reaches `note_handshake_timeout` never runs for it,
-                // and that reflex is the only thing that seeds `retry_pending`
-                // for a configured peer. Without this call a single rejected
-                // dial would retire the peer for the process lifetime: the
-                // configured-peer floor dials once at startup and every later
-                // dial comes off `retry_pending`.
-                //
-                // The reschedule targets `dialed_peer`, the dial-time
-                // expectation, NOT the machine's expected identity — the
-                // completion above already overwrote that with the answering
-                // static, so reading it here would re-dial the impostor.
-                if let Some(peer) = dialed_peer {
-                    self.note_handshake_timeout(peer, packet.timestamp_ms);
-                }
-                self.stats_mut()
-                    .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
-                return;
-            }
-        }
 
         // ACL check: with XX, this is the first point where the initiator
         // knows the responder's identity.
@@ -1170,9 +1170,6 @@ impl Node {
             // never promotes; its machine goes with it (dropping the embedded
             // pending connection), and everything else the leg holds — the
             // index, the link, and the `pending_outbound` entry — goes with it.
-            //
-            // No reschedule fires, unlike the dial-identity gate above: the dial
-            // named ourselves, so there is nothing to retry.
             //
             // Link disposal goes through `remove_link`, never a bare
             // `links.remove` plus `addr_to_link.remove`. We have answered our own

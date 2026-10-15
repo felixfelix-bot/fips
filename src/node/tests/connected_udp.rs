@@ -90,7 +90,7 @@ fn promoted_peer_with_the_far_side_session(
         .peer_machines
         .get_mut(&link_id)
         .unwrap()
-        .complete_handshake(&msg2, None, 1_000)
+        .complete_handshake_accepting(&msg2, None, 1_000)
         .unwrap();
 
     responder

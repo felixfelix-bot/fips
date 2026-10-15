@@ -21,6 +21,7 @@ mod decrypt_failure;
 mod decrypt_forged;
 mod disconnect;
 mod discovery;
+mod forged_initial_msg2;
 mod forwarding;
 mod handshake;
 mod handshake_lines;
@@ -249,7 +250,7 @@ pub(super) fn seed_completed_connection_with(
         .peer_machines
         .get_mut(&link_id)
         .unwrap()
-        .complete_handshake(&msg2, None, current_time_ms)
+        .complete_handshake_accepting(&msg2, None, current_time_ms)
         .unwrap();
 
     // Complete responder handshake (XX: processes msg3)

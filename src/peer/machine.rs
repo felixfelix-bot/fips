@@ -86,9 +86,9 @@
 use crate::identity::ErasingKeypair;
 use crate::noise::{self, NoiseError, NoiseSession};
 use crate::proto::fmp::{
-    ConnAction, ConnSnapshot, ConnectionState, EstablishSnapshot, Fmp, InboundDecision,
-    InboundReject, NodeProfile, OutboundDecision, OutboundSnapshot, PeerSnapshot, PromotionResult,
-    RekeyCfg, RekeyResendSnapshot, WireOutcome,
+    ConnAction, ConnSnapshot, ConnectionState, DialMsg2Decision, DialMsg2Reject, EstablishSnapshot,
+    Fmp, InboundDecision, InboundReject, NodeProfile, OutboundDecision, OutboundSnapshot,
+    PeerSnapshot, PromotionResult, RekeyCfg, RekeyResendSnapshot, WireOutcome,
 };
 use crate::proto::link::LinkMessageType;
 use crate::transport::{LinkDirection, LinkId, LinkStats, TransportAddr, TransportId};
@@ -108,6 +108,28 @@ pub(crate) enum Msg3Error {
     /// read failed. The leg's handshake is consumed.
     #[error(transparent)]
     Failed(#[from] NoiseError),
+}
+
+/// How an initiator's initial msg2 ended, when the dial attempt can continue.
+///
+/// Only [`Completed`](Self::Completed) consumes the leg's handshake. The other
+/// two leave the leg exactly as it was before the msg2 was read, so the
+/// genuine msg2 can still complete the attempt.
+#[derive(Debug)]
+pub(crate) enum DialMsg2Step {
+    /// The dial-identity decision accepted the msg2: msg3 is written, the
+    /// handshake has become the leg's session, and the learned identity and
+    /// epoch are on the carrier. Carries the msg3 bytes and the decrypted
+    /// negotiation payload from msg2, if it had one.
+    Completed(Vec<u8>, Option<Vec<u8>>),
+    /// The msg2 read, and the dial-identity decision rejected the static it
+    /// carries. `learned_peer` is the address that static derives to.
+    Rejected {
+        reason: DialMsg2Reject,
+        learned_peer: NodeAddr,
+    },
+    /// The msg2 did not read or its negotiation payload did not decrypt.
+    Unreadable(NoiseError),
 }
 
 // ============================================================================
@@ -867,51 +889,52 @@ impl PeerMachine {
 
     /// Complete the handshake by processing message 2 and generating message 3.
     ///
-    /// For outbound connections only (initiator). Processes the responder's
-    /// msg2 (learning their identity and epoch), then generates msg3.
-    /// Returns the Noise XX msg3 bytes to send.
+    /// For outbound connections only (initiator). Reads the responder's msg2
+    /// (learning their identity and epoch), decrypts its negotiation payload if
+    /// present, and asks `decide` whether the identity that answered may
+    /// complete this dial. Only on [`Accept`](DialMsg2Decision::Accept) is the
+    /// handshake taken: msg3 is written (with `negotiation_payload` encrypted
+    /// and appended, if given), the handshake becomes the leg's session, and
+    /// the learned identity and epoch land on the carrier.
     ///
-    /// If `negotiation_payload` is provided, it is encrypted and appended
-    /// to the returned msg3 bytes. If the received msg2 contains a negotiation
-    /// payload (bytes beyond the base XX msg2), it is decrypted and returned.
+    /// Nothing authenticates a msg2 before this read, and the index it names
+    /// travels in cleartext in our msg1, so the message may be a forgery.
+    /// Under XX it may also read correctly and still not be from the peer we
+    /// dialed: any keyed node that saw the msg1 can answer it under its own
+    /// static. A msg2 that does not read, whose payload does not decrypt, or
+    /// whose static `decide` rejects puts the handshake back in its pre-read
+    /// state and returns [`Unreadable`](DialMsg2Step::Unreadable) or
+    /// [`Rejected`](DialMsg2Step::Rejected). The carrier is not touched: its
+    /// expected identity stays the dialed one, and neither the epoch nor the
+    /// last activity moves, so the attempt keeps its resend schedule and its
+    /// deadline. `Err` means the leg cannot continue: it had no handshake to
+    /// read with, or completing an accepted msg2 failed after the handshake
+    /// was taken.
     ///
-    /// Deliberately identity-agnostic, like its rekey sibling
-    /// `ActivePeer::complete_rekey_msg2`: this is the crypto leaf, and whether
-    /// the identity that answered may be admitted as the one dialed is a
-    /// decision, taken by the caller against the FMP core. The learned identity
-    /// lands on the carrier unconditionally — on an anonymous leg that write is
-    /// the only way the carrier ever gets an identity — while the dial intent
-    /// sits untouched in `conn_dialed_identity` for the caller to compare
-    /// against.
+    /// The machine does not decide whether the identity that answered may be
+    /// admitted as the one dialed; the caller supplies that decision, taken
+    /// against the FMP core, and this runs it before anything is consumed. On
+    /// an anonymous leg the decision accepts any answer, and the learned
+    /// identity written here is the only way the carrier gets one. The dial
+    /// intent sits untouched in `conn_dialed_identity`.
     pub(crate) fn complete_handshake(
         &mut self,
         message: &[u8],
         negotiation_payload: Option<&[u8]>,
         current_time_ms: u64,
-    ) -> Result<(Vec<u8>, Option<Vec<u8>>), NoiseError> {
+        decide: impl FnOnce(NodeAddr) -> DialMsg2Decision,
+    ) -> Result<DialMsg2Step, NoiseError> {
         let (msg3, received_negotiation, learned_identity, remote_epoch) = {
             let leg = self.leg.as_mut().ok_or_else(no_pending_connection)?;
 
             // The connection is at `SentMsg1` iff its Noise handshake handle is
             // present (set by `start_handshake`, taken here on completion).
-            // Gating on the handle directly is byte-equivalent to the old
-            // `!= SentMsg1` guard for every reachable transition.
-            if leg.noise_handshake.is_none() {
+            let Some(hs) = leg.noise_handshake.as_mut() else {
                 return Err(NoiseError::WrongState {
                     expected: "sent_msg1 state".to_string(),
                     got: "no active handshake".to_string(),
                 });
-            }
-
-            // The slot is heap memory that outlives this call; clearing it once
-            // the handshake has left keeps both private keys from staying
-            // there. Unwrapping before clearing lets the handshake move
-            // straight from the slot to `hs`, with no second stack copy.
-            let mut hs = leg
-                .noise_handshake
-                .take()
-                .expect("noise handshake must exist in SentMsg1 state");
-            noise::clear_slot(&mut leg.noise_handshake);
+            };
 
             // Split msg2 into base XX part and optional negotiation
             let base_size = noise::HANDSHAKE_MSG2_SIZE;
@@ -921,24 +944,56 @@ impl PeerMachine {
                 (message, None)
             };
 
-            // Process XX msg2 (learns responder identity + epoch)
-            hs.read_message_2(base_msg2)?;
+            // Process XX msg2 (learns responder identity + epoch). A failed
+            // read restores the handshake itself.
+            let rollback = match hs.try_read_message_2(base_msg2) {
+                Ok(rollback) => rollback,
+                Err(e) => return Ok(DialMsg2Step::Unreadable(e)),
+            };
 
             // Decrypt negotiation payload from msg2 if present
-            let received_negotiation = if let Some(encrypted) = extra {
-                Some(hs.decrypt_payload(encrypted)?)
-            } else {
-                None
+            let received_negotiation = match extra {
+                Some(encrypted) => match hs.decrypt_payload(encrypted) {
+                    Ok(payload) => Some(payload),
+                    Err(e) => {
+                        hs.restore_message_2(rollback);
+                        return Ok(DialMsg2Step::Unreadable(e));
+                    }
+                },
+                None => None,
             };
 
             // Learn responder identity from msg2
-            let remote_static = *hs
-                .remote_static()
-                .expect("remote static available after XX msg2");
+            let Some(remote_static) = hs.remote_static().copied() else {
+                hs.restore_message_2(rollback);
+                return Ok(DialMsg2Step::Unreadable(NoiseError::WrongState {
+                    expected: "remote static learned from msg2".to_string(),
+                    got: "no remote static".to_string(),
+                }));
+            };
             let learned_identity = PeerIdentity::from_pubkey_full(remote_static);
+            let learned_peer = *learned_identity.node_addr();
+
+            if let DialMsg2Decision::Reject { reason } = decide(learned_peer) {
+                hs.restore_message_2(rollback);
+                return Ok(DialMsg2Step::Rejected {
+                    reason,
+                    learned_peer,
+                });
+            }
 
             // Capture remote epoch from msg2
             let remote_epoch = hs.remote_epoch();
+
+            // The slot is heap memory that outlives this call; clearing it once
+            // the handshake has left keeps both private keys from staying
+            // there. Unwrapping before clearing lets the handshake move
+            // straight from the slot to `hs`, with no second stack copy.
+            let mut hs = leg
+                .noise_handshake
+                .take()
+                .expect("noise handshake checked present above");
+            noise::clear_slot(&mut leg.noise_handshake);
 
             // Generate XX msg3
             let mut msg3 = hs.write_message_3()?;
@@ -959,7 +1014,30 @@ impl PeerMachine {
         self.conn.set_remote_epoch(remote_epoch);
         self.conn.touch(current_time_ms);
 
-        Ok((msg3, received_negotiation))
+        Ok(DialMsg2Step::Completed(msg3, received_negotiation))
+    }
+
+    /// [`complete_handshake`](Self::complete_handshake) with a decision that
+    /// accepts whoever answered, for tests that drive a genuine handshake by
+    /// hand. `Completed` maps to `Ok`; a msg2 that does not complete the
+    /// handshake maps to `Err`.
+    #[cfg(test)]
+    pub(crate) fn complete_handshake_accepting(
+        &mut self,
+        message: &[u8],
+        negotiation_payload: Option<&[u8]>,
+        current_time_ms: u64,
+    ) -> Result<(Vec<u8>, Option<Vec<u8>>), NoiseError> {
+        match self.complete_handshake(message, negotiation_payload, current_time_ms, |_| {
+            DialMsg2Decision::Accept
+        })? {
+            DialMsg2Step::Completed(msg3, negotiation) => Ok((msg3, negotiation)),
+            DialMsg2Step::Unreadable(e) => Err(e),
+            DialMsg2Step::Rejected { learned_peer, .. } => Err(NoiseError::WrongState {
+                expected: "an accepted msg2".to_string(),
+                got: format!("a msg2 from {learned_peer} rejected"),
+            }),
+        }
     }
 
     /// Complete the responder handshake by processing message 3.
@@ -2279,6 +2357,10 @@ fn disconnect_frame(reason: CloseReason) -> Vec<u8> {
 // Unit tests — assert on ACTION SEQUENCES + STATE transitions using hand-built
 // synthetic snapshots (no real crypto sessions).
 // ============================================================================
+
+#[cfg(test)]
+#[path = "tests/machine.rs"]
+mod msg2_tests;
 
 #[cfg(test)]
 mod tests {
@@ -3934,7 +4016,7 @@ mod tests {
 
         // Initiator processes msg2 and generates msg3
         let (msg3, _neg) = initiator_conn
-            .complete_handshake(&msg2, None, 1300)
+            .complete_handshake_accepting(&msg2, None, 1300)
             .unwrap();
         // The initiator completes at msg3 generation: it now holds a session.
         assert!(initiator_conn.has_session());
@@ -3995,7 +4077,7 @@ mod tests {
         let msg2 = res
             .receive_handshake_init(responder.keypair(), make_epoch(), &msg1, None, 1200)
             .unwrap();
-        let (msg3, _) = ini.complete_handshake(&msg2, None, 1300).unwrap();
+        let (msg3, _) = ini.complete_handshake_accepting(&msg2, None, 1300).unwrap();
         res.complete_handshake_msg3(&msg3, 1400).unwrap();
         assert!(res.has_session(), "the responder's leg holds the session");
         assert!(leg_slot_nonzero_bytes(&res.leg) > 64);
@@ -4023,7 +4105,10 @@ mod tests {
         conn.mark_failed();
 
         assert!(!conn.has_session());
-        assert!(conn.complete_handshake(&[0u8; 96], None, 1200).is_err());
+        assert!(
+            conn.complete_handshake_accepting(&[0u8; 96], None, 1200)
+                .is_err()
+        );
     }
 
     #[test]
