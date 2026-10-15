@@ -9,7 +9,10 @@ Unit tests for `core/src/noise`.
   `take_cleared` and `clear_slot`, and
   `test_cipher_state_output_is_pinned`, which pins `CipherState`'s
   transport bytes and so checks whichever AEAD backend the build uses.
-  `HandshakeState` is named through `crate::testutil::TestEntropy`.
+  `HandshakeState` is named through `crate::testutil::TestEntropy`;
+  `test_handshake_ephemeral_draws_from_the_entropy_source` uses
+  `FixedEntropy` instead, to show the ephemeral key comes from the
+  handshake's source.
 - `aead.rs`: the tests for `../aead.rs`, attached from it with
   `#[cfg(test)] #[path = "tests/aead.rs"] mod tests;`, so they are a
   child module of `aead` and see its private items. The RFC 8439

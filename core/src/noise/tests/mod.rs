@@ -1080,3 +1080,33 @@ fn test_cipher_state_output_is_pinned() {
         .unwrap();
     assert_eq!(opened, b"fips wire vector");
 }
+
+/// The ephemeral key comes from the handshake's entropy source: two
+/// initiators under the same fixed source send the same ephemeral public
+/// key, the first 33 bytes of message 1, and one under another source sends
+/// a different one. Without this, nothing ties `generate_ephemeral` to `E`.
+#[test]
+fn test_handshake_ephemeral_draws_from_the_entropy_source() {
+    use crate::testutil::FixedEntropy;
+
+    let static_keypair = generate_keypair();
+    let remote_static = generate_keypair().public_key();
+    let epoch = generate_epoch();
+
+    let mut first =
+        handshake::HandshakeState::<FixedEntropy<1>>::new_initiator(static_keypair, remote_static);
+    first.set_local_epoch(epoch);
+    let mut second =
+        handshake::HandshakeState::<FixedEntropy<1>>::new_initiator(static_keypair, remote_static);
+    second.set_local_epoch(epoch);
+    let mut other =
+        handshake::HandshakeState::<FixedEntropy<2>>::new_initiator(static_keypair, remote_static);
+    other.set_local_epoch(epoch);
+
+    let first = first.write_message_1().unwrap();
+    let second = second.write_message_1().unwrap();
+    let other = other.write_message_1().unwrap();
+
+    assert_eq!(first[..PUBKEY_SIZE], second[..PUBKEY_SIZE]);
+    assert_ne!(first[..PUBKEY_SIZE], other[..PUBKEY_SIZE]);
+}
