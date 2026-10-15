@@ -4,11 +4,12 @@ use super::{
     PROTOCOL_NAME_XK, PUBKEY_SIZE, XK_HANDSHAKE_MSG1_SIZE, XK_HANDSHAKE_MSG2_SIZE,
     XK_HANDSHAKE_MSG3_SIZE,
 };
+use fips_core::entropy::EntropySource;
 use hkdf::Hkdf;
-use rand::Rng;
 use secp256k1::{Keypair, PublicKey, SecretKey, ecdh::shared_secret_point};
 use sha2::{Digest, Sha256};
 use std::fmt;
+use std::marker::PhantomData;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 /// Symmetric state during handshake.
@@ -131,7 +132,9 @@ impl SymmetricState {
 }
 
 /// Handshake state for Noise IK and XK patterns.
-pub struct HandshakeState {
+///
+/// `E` is the host's random source, used for the ephemeral key.
+pub struct HandshakeState<E> {
     /// Which Noise pattern is being used.
     pattern: NoisePattern,
     /// Our role in the handshake.
@@ -152,13 +155,15 @@ pub struct HandshakeState {
     remote_static: Option<PublicKey>,
     /// Remote ephemeral public key (learned during handshake).
     remote_ephemeral: Option<PublicKey>,
+    /// The random source for the ephemeral key.
+    entropy: PhantomData<fn() -> E>,
     /// Our startup epoch for restart detection.
     local_epoch: Option<[u8; 8]>,
     /// Remote peer's startup epoch (learned during handshake).
     remote_epoch: Option<[u8; 8]>,
 }
 
-impl HandshakeState {
+impl<E: EntropySource> HandshakeState<E> {
     /// Normalize a compressed public key to even parity for pre-message hashing.
     ///
     /// Nostr npubs encode x-only keys (no parity). The Noise IK pre-message
@@ -189,6 +194,7 @@ impl HandshakeState {
             ephemeral_keypair: None,
             remote_static: Some(remote_static),
             remote_ephemeral: None,
+            entropy: PhantomData,
             local_epoch: None,
             remote_epoch: None,
         };
@@ -220,6 +226,7 @@ impl HandshakeState {
             ephemeral_keypair: None,
             remote_static: None, // Will learn from message 1
             remote_ephemeral: None,
+            entropy: PhantomData,
             local_epoch: None,
             remote_epoch: None,
         };
@@ -250,6 +257,7 @@ impl HandshakeState {
             ephemeral_keypair: None,
             remote_static: Some(remote_static),
             remote_ephemeral: None,
+            entropy: PhantomData,
             local_epoch: None,
             remote_epoch: None,
         };
@@ -279,6 +287,7 @@ impl HandshakeState {
             ephemeral_keypair: None,
             remote_static: None, // Will learn from message 3
             remote_ephemeral: None,
+            entropy: PhantomData,
             local_epoch: None,
             remote_epoch: None,
         };
@@ -326,9 +335,8 @@ impl HandshakeState {
 
     /// Generate ephemeral keypair.
     fn generate_ephemeral(&mut self) {
-        let mut rng = rand::rng();
         let mut secret_bytes = [0u8; 32];
-        rng.fill_bytes(&mut secret_bytes);
+        E::fill(&mut secret_bytes);
 
         let mut secret_key =
             SecretKey::from_slice(&secret_bytes).expect("32 random bytes is valid secret key");
@@ -1082,7 +1090,7 @@ impl HandshakeState {
     }
 }
 
-impl Drop for HandshakeState {
+impl<E> Drop for HandshakeState<E> {
     /// Erase the two private keys this state holds.
     ///
     /// `static_keypair` is the node's long-term private key and
@@ -1108,7 +1116,7 @@ impl Drop for HandshakeState {
     }
 }
 
-impl fmt::Debug for HandshakeState {
+impl<E> fmt::Debug for HandshakeState<E> {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("HandshakeState")
             .field("pattern", &self.pattern)

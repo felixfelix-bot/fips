@@ -48,7 +48,9 @@ pub use fips_core::noise::{
     EPOCH_ENCRYPTED_SIZE, EPOCH_SIZE, HANDSHAKE_MSG1_SIZE, HANDSHAKE_MSG2_SIZE, PUBKEY_SIZE,
     TAG_SIZE,
 };
-pub use handshake::HandshakeState;
+/// The Noise handshake, drawing its ephemeral keys from
+/// [`OsEntropy`](crate::identity::OsEntropy).
+pub type HandshakeState = handshake::HandshakeState<crate::identity::OsEntropy>;
 pub use replay::ReplayWindow;
 pub use session::NoiseSession;
 

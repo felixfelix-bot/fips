@@ -2,6 +2,8 @@ use super::*;
 use rand::Rng;
 use secp256k1::Parity;
 
+type HandshakeState = handshake::HandshakeState<crate::testutil::TestEntropy>;
+
 fn generate_keypair() -> secp256k1::Keypair {
     let secp = secp256k1::Secp256k1::new();
     let mut secret_bytes = [0u8; 32];
