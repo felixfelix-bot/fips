@@ -1,0 +1,178 @@
+//! End-to-end tests of the app-owned TUN, the form an embedder that owns
+//! the TUN file descriptor (an Android `VpnService`) uses.
+//!
+//! Two started nodes run their receive loops in-process. The embedder's
+//! side is played by the channel pair `Node::enable_app_owned_tun`
+//! returns: packets go in through the outbound sender and replies and
+//! deliveries come out of the inbound receiver. Nothing else in the node is
+//! reached, so these tests hold whatever carries the packet in between.
+
+use super::*;
+use std::net::Ipv6Addr;
+use std::sync::mpsc::Receiver;
+
+/// ICMPv6 Destination Unreachable type.
+const DEST_UNREACHABLE: u8 = 1;
+/// ICMPv6 Packet Too Big type.
+const PACKET_TOO_BIG: u8 = 2;
+
+/// A node configuration with one loopback UDP transport, the TUN enabled
+/// (so only the app-owned channels keep a system device from being made),
+/// and no DNS responder or control socket.
+fn app_tun_config() -> Config {
+    let mut config = Config::new();
+    config.transports.udp = crate::config::TransportInstances::Single(crate::config::UdpConfig {
+        bind_addr: Some("127.0.0.1:0".to_string()),
+        ..Default::default()
+    });
+    config.tun.enabled = true;
+    config.dns.enabled = false;
+    config.node.control.enabled = false;
+    config
+}
+
+/// The address of the node's first UDP transport.
+fn udp_addr(node: &Node) -> std::net::SocketAddr {
+    node.transport_ids()
+        .find_map(|id| node.get_transport(id).and_then(|t| t.local_addr()))
+        .expect("the node has a bound UDP transport")
+}
+
+/// An IPv6 packet of `len` bytes, No Next Header, from `src` to `dst`.
+fn ipv6_packet(src: Ipv6Addr, dst: Ipv6Addr, len: usize) -> Vec<u8> {
+    let mut packet = vec![0u8; len];
+    packet[0] = 0x60;
+    packet[4..6].copy_from_slice(&((len - 40) as u16).to_be_bytes());
+    packet[6] = 59;
+    packet[7] = 64;
+    packet[8..24].copy_from_slice(&src.octets());
+    packet[24..40].copy_from_slice(&dst.octets());
+    for (i, byte) in packet[40..].iter_mut().enumerate() {
+        *byte = i as u8;
+    }
+    packet
+}
+
+/// Source address of an IPv6 packet.
+fn source(packet: &[u8]) -> Ipv6Addr {
+    Ipv6Addr::from(<[u8; 16]>::try_from(&packet[8..24]).unwrap())
+}
+
+/// Destination address of an IPv6 packet.
+fn destination(packet: &[u8]) -> Ipv6Addr {
+    Ipv6Addr::from(<[u8; 16]>::try_from(&packet[24..40]).unwrap())
+}
+
+/// The next ICMPv6 message of `kind` on `rx` that quotes a packet sent to
+/// `quoted_dst`, skipping any other packet, or `None` after `wait`.
+async fn icmp_reply(
+    rx: &Receiver<Vec<u8>>,
+    kind: u8,
+    quoted_dst: Ipv6Addr,
+    wait: Duration,
+) -> Option<Vec<u8>> {
+    let deadline = tokio::time::Instant::now() + wait;
+    while tokio::time::Instant::now() < deadline {
+        while let Ok(packet) = rx.try_recv() {
+            let quoted = packet.get(48..).unwrap_or_default();
+            if packet.len() >= 48
+                && packet[6] == 58
+                && packet[40] == kind
+                && quoted.len() >= 40
+                && destination(quoted) == quoted_dst
+            {
+                return Some(packet);
+            }
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    None
+}
+
+/// An app-owned TUN carries a packet from one embedder to its peer's, and
+/// answers the embedder with ICMPv6 for an address nobody resolves and for
+/// a packet over the node-wide MTU.
+#[tokio::test]
+async fn an_app_owned_tun_carries_a_packet_to_the_peer_app_and_answers_refusals_with_icmpv6() {
+    let mut node_b = Node::new(app_tun_config()).unwrap();
+    let (_b_outbound, b_inbound) = node_b.enable_app_owned_tun();
+    node_b.start().await.unwrap();
+
+    let mut config_a = app_tun_config();
+    config_a.peers.push(crate::config::PeerConfig::new(
+        node_b.npub(),
+        "udp",
+        udp_addr(&node_b).to_string(),
+    ));
+    let mut node_a = Node::new(config_a).unwrap();
+    let (a_outbound, a_inbound) = node_a.enable_app_owned_tun();
+    node_a.start().await.unwrap();
+
+    let addr_a = node_a.identity().address().to_ipv6();
+    let addr_b = node_b.identity().address().to_ipv6();
+    let stranger = crate::Identity::generate().address().to_ipv6();
+    let node_mtu = node_a.effective_ipv6_mtu();
+
+    let embedder = async {
+        // Nobody resolves the stranger's address: Destination Unreachable,
+        // from our own address, back to the sender.
+        a_outbound
+            .send(ipv6_packet(addr_a, stranger, 80))
+            .await
+            .unwrap();
+        let unreachable = icmp_reply(
+            &a_inbound,
+            DEST_UNREACHABLE,
+            stranger,
+            Duration::from_secs(5),
+        )
+        .await
+        .expect("Destination Unreachable reaches the app");
+        assert_eq!(unreachable[41], 0, "code 0, no route to destination");
+        assert_eq!(source(&unreachable), addr_a, "sent from our address");
+        assert_eq!(destination(&unreachable), addr_a, "sent to the sender");
+
+        // One byte over the node-wide IPv6 MTU: Packet Too Big at that MTU,
+        // from the address the packet was sent to.
+        a_outbound
+            .send(ipv6_packet(addr_a, addr_b, node_mtu as usize + 1))
+            .await
+            .unwrap();
+        let too_big = icmp_reply(&a_inbound, PACKET_TOO_BIG, addr_b, Duration::from_secs(5))
+            .await
+            .expect("Packet Too Big reaches the app");
+        assert_eq!(
+            u32::from_be_bytes(too_big[44..48].try_into().unwrap()),
+            u32::from(node_mtu),
+            "reports the node-wide IPv6 MTU",
+        );
+        assert_eq!(source(&too_big), addr_b, "sent from the destination");
+        assert_eq!(destination(&too_big), addr_a, "sent to the sender");
+
+        // A packet to the peer reaches the peer's app unchanged. The link
+        // and session come up while it is offered, so offer it until it
+        // arrives.
+        let packet = ipv6_packet(addr_a, addr_b, 120);
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the packet never reached the peer's app"
+            );
+            a_outbound.send(packet.clone()).await.unwrap();
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            if std::iter::from_fn(|| b_inbound.try_recv().ok()).any(|p| p == packet) {
+                break;
+            }
+        }
+    };
+
+    tokio::select! {
+        result = node_a.run_rx_loop() => panic!("node A's rx loop exited: {result:?}"),
+        result = node_b.run_rx_loop() => panic!("node B's rx loop exited: {result:?}"),
+        () = embedder => {}
+    }
+
+    node_a.stop().await.unwrap();
+    node_b.stop().await.unwrap();
+}

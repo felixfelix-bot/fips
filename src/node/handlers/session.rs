@@ -4169,12 +4169,7 @@ impl Node {
     /// Borrow the host-facing ICMPv6 sender: the TUN channel, our address
     /// and the Packet Too Big rate limiter.
     pub(in crate::node) fn host_icmp(&mut self) -> IcmpContext<'_> {
-        let our_ipv6 = crate::Ipv6Address::from_node_addr(self.node_addr()).to_ipv6();
-        IcmpContext::new(
-            self.supervisor.ipv6tun.tun_tx.as_ref(),
-            our_ipv6,
-            &mut self.icmp_rate_limiter,
-        )
+        self.supervisor.ipv6tun.icmp()
     }
 
     /// Queue a packet while waiting for session establishment.

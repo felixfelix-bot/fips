@@ -5,7 +5,7 @@
 //! responder up and take them down live here, together with the handles
 //! they leave behind for the node to drive and, later, to tear down.
 
-use std::net::{IpAddr, SocketAddr};
+use std::net::{IpAddr, Ipv6Addr, SocketAddr};
 use std::path::PathBuf;
 use std::thread::{self, JoinHandle};
 
@@ -14,8 +14,11 @@ use tracing::{debug, info, warn};
 
 use super::config::{DnsConfig, TunConfig};
 use super::dns::{DnsIdentityRx, bind_dns_socket, lookup_mesh_ifindex, run_responder};
+use super::icmp::IcmpContext;
+use super::icmp_rate_limit::IcmpRateLimiter;
 use super::tun::{
-    MssCeiling, TunDevice, TunError, TunOutboundRx, TunTx, run_tun_reader, shutdown_tun_interface,
+    MssCeiling, TunDevice, TunError, TunOutboundRx, TunState, TunTx, run_tun_reader,
+    shutdown_tun_interface,
 };
 use crate::Ipv6Address;
 use crate::config::PeerConfig;
@@ -24,14 +27,23 @@ use crate::node::lifecycle::supervisor::Child;
 use crate::node::lifecycle::{report_exit, report_thread};
 use crate::node::path_mtu::PathMtuLookup;
 
-/// Runtime handles of the TUN and DNS children, held by the node's
-/// supervisor.
+/// State and runtime handles of the TUN and DNS children, held by the
+/// node's supervisor.
 ///
-/// Every field is empty until its child starts. The TUN channels are the
-/// exception: an embedder that owns the TUN installs them before start
-/// through `Node::enable_app_owned_tun`, without a device name.
-#[derive(Default)]
+/// Our address, the TUN state and the ICMPv6 limiter are set when the node
+/// is built. Every other field is empty until its child starts. The TUN
+/// channels are the exception: an embedder that owns the TUN installs them
+/// before start through `Node::enable_app_owned_tun`, without a device name.
 pub(crate) struct Handles {
+    /// This node's IPv6 address, the source of the Destination Unreachable
+    /// replies sent to the host. The node's identity never changes, so it is
+    /// derived once.
+    our_addr: Ipv6Addr,
+    /// TUN device state, as reported by `Node::tun_state`.
+    tun_state: TunState,
+    /// Per-source limiter of the Packet Too Big replies sent to the host.
+    icmp_limiter: IcmpRateLimiter,
+
     /// Kernel name of the TUN device this node created, used to delete or
     /// down it at teardown. Set only while a system TUN is up; an app-owned
     /// TUN leaves it unset.
@@ -79,26 +91,76 @@ pub(crate) struct TunThreads {
     pub(crate) exit_tx: Option<Sender<Child>>,
 }
 
-/// Create the TUN device, logging it, or log the failure and return `None`.
-///
-/// A failure here is not fatal to the node: it continues without a TUN.
-pub(crate) async fn open_tun(config: &TunConfig, address: Ipv6Address) -> Option<TunDevice> {
-    match TunDevice::create(config, address).await {
-        Ok(device) => {
-            info!("TUN device active:");
-            info!("     name: {}", device.name());
-            info!("  address: {}", device.address());
-            info!("      mtu: {}", device.mtu());
-            Some(device)
-        }
-        Err(e) => {
-            warn!(error = %e, "Failed to initialize TUN, continuing without it");
-            None
+impl Handles {
+    /// Empty handles for a node whose address is `our_addr`, with the TUN
+    /// configured when `tun_enabled` and disabled otherwise.
+    pub(crate) fn new(our_addr: Ipv6Addr, tun_enabled: bool) -> Self {
+        Self {
+            our_addr,
+            tun_state: if tun_enabled {
+                TunState::Configured
+            } else {
+                TunState::Disabled
+            },
+            icmp_limiter: IcmpRateLimiter::new(),
+            tun_name: None,
+            tun_tx: None,
+            tun_outbound_rx: None,
+            tun_reader_handle: None,
+            tun_writer_handle: None,
+            #[cfg(any(target_os = "macos", target_os = "freebsd"))]
+            tun_shutdown_fd: None,
+            dns_identity_rx: None,
+            dns_task: None,
+            dns_local_addr: None,
+            dns_aliases: None,
         }
     }
-}
 
-impl Handles {
+    /// The TUN device state.
+    pub(crate) fn tun_state(&self) -> TunState {
+        self.tun_state
+    }
+
+    /// Borrow the host-facing ICMPv6 sender: the TUN channel, our address
+    /// and the Packet Too Big rate limiter.
+    pub(crate) fn icmp(&mut self) -> IcmpContext<'_> {
+        IcmpContext::new(self.tun_tx.as_ref(), self.our_addr, &mut self.icmp_limiter)
+    }
+
+    /// Install the channels of a TUN the embedder owns, which makes the TUN
+    /// active without a device.
+    pub(crate) fn install_app_tun(&mut self, tun_tx: TunTx, outbound_rx: TunOutboundRx) {
+        self.tun_tx = Some(tun_tx);
+        self.tun_outbound_rx = Some(outbound_rx);
+        self.tun_state = TunState::Active;
+    }
+
+    /// Create the TUN device, logging it, or log the failure, mark the TUN
+    /// failed and return `None`.
+    ///
+    /// A failure here is not fatal to the node: it continues without a TUN.
+    pub(crate) async fn open_tun(
+        &mut self,
+        config: &TunConfig,
+        address: Ipv6Address,
+    ) -> Option<TunDevice> {
+        match TunDevice::create(config, address).await {
+            Ok(device) => {
+                info!("TUN device active:");
+                info!("     name: {}", device.name());
+                info!("  address: {}", device.address());
+                info!("      mtu: {}", device.mtu());
+                Some(device)
+            }
+            Err(e) => {
+                warn!(error = %e, "Failed to initialize TUN, continuing without it");
+                self.tun_state = TunState::Failed;
+                None
+            }
+        }
+    }
+
     /// Whether the TUN child is up.
     ///
     /// Follows the device name, not the TUN sender: an app-owned TUN
@@ -242,18 +304,19 @@ impl Handles {
         {
             self.tun_shutdown_fd = Some(shutdown_write_fd);
         }
+        self.tun_state = TunState::Active;
         Ok(())
     }
 
     /// Stop the TUN child: close the writer's channel, delete or down the
     /// interface, wake the reader, and join both threads.
     ///
-    /// Returns whether there was a TUN child to stop. With no device name
-    /// (never started, or app-owned) it does nothing, and an app-owned
-    /// sender is left in place.
-    pub(crate) async fn stop_tun(&mut self) -> bool {
+    /// Marks the TUN disabled once both threads are joined. With no device
+    /// name (never started, or app-owned) it does nothing, and an app-owned
+    /// sender and its state are left in place.
+    pub(crate) async fn stop_tun(&mut self) {
         let Some(name) = self.tun_name.take() else {
-            return false;
+            return;
         };
         info!(name = %name, "Shutting down TUN interface");
 
@@ -285,7 +348,7 @@ impl Handles {
         if let Some(handle) = self.tun_writer_handle.take() {
             let _ = handle.join();
         }
-        true
+        self.tun_state = TunState::Disabled;
     }
 
     /// Start the `.fips` DNS responder and keep its handles, returning

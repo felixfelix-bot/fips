@@ -6,6 +6,7 @@ use crate::utils::index::SessionIndex;
 use std::time::Duration;
 
 mod acl;
+mod app_tun;
 #[cfg(ble_available)]
 mod ble;
 mod bloom;
