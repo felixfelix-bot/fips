@@ -53,7 +53,7 @@ ring = { version = "0.17", default-features = false, optional = true }
 # Use `ring` for the AEAD instead of RustCrypto (`noise::aead::AeadKey`).
 # Hosted builds turn it on; bare-metal builds must leave it off.
 ring = ["dep:ring"]
-# Test hooks in `proto`, `cache` and `noise`: methods and re-exports that
+# Test hooks in `proto`, `cache`, `noise` and `node`: methods and re-exports that
 # only unit tests use to set up or inspect state. This crate's tests see them
 # through `cfg(test)`; the root crate's tests see them because the root
 # enables this feature from its `[dev-dependencies]` only. Never enable it
@@ -72,3 +72,6 @@ secp256k1 = { version = "0.30", default-features = false, features = ["rand", "s
 # `MmpMode`'s configuration spelling, checked with the parser the node
 # configuration uses.
 serde_yaml = "0.9"
+# `serde_json::to_value` for the stats history's JSON form of a gap (NaN as
+# `null`), as the control API serializes it.
+serde_json = "1.0"

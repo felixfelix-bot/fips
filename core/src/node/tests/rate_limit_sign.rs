@@ -3,14 +3,14 @@
 //! that module path.
 
 use super::*;
-use crate::time::{HostClock, HostInstant, at};
+use crate::testutil::{TestClock, TestInstant};
 
 // The limiter on the tests' clock. Instants are named by `t`.
-type LookupSignRateLimiter = super::LookupSignRateLimiter<HostClock>;
+type LookupSignRateLimiter = super::LookupSignRateLimiter<TestClock>;
 
 /// The instant `ms` milliseconds into the test.
-fn t(ms: u64) -> HostInstant {
-    at::<HostClock>(ms)
+fn t(ms: u64) -> TestInstant {
+    TestInstant(ms)
 }
 
 fn addr(val: u8) -> NodeAddr {

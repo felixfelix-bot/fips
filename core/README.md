@@ -25,6 +25,10 @@ moves in from the root crate one module at a time. So far it holds:
 - `SessionIndex`, its random allocator `IndexAllocator` and
   `IndexError`, re-exported under `fips::utils::index`, where
   `IndexAllocator` is an alias over `OsEntropy`;
+- the rate limiters (`node::rate_limit`) and the stats history
+  (`node::stats_history`), generic over `time::Clock` and re-exported
+  under the root crate's `node::rate_limit` and `node::stats_history`
+  with aliases over its `HostClock`;
 - Noise: the IK and XK handshakes, the transport sessions, the replay
   window, the cipher state and the AEAD under it, with the handshake
   message sizes. All but the AEAD are re-exported under `fips::noise`;

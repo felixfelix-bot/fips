@@ -2,16 +2,17 @@
 //! the session-setup limiter. Attached as that module's `tests` child.
 
 use super::*;
-use crate::time::{HostClock, HostInstant, at};
+use crate::testutil::{TestClock, TestInstant};
+use alloc::string::ToString;
 
 // The limiters on the tests' clock. Instants are named by `t`.
-type TokenBucket = super::TokenBucket<HostClock>;
-type HandshakeRateLimiter = super::HandshakeRateLimiter<HostClock>;
-type SessionSetupRateLimiter = super::SessionSetupRateLimiter<HostClock>;
+type TokenBucket = super::TokenBucket<TestClock>;
+type HandshakeRateLimiter = super::HandshakeRateLimiter<TestClock>;
+type SessionSetupRateLimiter = super::SessionSetupRateLimiter<TestClock>;
 
 /// The instant `ms` milliseconds into the test.
-fn t(ms: u64) -> HostInstant {
-    at::<HostClock>(ms)
+fn t(ms: u64) -> TestInstant {
+    TestInstant(ms)
 }
 
 #[test]

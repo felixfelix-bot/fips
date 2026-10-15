@@ -3,15 +3,16 @@
 //! module's `tests` child.
 
 use super::*;
-use crate::time::{HostClock, HostInstant, at};
+use crate::testutil::{TestClock, TestInstant};
+use alloc::vec;
 
 // The history on the tests' clock. Instants are named by `secs`.
-type StatsHistory = super::StatsHistory<HostClock>;
-type PeerSnapshot = super::PeerSnapshot<HostClock>;
+type StatsHistory = super::StatsHistory<TestClock>;
+type PeerSnapshot = super::PeerSnapshot<TestClock>;
 
 /// The instant `s` seconds into the test.
-fn secs(s: u64) -> HostInstant {
-    at::<HostClock>(s * 1000)
+fn secs(s: u64) -> TestInstant {
+    TestInstant(s * 1000)
 }
 
 fn make_snap(t: u64) -> Snapshot {
@@ -33,7 +34,7 @@ fn make_addr(tag: u8) -> NodeAddr {
     NodeAddr::from_bytes([tag; 16])
 }
 
-fn make_peer_snap(tag: u8, now: HostInstant, t: u64) -> PeerSnapshot {
+fn make_peer_snap(tag: u8, now: TestInstant, t: u64) -> PeerSnapshot {
     PeerSnapshot {
         node_addr: make_addr(tag),
         last_seen: now,

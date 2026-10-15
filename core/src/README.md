@@ -15,6 +15,9 @@ changing anything here.
   parameter; the core never reads a random source of its own.
 - `identity/`: node and peer identity types and their encodings. Its own
   README describes it.
+- `node/`: node-level bookkeeping that is not a protocol layer: the
+  handshake, session-setup and lookup-signing rate limiters, and the
+  stats history. Its own README describes it.
 - `noise/`: the Noise handshakes, the transport sessions, the replay
   window, the cipher state and the AEAD under it, and the fixed sizes of
   the handshake messages. Its own README describes it.

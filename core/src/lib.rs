@@ -16,6 +16,7 @@ extern crate std;
 pub mod cache;
 pub mod entropy;
 pub mod identity;
+pub mod node;
 pub mod noise;
 pub mod proto;
 pub mod time;
