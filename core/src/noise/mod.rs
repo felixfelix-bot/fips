@@ -1,9 +1,13 @@
-//! Noise message sizes.
+//! Noise: the handshakes, the transport sessions and the AEAD.
 //!
-//! The fixed sizes of the AEAD tag, a public key, the startup epoch and the
-//! IK handshake messages, which the link-layer wire codec checks frames
-//! against. They are wire format. The handshake and the sessions that use
-//! them stay in the root crate's `noise` module, which re-exports these.
+//! The IK (link layer) and XK (session layer) handshakes over secp256k1,
+//! the sessions they produce, the replay window, and the ChaCha20-Poly1305
+//! AEAD they seal and open with. Below the declarations are the fixed sizes
+//! of the AEAD tag, a public key, the startup epoch and the IK handshake
+//! messages, which the link-layer wire codec checks frames against. They are
+//! wire format. The root crate re-exports this module's items other than
+//! `aead` as `fips::noise`, with `HandshakeState` drawing its ephemeral keys
+//! from the host's entropy source.
 
 pub mod aead;
 mod cipher;

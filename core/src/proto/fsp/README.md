@@ -25,7 +25,8 @@ module has no cryptography.
 ## Invariants
 
 - **No cryptography and no clock.** Time comes in as an argument; keys
-  and ciphertext stay in the root crate.
+  and ciphertext are handled by the Noise code in `core/src/noise`
+  (`crate::noise`).
 - **The session wire is protocol** and does not change on the deployed
   lines.
 - **The quorum counts links, not reporters.** A vote is keyed on the

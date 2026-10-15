@@ -83,7 +83,7 @@ That argument is about domain separation, and on those grounds it holds. It
 does not cover transcript binding, which is the property actually absent.
 Domain separation and DH binding survive through the chaining key `ck`, which
 `mix_key` chains from `ck = h`, seeded from the protocol name in
-`SymmetricState::initialize` (`src/noise/handshake.rs`). The handshake hash
+`SymmetricState::initialize` (`core/src/noise/handshake.rs`). The handshake hash
 `h` is maintained at every step and is never fed to the AEAD, so it binds
 nothing.
 
