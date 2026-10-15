@@ -72,6 +72,7 @@ impl NoiseSession {
     ///
     /// Use this to get the counter to include in the wire format.
     /// The counter will be incremented when `encrypt` is called.
+    #[inline]
     pub fn current_send_counter(&self) -> u64 {
         self.send_cipher.nonce
     }
@@ -88,6 +89,7 @@ impl NoiseSession {
     ///
     /// Returns Ok(()) if the counter is acceptable, Err if it should be rejected.
     /// Call this before attempting decryption to avoid wasting CPU on replay attacks.
+    #[inline]
     pub fn check_replay(&self, counter: u64) -> Result<(), NoiseError> {
         if self.replay_window.check(counter) {
             Ok(())
@@ -163,6 +165,7 @@ impl NoiseSession {
     }
 
     /// Get the highest received counter.
+    #[inline]
     pub fn highest_received_counter(&self) -> u64 {
         self.replay_window.highest()
     }
@@ -189,6 +192,7 @@ impl NoiseSession {
 
     /// Reserve and return the next send counter, advancing the internal
     /// nonce. For pipelined encrypt paths.
+    #[inline]
     pub fn take_send_counter(&mut self) -> Result<u64, NoiseError> {
         if self.send_cipher.nonce == u64::MAX {
             return Err(NoiseError::NonceOverflow);
@@ -200,6 +204,7 @@ impl NoiseSession {
 
     /// Accept a counter into the replay window after a successful out-of-task
     /// decrypt. Caller is responsible for verifying decrypt success first.
+    #[inline]
     pub fn accept_replay(&mut self, counter: u64) {
         self.replay_window.accept(counter);
     }
