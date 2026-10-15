@@ -38,6 +38,7 @@ mod rx_stall;
 mod second_path_msg1;
 mod session;
 mod silent_backoff;
+mod silent_replay;
 mod spanning_tree;
 mod stored_msg2;
 mod tcp;

@@ -7,7 +7,7 @@ use crate::proto::fmp::silent::{
     ActiveBackoff, SILENT_BACKOFF_BASE_MS, SILENT_BACKOFF_CAP_MS, SILENT_SESSION_LIMIT,
 };
 use crate::proto::fmp::{
-    EstablishSnapshot, Fmp, InboundDecision, InboundReject, Msg1Digest, SilentSessions,
+    EphemeralDigest, EstablishSnapshot, Fmp, InboundDecision, InboundReject, SilentSessions,
 };
 use crate::testutil::make_node_addr;
 use alloc::vec;
@@ -19,9 +19,17 @@ const EPOCH: [u8; 8] = [7u8; 8];
 /// Another epoch: a restart of the same peer.
 const OTHER_EPOCH: [u8; 8] = [8u8; 8];
 
-/// A distinct link-setup msg1 digest for session `n`.
-fn setup(n: u32) -> Option<Msg1Digest> {
-    Some(Msg1Digest::of(&n.to_le_bytes()))
+/// A noise msg1 whose ephemeral is distinct for each `n`, followed by `tail`.
+fn noise_msg1(n: u32, tail: &[u8]) -> Vec<u8> {
+    let mut msg = vec![0u8; crate::noise::PUBKEY_SIZE];
+    msg[..4].copy_from_slice(&n.to_le_bytes());
+    msg.extend_from_slice(tail);
+    msg
+}
+
+/// A distinct link-setup msg1 ephemeral digest for session `n`.
+fn setup(n: u32) -> Option<EphemeralDigest> {
+    EphemeralDigest::of_noise_msg1(&noise_msg1(n, &[]))
 }
 
 /// End sessions `first..first + count` of `peer` silent at `epoch`, one
@@ -136,6 +144,30 @@ fn a_session_promoted_from_an_already_counted_msg1_is_not_counted_again() {
     }
     assert_eq!(record.count(&peer), Some(1));
     assert_eq!(record.refusing(&peer, 5_000), None);
+}
+
+#[test]
+fn sessions_promoted_from_msg1s_carrying_one_ephemeral_count_once_whatever_follows_it() {
+    // The record keys on the ephemeral the msg1's AEAD binds, not on the
+    // whole message, so three msg1s sharing it count as one session.
+    let peer = make_node_addr(1);
+    let mut record = SilentSessions::new();
+    for t in 0..3u8 {
+        let setup = EphemeralDigest::of_noise_msg1(&noise_msg1(0, &[t; 16]));
+        assert!(setup.is_some());
+        assert_eq!(
+            record.ended(peer, Some(EPOCH), setup, u64::from(t) * 1000),
+            None
+        );
+    }
+    assert_eq!(record.count(&peer), Some(1));
+    assert_eq!(record.refusing(&peer, 3_000), None);
+}
+
+#[test]
+fn a_msg1_too_short_to_carry_an_ephemeral_has_no_ephemeral_digest() {
+    let short = vec![0u8; crate::noise::PUBKEY_SIZE - 1];
+    assert_eq!(EphemeralDigest::of_noise_msg1(&short), None);
 }
 
 #[test]

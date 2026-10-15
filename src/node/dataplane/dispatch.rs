@@ -122,7 +122,7 @@ impl Node {
         let refusal = self.silent_sessions.ended(
             *node_addr,
             epoch,
-            peer.setup_msg1(),
+            peer.setup_ephemeral(),
             crate::time::mono_ms(),
         );
         if let Some(refusal) = refusal {

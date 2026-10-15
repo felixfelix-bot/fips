@@ -8,7 +8,7 @@ use crate::node::REKEY_JITTER_SECS;
 use crate::node::diag::HsLineCounts;
 use crate::noise::{HandshakeState as NoiseHandshakeState, NoiseError, NoiseSession};
 use crate::proto::bloom::BloomFilter;
-use crate::proto::fmp::{AnsweredMsg1s, Msg1Digest, RekeyAnswer, RekeyRole};
+use crate::proto::fmp::{AnsweredMsg1s, EphemeralDigest, Msg1Digest, RekeyAnswer, RekeyRole};
 use crate::proto::mmp::MmpPeerState;
 use crate::proto::stp::{ParentDeclaration, TreeCoordinate};
 use crate::transport::{LinkId, LinkStats, TransportAddr, TransportId};
@@ -263,6 +263,9 @@ pub struct ActivePeer {
     /// Digest of the link-setup msg1 the peering was promoted from, which
     /// `handshake_msg2` answers. Only a resend of that msg1 draws it.
     setup_msg1: Option<Msg1Digest>,
+    /// Digest of the ephemeral in that msg1, by which the silent-session
+    /// record counts a session once however a copy's header was rewritten.
+    setup_ephemeral: Option<EphemeralDigest>,
 
     // === Rekey (Key Rotation) ===
     /// When the current Noise session was established (for rekey timer).
@@ -352,6 +355,7 @@ impl ActivePeer {
             last_heartbeat_attempt: None,
             handshake_msg2: None,
             setup_msg1: None,
+            setup_ephemeral: None,
             session_established_at: now,
             link_established_at: now,
             rekey_jitter_secs: draw_rekey_jitter(),
@@ -441,6 +445,7 @@ impl ActivePeer {
             last_heartbeat_attempt: None,
             handshake_msg2: None,
             setup_msg1: None,
+            setup_ephemeral: None,
             session_established_at: now,
             link_established_at: now,
             rekey_jitter_secs: draw_rekey_jitter(),
@@ -1256,18 +1261,24 @@ impl ActivePeer {
         self.setup_msg1.as_ref() == Some(msg1)
     }
 
-    /// The digest of the link-setup msg1 this peering was promoted from, or
-    /// `None` for a peering this node dialled.
-    pub(crate) fn setup_msg1(&self) -> Option<Msg1Digest> {
-        self.setup_msg1
-    }
-
     /// Record `msg1`, the link-setup msg1 this peering was promoted from, so
     /// a resend of it draws the stored msg2 while the session is too young
     /// to rekey, and a copy of it is refused once the session is old enough.
     pub(crate) fn note_setup(&mut self, msg1: Msg1Digest) {
         self.setup_msg1 = Some(msg1);
         self.answered.end_setup(msg1);
+    }
+
+    /// Record the ephemeral digest of the link-setup msg1 this peering was
+    /// promoted from (`None` if the msg1 was too short to carry one).
+    pub(crate) fn note_setup_ephemeral(&mut self, ephemeral: Option<EphemeralDigest>) {
+        self.setup_ephemeral = ephemeral;
+    }
+
+    /// The ephemeral digest of the link-setup msg1 this peering was promoted
+    /// from, or `None` for a peering this node dialled.
+    pub(crate) fn setup_ephemeral(&self) -> Option<EphemeralDigest> {
+        self.setup_ephemeral
     }
 
     /// Check whether the pending session has been held for at least `hold`

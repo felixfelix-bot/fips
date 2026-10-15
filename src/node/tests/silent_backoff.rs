@@ -17,7 +17,7 @@ use tokio::net::UdpSocket;
 use tokio::time::timeout;
 
 /// The epoch the silent sessions run at.
-const EPOCH: [u8; 8] = [7u8; 8];
+pub(super) const EPOCH: [u8; 8] = [7u8; 8];
 
 /// The same peer after a restart.
 const NEW_EPOCH: [u8; 8] = [8u8; 8];
@@ -31,8 +31,8 @@ const REFUSAL: &str =
 const IDLE_MS: u64 = 16_000;
 
 /// A node with one UDP transport, and a socket playing the silent peer.
-struct Rig {
-    node: Node,
+pub(super) struct Rig {
+    pub(super) node: Node,
     transport_id: TransportId,
     sock: UdpSocket,
     from: TransportAddr,
@@ -42,7 +42,7 @@ struct Rig {
 
 impl Rig {
     /// A fresh node and a fresh silent identity, with the reaper armed.
-    async fn new() -> Self {
+    pub(super) async fn new() -> Self {
         let mut node = make_node();
         let transport_id = TransportId::new(1);
         let (sock, from) = register_udp_with_peer_socket(&mut node, transport_id).await;
@@ -58,12 +58,12 @@ impl Rig {
     }
 
     /// The silent identity's address.
-    fn peer(&self) -> NodeAddr {
+    pub(super) fn peer(&self) -> NodeAddr {
         *PeerIdentity::from_pubkey_full(self.sender.pubkey_full()).node_addr()
     }
 
     /// A new msg1 from the silent identity at `epoch`.
-    fn msg1(&mut self, epoch: [u8; 8]) -> Vec<u8> {
+    pub(super) fn msg1(&mut self, epoch: [u8; 8]) -> Vec<u8> {
         self.next_index += 1;
         craft_msg1_wire(
             &self.node,
@@ -75,7 +75,7 @@ impl Rig {
     }
 
     /// Deliver `data` as a msg1 from the peer socket.
-    async fn deliver(&mut self, data: Vec<u8>) {
+    pub(super) async fn deliver(&mut self, data: Vec<u8>) {
         let packet = ReceivedPacket {
             transport_id: self.transport_id,
             remote_addr: self.from.clone(),
@@ -86,7 +86,7 @@ impl Rig {
     }
 
     /// The silent identity's current link, if it is a peer.
-    fn link(&self) -> Option<LinkId> {
+    pub(super) fn link(&self) -> Option<LinkId> {
         self.node.get_peer(&self.peer()).map(|p| p.link_id())
     }
 
@@ -102,7 +102,7 @@ impl Rig {
     }
 
     /// Run the link-dead reaper and assert it removed the silent identity.
-    async fn reap(&mut self) {
+    pub(super) async fn reap(&mut self) {
         self.node.check_link_heartbeats().await;
         assert!(self.link().is_none(), "the reaper removed the silent peer");
     }
@@ -123,7 +123,7 @@ impl Rig {
 
     /// Discard whatever the node has sent the peer socket so far, and return
     /// how many packets that was.
-    async fn drain(&self) -> usize {
+    pub(super) async fn drain(&self) -> usize {
         let mut buf = [0u8; 2048];
         let mut n = 0;
         while timeout(Duration::from_millis(100), self.sock.recv_from(&mut buf))
@@ -135,7 +135,7 @@ impl Rig {
         n
     }
 
-    fn silent_rejects(&self) -> u64 {
+    pub(super) fn silent_rejects(&self) -> u64 {
         self.node.stats().handshake.silent_backoff
     }
 

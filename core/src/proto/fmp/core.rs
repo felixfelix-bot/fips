@@ -167,6 +167,27 @@ impl Msg1Digest {
     }
 }
 
+/// A digest of the initiator ephemeral a link handshake msg1 carries.
+///
+/// The ephemeral is authenticated by the msg1's own AEAD (it is mixed into
+/// the handshake hash before the encrypted static), so a copy with a changed
+/// header still carries the same ephemeral, while the whole-message
+/// [`Msg1Digest`] that recognises resends does not match it. The records
+/// that must count one captured msg1 once, however its header is rewritten,
+/// key on this.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EphemeralDigest([u8; 32]);
+
+impl EphemeralDigest {
+    /// Digest the ephemeral at the start of a Noise IK msg1, or `None` if the
+    /// message is too short to carry one.
+    pub fn of_noise_msg1(noise_msg1: &[u8]) -> Option<Self> {
+        use sha2::{Digest, Sha256};
+        let ephemeral = noise_msg1.get(..crate::noise::PUBKEY_SIZE)?;
+        Some(Self(Sha256::digest(ephemeral).into()))
+    }
+}
+
 /// What this node sent when it answered a peer's rekey msg1 as the responder:
 /// the msg1 it answered, by digest, and the framed msg2 it sent back.
 ///

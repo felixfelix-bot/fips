@@ -15,8 +15,9 @@ use crate::peer::machine::{
 };
 use crate::proto::fmp::wire::{Msg1Header, Msg2Header, build_msg2};
 use crate::proto::fmp::{
-    EstablishSnapshot, EstablishView, InboundDecision, InboundReject, Msg1Arrival, Msg1Digest,
-    OutboundSnapshot, PromotionResult, RekeyAnswer, WireOutcome, cross_connection_winner,
+    EphemeralDigest, EstablishSnapshot, EstablishView, InboundDecision, InboundReject, Msg1Arrival,
+    Msg1Digest, OutboundSnapshot, PromotionResult, RekeyAnswer, WireOutcome,
+    cross_connection_winner,
 };
 use crate::transport::{Link, LinkDirection, LinkId, ReceivedPacket, TransportError, TransportId};
 use crate::utils::index::SessionIndex;
@@ -95,25 +96,6 @@ pub(in crate::node) const UNHEARD_PEERING_MIN_AGE_MS: u64 = 1_000;
 /// msg1 and, if that peering was replaced before its first frame, its next).
 /// No measured basis.
 const MAX_REPLAYED_MSG1S: usize = 8;
-
-/// A digest of the initiator ephemeral a link handshake msg1 carries.
-///
-/// The ephemeral is authenticated by the msg1's own AEAD (it is mixed into
-/// the handshake hash before the encrypted static), so a copy with a changed
-/// header still carries the same ephemeral, while the whole-message digest
-/// that recognises resends does not match it.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub(in crate::node) struct EphemeralDigest([u8; 32]);
-
-impl EphemeralDigest {
-    /// Digest the ephemeral at the start of a Noise IK msg1, or `None` if the
-    /// message is too short to carry one.
-    pub(in crate::node) fn of_noise_msg1(noise_msg1: &[u8]) -> Option<Self> {
-        use sha2::{Digest, Sha256};
-        let ephemeral = noise_msg1.get(..crate::noise::PUBKEY_SIZE)?;
-        Some(Self(Sha256::digest(ephemeral).into()))
-    }
-}
 
 /// What the replay memory says about a msg1 that would replace an unheard
 /// peering.
@@ -1624,6 +1606,7 @@ impl Node {
                     if let Some(peer) = self.peers.get_mut(&peer_node_addr) {
                         peer.set_handshake_msg2(wire_msg2.clone());
                         peer.note_setup(wire.msg1_digest);
+                        peer.note_setup_ephemeral(ephemeral);
                     }
                     self.note_unheard_promotion(&peer_node_addr, ephemeral, packet.timestamp_ms);
                     // Send initial tree announce to new peer
@@ -1764,6 +1747,7 @@ impl Node {
                     if let Some(peer) = self.peers.get_mut(&peer_node_addr) {
                         peer.set_handshake_msg2(wire_msg2.clone());
                         peer.note_setup(wire.msg1_digest);
+                        peer.note_setup_ephemeral(ephemeral);
                     }
                     self.note_unheard_promotion(&peer_node_addr, ephemeral, packet.timestamp_ms);
                     // Send initial tree announce to new peer
