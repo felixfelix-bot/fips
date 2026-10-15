@@ -5,6 +5,7 @@
 //! prefix followed by the first 15 bytes of the node_addr.
 
 pub(crate) use fips_core::identity::ErasingKeypair;
+pub(crate) use fips_core::identity::secp;
 pub use fips_core::identity::{
     AuthResponse, IPV6_ADDRESS_PREFIX, IdentityError, Ipv6Address, NodeAddr, PeerIdentity,
     decode_npub, decode_nsec, decode_secret, encode_npub, encode_nsec, init_secp,

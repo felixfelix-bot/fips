@@ -6,7 +6,7 @@ use super::{
 };
 use hkdf::Hkdf;
 use rand::Rng;
-use secp256k1::{Keypair, PublicKey, Secp256k1, SecretKey, ecdh::shared_secret_point};
+use secp256k1::{Keypair, PublicKey, SecretKey, ecdh::shared_secret_point};
 use sha2::{Digest, Sha256};
 use std::fmt;
 use zeroize::{Zeroize, ZeroizeOnDrop};
@@ -152,8 +152,6 @@ pub struct HandshakeState {
     remote_static: Option<PublicKey>,
     /// Remote ephemeral public key (learned during handshake).
     remote_ephemeral: Option<PublicKey>,
-    /// Secp256k1 context.
-    secp: Secp256k1<secp256k1::All>,
     /// Our startup epoch for restart detection.
     local_epoch: Option<[u8; 8]>,
     /// Remote peer's startup epoch (learned during handshake).
@@ -182,7 +180,6 @@ impl HandshakeState {
     /// The initiator knows the responder's static key and will send first.
     /// Used by FMP (link layer).
     pub fn new_initiator(mut static_keypair: Keypair, remote_static: PublicKey) -> Self {
-        let secp = Secp256k1::new();
         let mut state = Self {
             pattern: NoisePattern::Ik,
             role: HandshakeRole::Initiator,
@@ -192,7 +189,6 @@ impl HandshakeState {
             ephemeral_keypair: None,
             remote_static: Some(remote_static),
             remote_ephemeral: None,
-            secp,
             local_epoch: None,
             remote_epoch: None,
         };
@@ -215,7 +211,6 @@ impl HandshakeState {
     /// The responder does NOT know the initiator's static key - it will be
     /// learned from message 1. Used by FMP (link layer).
     pub fn new_responder(mut static_keypair: Keypair) -> Self {
-        let secp = Secp256k1::new();
         let mut state = Self {
             pattern: NoisePattern::Ik,
             role: HandshakeRole::Responder,
@@ -225,7 +220,6 @@ impl HandshakeState {
             ephemeral_keypair: None,
             remote_static: None, // Will learn from message 1
             remote_ephemeral: None,
-            secp,
             local_epoch: None,
             remote_epoch: None,
         };
@@ -247,7 +241,6 @@ impl HandshakeState {
     /// The initiator knows the responder's static key. XK defers the
     /// initiator's static key reveal to msg3. Used by FSP (session layer).
     pub fn new_xk_initiator(mut static_keypair: Keypair, remote_static: PublicKey) -> Self {
-        let secp = Secp256k1::new();
         let mut state = Self {
             pattern: NoisePattern::Xk,
             role: HandshakeRole::Initiator,
@@ -257,7 +250,6 @@ impl HandshakeState {
             ephemeral_keypair: None,
             remote_static: Some(remote_static),
             remote_ephemeral: None,
-            secp,
             local_epoch: None,
             remote_epoch: None,
         };
@@ -278,7 +270,6 @@ impl HandshakeState {
     /// The responder does NOT know the initiator's static key - it will be
     /// learned from message 3. Used by FSP (session layer).
     pub fn new_xk_responder(mut static_keypair: Keypair) -> Self {
-        let secp = Secp256k1::new();
         let mut state = Self {
             pattern: NoisePattern::Xk,
             role: HandshakeRole::Responder,
@@ -288,7 +279,6 @@ impl HandshakeState {
             ephemeral_keypair: None,
             remote_static: None, // Will learn from message 3
             remote_ephemeral: None,
-            secp,
             local_epoch: None,
             remote_epoch: None,
         };
@@ -342,7 +332,10 @@ impl HandshakeState {
 
         let mut secret_key =
             SecretKey::from_slice(&secret_bytes).expect("32 random bytes is valid secret key");
-        self.ephemeral_keypair = Some(Keypair::from_secret_key(&self.secp, &secret_key));
+        self.ephemeral_keypair = Some(Keypair::from_secret_key(
+            crate::identity::secp(),
+            &secret_key,
+        ));
         secret_bytes.zeroize();
         // This clears the copy this frame owns, with a volatile write the
         // optimiser keeps; a copy made before it, such as one a call above
