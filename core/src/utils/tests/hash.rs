@@ -13,3 +13,11 @@ fn keyed_hasher_takes_its_key_from_the_entropy_source() {
     assert_eq!(one.hash_one(key), one_again.hash_one(key));
     assert_ne!(one.hash_one(key), two.hash_one(key));
 }
+
+#[test]
+fn keyed_hasher_draws_both_key_halves_from_the_entropy_source() {
+    let hasher = KeyedHasher::new::<FixedEntropy<1>>();
+    let half = u64::from_le_bytes([1; 8]);
+    assert_eq!(hasher.k0, half);
+    assert_eq!(hasher.k1, half);
+}

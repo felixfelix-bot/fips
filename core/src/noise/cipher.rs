@@ -157,27 +157,22 @@ impl fmt::Display for HandshakeProgress {
 ///
 /// AEAD is ChaCha20-Poly1305 through [`AeadKey`], the backend this build
 /// chose: `ring`'s (BoringSSL assembly, NEON on aarch64 and AVX2/AVX-512 on
-/// x86_64) on hosted builds, RustCrypto's elsewhere. The 32-byte key is
-/// retained alongside a cached keyed cipher so the per-packet AEAD skips
-/// rebuilding the keyed cipher. (It does not skip Poly1305 key derivation,
-/// which is nonce-dependent and happens per message inside seal and open.)
-/// `CipherState`'s manual `Clone` impl rebuilds the keyed AEAD from those
-/// retained bytes, and so does `cipher_clone` for each off-task AEAD worker;
-/// those two are why the bytes are kept. The rebuild is cheap for
-/// ChaCha20-Poly1305: a length check and a conversion of the 32 key bytes
-/// into little-endian words.
+/// x86_64) on hosted builds, RustCrypto's elsewhere. The keyed cipher is
+/// built once, when the key is set, and cached, so the per-packet AEAD skips
+/// rebuilding it. (It does not skip Poly1305 key derivation, which is
+/// nonce-dependent and happens per message inside seal and open.) `Clone`
+/// and `cipher_clone`, which hands a key to each off-task AEAD worker, clone
+/// the cached cipher; the 32 key bytes are not kept.
 ///
-/// Because the key bytes are retained, every clone leaves a second copy in
-/// memory; each copy is cleared when it goes out of scope. Only `key` is
-/// zeroized. `cipher` is skipped because `ring`'s key holds its material
-/// behind `ring`'s own API and cannot be cleared from here (RustCrypto's
-/// clears itself on drop); `nonce` and `has_key` are skipped because they
-/// are not secret.
-#[derive(Zeroize, ZeroizeOnDrop)]
+/// The state holds no key bytes of its own, so the derived `Zeroize` and
+/// `ZeroizeOnDrop` skip every field and clear nothing. They are kept so the
+/// type's trait impls do not change. The key material is inside `cipher`:
+/// RustCrypto's key clears itself on drop, and `ring`'s holds its material
+/// behind `ring`'s own API with no route to clear it. Every clone, and every
+/// key `cipher_clone` hands out, is a further copy of that material. `nonce`
+/// and `has_key` are not secret.
+#[derive(Clone, Zeroize, ZeroizeOnDrop)]
 pub struct CipherState {
-    /// Encryption key (32 bytes). Retained because `Clone` and
-    /// `cipher_clone` rebuild the keyed AEAD from these bytes.
-    key: [u8; 32],
     /// Cached keyed AEAD, valid iff `has_key`. None for an un-keyed state.
     #[zeroize(skip)]
     cipher: Option<AeadKey>,
@@ -189,22 +184,6 @@ pub struct CipherState {
     has_key: bool,
 }
 
-impl Clone for CipherState {
-    fn clone(&self) -> Self {
-        let cipher = if self.has_key {
-            Self::build_cipher(&self.key)
-        } else {
-            None
-        };
-        Self {
-            key: self.key,
-            cipher,
-            nonce: self.nonce,
-            has_key: self.has_key,
-        }
-    }
-}
-
 impl CipherState {
     /// Create a new cipher state with the given key.
     ///
@@ -213,7 +192,6 @@ impl CipherState {
     pub(crate) fn new(mut key: [u8; 32]) -> Self {
         let cipher = Self::build_cipher(&key);
         let state = Self {
-            key,
             cipher,
             nonce: 0,
             has_key: true,
@@ -225,7 +203,6 @@ impl CipherState {
     /// Create an empty cipher state (no key yet).
     pub(super) fn empty() -> Self {
         Self {
-            key: [0u8; 32],
             cipher: None,
             nonce: 0,
             has_key: false,
@@ -237,16 +214,14 @@ impl CipherState {
     /// The parameter is this frame's own copy of live key material, so it is
     /// cleared before returning. The caller's copy stays the caller's to clear.
     pub(super) fn initialize_key(&mut self, mut key: [u8; 32]) {
-        self.key = key;
         self.cipher = Self::build_cipher(&key);
         self.nonce = 0;
         self.has_key = true;
         key.zeroize();
     }
 
-    /// Build the keyed cipher from raw key bytes. Centralized so the
-    /// cipher-cache rebuild paths (`new`, `initialize_key`, `Clone`) all
-    /// agree on construction.
+    /// Build the keyed cipher from raw key bytes. Centralized so the two
+    /// paths that set a key (`new`, `initialize_key`) agree on construction.
     fn build_cipher(key: &[u8; 32]) -> Option<AeadKey> {
         AeadKey::with_key(key)
     }
@@ -384,23 +359,17 @@ impl CipherState {
         self.has_key
     }
 
-    /// Copy out the retained key bytes, so a test can observe zeroization
-    /// without reading freed memory.
-    #[cfg(test)]
-    pub(super) fn key_bytes(&self) -> [u8; 32] {
-        self.key
-    }
-
     /// Clone the underlying keyed AEAD, for off-task AEAD workers.
     ///
-    /// Returns `None` if no key. On hosted builds the clone is a
+    /// Returns `None` if no key; otherwise a clone of the cached cipher, not
+    /// a rebuild from key bytes. On hosted builds the clone is a
     /// `ring::aead::LessSafeKey`, which the workers seal and open with
     /// directly — the worker holds the cipher and a pre-assigned counter,
     /// while the dispatcher keeps the replay window and counter assignment
     /// sequential.
     pub fn cipher_clone(&self) -> Option<AeadKey> {
         if self.has_key {
-            Self::build_cipher(&self.key)
+            self.cipher.clone()
         } else {
             None
         }

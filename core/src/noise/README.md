@@ -10,7 +10,8 @@ against the sizes here.
 The root crate's `src/noise.rs` re-exports the handshake, session,
 replay and cipher-state items and the sizes under `fips::noise`. It does
 not re-export the `aead` module: root code meets `AeadKey` only as the
-type the sessions' key hand-outs return. `HandshakeState` takes the
+type the sessions' key hand-outs return, and in the compile-time tie
+that pins that type to `ring`. `HandshakeState` takes the
 host's entropy source as a type parameter, for its ephemeral keys; the
 root fixes it with the alias
 `fips::noise::HandshakeState = HandshakeState<OsEntropy>`, so its
@@ -98,9 +99,16 @@ paths are not built, the tie is the check that keeps the daemon on
   attribute.
 - **The key hand-out is deliberately not `#[inline]`**
   (`send_cipher_clone`, `recv_cipher_clone`, `CipherState::cipher_clone`).
-  It builds and returns a keyed cipher, and inlining it into the root
-  measured slower on the `handout/send_cipher_clone` row of
-  `benches/noise_aead.rs`.
+  It clones and returns the cached keyed cipher. Inlining it into the
+  root measured slower on the `handout/send_cipher_clone` row of
+  `benches/noise_aead.rs`, but that was measured when the hand-out
+  rebuilt the cipher from retained key bytes, and has not been measured
+  again since. Against that rebuilding hand-out, the clone measured
+  29.2 ns to 28.2 ns on the hand-out row (median of five interleaved
+  rounds each, on a loaded host), within the +5 ns the change was held
+  to, and the `session/*` and `worker/*` rows moved by -2.5 to +0.1
+  percent, within +5 percent. The release daemon still calls the
+  hand-out rather than inlining it.
 - **The randomness comes from the host.** The ephemeral secret is filled
   by `E::fill`, and the ephemeral public key is derived with the shared
   context from `identity::secp()`; nothing here reads a random source

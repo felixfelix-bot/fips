@@ -53,15 +53,17 @@ ring = { version = "0.17", default-features = false, optional = true }
 # Use `ring` for the AEAD instead of RustCrypto (`noise::aead::AeadKey`).
 # Hosted builds turn it on; bare-metal builds must leave it off.
 ring = ["dep:ring"]
-# Test hooks in `proto`: methods and re-exports that only unit tests use to
-# set up or inspect state. This crate's tests see them through `cfg(test)`;
-# the root crate's tests see them because the root enables this feature from
-# its `[dev-dependencies]` only. Never enable it outside tests.
+# Test hooks in `proto`, `cache` and `noise`: methods and re-exports that
+# only unit tests use to set up or inspect state. This crate's tests see them
+# through `cfg(test)`; the root crate's tests see them because the root
+# enables this feature from its `[dev-dependencies]` only. Never enable it
+# outside tests.
 test-hooks = []
 
 [dev-dependencies]
 # Host-only test dependencies; tests may use `std`.
-# Random keys for the test fixtures (`testutil::make_keypair`, the lookup tests).
+# Random keys for the test fixtures (`testutil::make_keypair`, the lookup
+# tests) and the random source `testutil::TestEntropy`.
 rand = "0.10.1"
 # `sign_schnorr` for the protocol tests' signing fixtures, which secp256k1
 # provides only with `rand` and `std`. Tests only: the library stays on

@@ -1,7 +1,7 @@
 //! Seal and open on the Noise transport paths.
 //!
-//! Two shapes, at a 64-byte and a 1400-byte payload behind a 16-byte header
-//! used as associated data:
+//! Three shapes, the first two at a 64-byte and a 1400-byte payload behind a
+//! 16-byte header used as associated data:
 //!
 //! - `session/*`: `NoiseSession::encrypt_with_aad` and
 //!   `decrypt_with_replay_check_and_aad`, the calls the node makes when it
@@ -10,6 +10,8 @@
 //!   key handed out by the session (`send_cipher_clone`) and a counter it
 //!   reserves, a seal in place on the wire buffer with the tag appended; or a
 //!   replay check, an open in place and an accept on a worker-owned window.
+//! - `handout/send_cipher_clone`: the session's key hand-out alone, which the
+//!   encrypt path calls per packet.
 //!
 //! Only API that exists before and after the AEAD moved into `fips-core` is
 //! used, so the same file runs against both trees for comparison.

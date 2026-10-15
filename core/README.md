@@ -20,13 +20,15 @@ moves in from the root crate one module at a time. So far it holds:
 - the transport value types: `TransportId`, `LinkId`, `LinkDirection`,
   `TransportAddr` and `LinkStats`, re-exported under `fips::transport`.
   The transports themselves stay in the root crate;
-- `SessionIndex`, re-exported under `fips::utils::index`. Its random
-  allocator stays in the root crate;
+- `SessionIndex`, its random allocator `IndexAllocator` and
+  `IndexError`, re-exported under `fips::utils::index`, where
+  `IndexAllocator` is an alias over `OsEntropy`;
 - Noise: the XX handshake, the transport sessions, the replay
   window, the cipher state and the AEAD under it, with the handshake
   message sizes. All but the AEAD are re-exported under `fips::noise`;
   the root crate meets `AeadKey` only as the type the sessions' key
-  hand-outs return;
+  hand-outs return, and in the compile-time tie that pins that type to
+  `ring`;
 - the protocol itself, `proto`: the wire codecs and sans-IO state
   machines of every layer (link, session, spanning tree, bloom filters,
   routing, lookups, metrics, probes). The root crate reaches it as
@@ -84,8 +86,9 @@ synthetic timestamps.
 random source. Code that needs random bytes or a nonce takes them from
 its caller, or takes the host's source as a type parameter bounded by
 `entropy::EntropySource`, as `Identity<E>`, `AuthChallenge<E>`,
-`CoordCache<E>` and `HandshakeState<E>` do. The host fixes the
-parameter once, in a type alias at the path its callers already use:
+`CoordCache<E>`, `HandshakeState<E>` and `IndexAllocator<E>` do. The
+host fixes the parameter once, in a type alias at the path its callers
+already use:
 the root crate's `fips::identity::Identity`, for example, is
 `Identity<OsEntropy>`, and `OsEntropy` is `rand`'s thread-local
 generator. The source must be cryptographically secure; keys derived

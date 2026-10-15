@@ -22,7 +22,14 @@ the same way in both crates.
 - `index.rs`: `SessionIndex`, the 32-bit number a receiver chooses for a
   Noise session and its peer puts in every encrypted frame, so the
   receiver finds the session without a search. It converts to and from
-  little-endian bytes and displays as eight hex digits.
+  little-endian bytes and displays as eight hex digits. Beside it are
+  `IndexAllocator<E>`, which draws random indices from the host's
+  `EntropySource` and tracks which are in use in a `BTreeSet` (the node
+  draws the values itself, and the set is touched per handshake and
+  teardown, not per packet), and `IndexError`. There is one allocator
+  per node, so an index is unique across the node, not per transport.
+  The root crate re-exports all three under `utils::index`, with
+  `IndexAllocator` an alias over its `OsEntropy`.
 - `tests/`: the unit tests for the files here; its README describes it.
 
 ## Invariants
@@ -30,13 +37,11 @@ the same way in both crates.
 - **A `KeyedHasher` is keyed from its entropy source.** `new::<E>()`
   draws all 16 key bytes from `E`; a fixed or zero key would give a peer
   a table layout it can predict and grind. Its `Debug` prints no key.
-- **Of the session index code, only the type is here.**
-  `IndexAllocator`, which draws random indices from `rand`'s
-  thread-local generator, and `IndexError` stay in the root crate's
-  `utils::index`, which re-exports `SessionIndex` from here. The
-  allocator can join it once randomness is passed in.
+- **The allocator draws from its entropy source.** Every candidate
+  index `IndexAllocator<E>::allocate` tries is four bytes from `E`, read
+  little-endian; it never reads a random source of its own.
 - **The byte order is wire format.** `to_le_bytes` and `from_le_bytes`
   are how the index appears in every encrypted frame header; they do not
   change on the deployed lines.
 - **The field is private.** Code builds and reads an index through `new`
-  and `as_u32`, including the root crate's allocator.
+  and `as_u32`.

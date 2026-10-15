@@ -23,8 +23,9 @@ use zeroize::{Zeroize, ZeroizeOnDrop};
 /// authenticate.
 ///
 /// `ck` and `h` are cleared on drop, including on the clone above once it
-/// goes out of scope. `cipher` is skipped because [`CipherState`] clears its
-/// own retained key.
+/// goes out of scope. `cipher` is skipped because [`CipherState`] holds no
+/// key bytes of its own: its key is the cached keyed cipher, which clears
+/// itself on drop on RustCrypto and cannot be cleared on `ring`.
 #[derive(Clone, Zeroize, ZeroizeOnDrop)]
 struct SymmetricState {
     /// Chaining key for key derivation.

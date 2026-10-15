@@ -60,9 +60,12 @@ its callers name it as before.
   rather than the cache growing past its cap (a link peer's write goes
   to probation instead). Otherwise a flood of hints could age a verified
   entry into the eviction slot and then plant a value in the space it
-  left. Eviction orders by last use, not by expiry; an expired entry is
-  removed when its key is written, when `get_and_touch` reads it, or by
-  `purge_expired`.
+  left. The refusal is for hints only: a verified write is stored even
+  when every entry is live-verified, because `insert_verified` does not
+  check whether `make_room` made room, so verified entries can take the
+  main segment past its cap. Eviction orders by last use, not by expiry;
+  an expired entry is removed when its key is written, when
+  `get_and_touch` reads it, or by `purge_expired`.
 - **Eviction finds its victim through ordered indexes, not a scan.**
   Entries eviction may take are kept in a `BTreeMap` by last use, and
   live-verified ones are parked by when their verification lapses, so an
