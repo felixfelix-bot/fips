@@ -2357,7 +2357,7 @@ impl Node {
         // Send standalone CoordsWarmup immediately (rate-limited)
         if self
             .coords_response_rate_limiter
-            .should_send(&msg.dest_addr, Self::now_ms())
+            .should_send(&msg.dest_addr, crate::time::mono_ms())
         {
             if let Some(entry) = self.sessions.get(&msg.dest_addr)
                 && entry.is_established()
@@ -2464,7 +2464,7 @@ impl Node {
         // Send standalone CoordsWarmup immediately (rate-limited)
         if self
             .coords_response_rate_limiter
-            .should_send(&msg.dest_addr, Self::now_ms())
+            .should_send(&msg.dest_addr, crate::time::mono_ms())
         {
             if let Some(entry) = self.sessions.get(&msg.dest_addr)
                 && entry.is_established()
@@ -2532,7 +2532,7 @@ impl Node {
         // the two do not disagree.
         if self
             .path_mtu_release_limiter
-            .should_send(&msg.dest_addr, Self::now_ms())
+            .should_send(&msg.dest_addr, crate::time::mono_ms())
         {
             self.path_mtu_lookup_release(&msg.dest_addr);
             self.coord_cache.clear_path_mtu(&msg.dest_addr);

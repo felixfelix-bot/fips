@@ -11542,3 +11542,89 @@ async fn a_forward_wall_clock_step_does_not_trigger_the_time_based_rekey() {
     );
     cleanup_nodes(&mut nodes).await;
 }
+
+#[tokio::test]
+async fn a_path_mtu_release_is_admitted_after_a_backward_wall_clock_step() {
+    use crate::node::handlers::session::PATH_MTU_RELEASE_MIN_INTERVAL;
+    use crate::proto::routing::PathBroken;
+
+    let mut node = make_node();
+    let remote = Identity::generate();
+    install_initiating(&mut node, &remote);
+    let dest = *remote.node_addr();
+    let reporter = NodeAddr::from_bytes([0xBB; 16]);
+    let dest_fips = crate::Ipv6Address::from_node_addr(&dest);
+    let encoded = PathBroken::new(dest, reporter).encode();
+    let inner = &encoded[5..];
+
+    node.path_mtu_lookup_insert(dest_fips, 700);
+    node.handle_path_broken(&reporter, &reporter, inner).await;
+    assert_eq!(
+        node.path_mtu_lookup_get(&dest_fips),
+        None,
+        "control: the first PathBroken releases"
+    );
+
+    crate::time::step_wall(-3_600_000);
+    crate::time::advance(PATH_MTU_RELEASE_MIN_INTERVAL + Duration::from_millis(100));
+    node.path_mtu_lookup_insert(dest_fips, 700);
+    node.handle_path_broken(&reporter, &reporter, inner).await;
+    assert_eq!(
+        node.path_mtu_lookup_get(&dest_fips),
+        None,
+        "a release a full interval after the last must be admitted although the \
+         system clock stepped back"
+    );
+}
+
+#[tokio::test]
+async fn a_coords_response_is_admitted_after_a_backward_wall_clock_step() {
+    use crate::proto::routing::CoordsRequired;
+
+    let mut nodes = run_tree_test(2, &[(0, 1)], false).await;
+    verify_tree_convergence(&nodes);
+    populate_all_coord_caches(&mut nodes);
+    establish_pair_session(&mut nodes).await;
+    let node1_addr = *nodes[1].node.node_addr();
+    let reporter = NodeAddr::from_bytes([0xBB; 16]);
+    let encoded = CoordsRequired::new(node1_addr, reporter).encode();
+    let interval_ms = nodes[0]
+        .node
+        .config()
+        .node
+        .session
+        .coords_response_interval_ms;
+    // Each standalone CoordsWarmup the response sends takes one send counter.
+    let sent = |nodes: &[TestNode]| {
+        nodes[0]
+            .node
+            .get_session(&node1_addr)
+            .expect("session present")
+            .send_counter()
+    };
+
+    let before = sent(&nodes);
+    nodes[0]
+        .node
+        .handle_coords_required(&reporter, &encoded[5..])
+        .await;
+    assert_eq!(
+        sent(&nodes),
+        before + 1,
+        "control: the first CoordsRequired is answered with a CoordsWarmup"
+    );
+
+    crate::time::step_wall(-3_600_000);
+    crate::time::advance(Duration::from_millis(interval_ms + 100));
+    nodes[0]
+        .node
+        .handle_coords_required(&reporter, &encoded[5..])
+        .await;
+    assert_eq!(
+        sent(&nodes),
+        before + 2,
+        "a response a full interval after the last must be admitted although the \
+         system clock stepped back"
+    );
+    cleanup_nodes(&mut nodes).await;
+}
