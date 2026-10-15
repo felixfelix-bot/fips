@@ -132,6 +132,29 @@ fn test_session_entry_touch() {
     assert_eq!(entry.created_at(), 1000);
 }
 
+/// A clock step back past the session's start must not wrap the inner
+/// header's timestamp to near 2^32, which the peer reads as an RTT sample of
+/// about 49 days.
+#[test]
+fn session_timestamp_is_zero_when_now_precedes_the_session_start() {
+    use crate::noise::HandshakeState;
+
+    let identity_a = Identity::generate();
+    let identity_b = Identity::generate();
+    let handshake = HandshakeState::new_initiator(identity_a.keypair(), identity_b.pubkey_full());
+    let mut entry = crate::node::session::SessionEntry::new(
+        *identity_b.node_addr(),
+        identity_b.pubkey_full(),
+        EndToEndState::Initiating(handshake),
+        10_000,
+        true,
+    );
+    entry.mark_established(10_000);
+
+    assert_eq!(entry.session_timestamp(11_500), 1_500);
+    assert_eq!(entry.session_timestamp(9_000), 0);
+}
+
 #[test]
 fn test_session_table_operations() {
     use crate::noise::HandshakeState;

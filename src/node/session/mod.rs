@@ -714,10 +714,11 @@ impl SessionEntry {
 
     /// Compute a session-relative timestamp for the FSP inner header.
     ///
-    /// Returns `(now_ms - session_start_ms)` truncated to u32.
-    /// Wraps naturally at ~49.7 days, which is fine for relative timing.
+    /// Returns `(now_ms - session_start_ms)` truncated to u32, or 0 when
+    /// `now_ms` reads before the session start. Wraps naturally at ~49.7
+    /// days, which is fine for relative timing.
     pub(crate) fn session_timestamp(&self, now_ms: u64) -> u32 {
-        now_ms.wrapping_sub(self.session_start_ms) as u32
+        now_ms.saturating_sub(self.session_start_ms) as u32
     }
 
     /// Whether this node initiated the Noise handshake.
