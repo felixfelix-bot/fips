@@ -184,3 +184,8 @@ harness = false
 name = "coord_cache"
 path = "benches/coord_cache.rs"
 harness = false
+
+[[bench]]
+name = "noise_aead"
+path = "benches/noise_aead.rs"
+harness = false
