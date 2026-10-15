@@ -109,7 +109,18 @@ pub enum NoiseError {
     ReplayDetected(u64),
 
     #[error("secp256k1 error: {0}")]
-    Secp256k1(#[from] secp256k1::Error),
+    Secp256k1(secp256k1::Error),
+}
+
+// Written out rather than derived with `#[from]`, which would also make the
+// field the error's `source()`: that needs `core::error::Error` on
+// `secp256k1::Error`, which the crate implements only with its `std` feature.
+// So `source()` returns `None` for this variant; the inner error's text is in
+// the `Display` output.
+impl From<secp256k1::Error> for NoiseError {
+    fn from(e: secp256k1::Error) -> Self {
+        Self::Secp256k1(e)
+    }
 }
 
 /// Role in the handshake.
