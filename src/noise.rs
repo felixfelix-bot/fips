@@ -14,7 +14,7 @@ pub use fips_core::noise::{
 };
 pub(crate) use fips_core::noise::{clear_slot, take_cleared};
 
-#[cfg(test)]
+#[cfg(all(test, unix))]
 pub(crate) use fips_core::noise::open;
 
 /// The Noise handshake, drawing its ephemeral keys from
