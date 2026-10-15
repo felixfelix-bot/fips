@@ -259,11 +259,17 @@ information arrives.
 
 ### Transit-Side Rate Limiting
 
-Transit nodes enforce a per-target minimum interval (default 2s, configurable
-via `forward_min_interval_secs`) for forwarded lookups. This is
-defense-in-depth against misbehaving nodes that generate fresh `request_id`s
-at high rate to bypass dedup. The rate limiter collapses rapid-fire lookups
-for the same target regardless of `request_id`.
+Transit nodes enforce a minimum interval per link peer and target (default
+2s, configurable via `forward_min_interval_secs`) for forwarded lookups. This
+is defense-in-depth against misbehaving nodes that generate fresh
+`request_id`s at high rate to bypass dedup. The rate limiter collapses
+rapid-fire lookups for the same target from the same link peer regardless of
+`request_id`. It is keyed on the link peer rather than the request's origin,
+which is unsigned and chosen by the sender, so one neighbour repeating a
+target does not suppress other neighbours' requests for it. Only a request
+that some peer can carry is recorded. The limiter holds at most 4096 entries;
+at that bound the peer holding the most entries loses its oldest, and the new
+entry is always recorded.
 
 ### LookupResponse
 
@@ -310,12 +316,22 @@ target. A copy that returns after the lookup completed or timed out, or a copy
 of an older attempt on a longer ladder, is recorded and forwarded as transit,
 and a later copy of it is dropped as a duplicate.
 
-**Response-forwarded flag**: Each `recent_requests` entry tracks whether a
-response has already been forwarded for that `request_id`. If a second
-response arrives (e.g., from convergent request paths that reached the
-target via different routes), the transit node drops it. This prevents
-response routing loops where multiple responses for the same request
-circulate through the network.
+**Relay eligibility**: Each `recent_requests` entry records the request's
+target and the link peers the transit forwarded it to, fixed when it was
+forwarded. A response is relayed only if it names that target and arrives from
+one of those peers. A transit cannot verify the proof, so a response from any
+other peer, including the peer the request came from or one whose filter
+claimed the target only after the forward, cannot be told from a forgery and
+is dropped.
+
+**Relayed-response memory**: Each entry also remembers the first eight bytes
+of the proof of the last eight responses relayed for it. A response whose
+digest is remembered is dropped, which stops response routing loops: a copy
+circulating on a reverse-path cycle is relayed once at each node. A response
+with a new digest is relayed however many have gone before, so a forgery
+that arrives first does not stop the genuine response. The cost is that an
+eligible peer can have each distinct forgery it sends relayed to the origin,
+which verifies and discards each one.
 
 **Proof verification**: The source verifies the Schnorr proof upon receipt,
 confirming that the target actually signed the response. The proof covers
@@ -618,7 +634,7 @@ recovery).
 | Discovery retry logic | **Implemented** |
 | Discovery originator backoff | **Implemented** |
 | Discovery transit-side rate limiting | **Implemented** |
-| Discovery response-forwarded dedup | **Implemented** |
+| Discovery response relay eligibility and memory | **Implemented** |
 | Leaf-only operation | Under development |
 | Link cost in parent selection (ETX) | **Implemented** |
 | Link cost in candidate ranking | **Implemented** |

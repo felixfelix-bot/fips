@@ -7,25 +7,42 @@
 
 use crate::node::reject::DiscoveryReject;
 use crate::node::{Node, diag};
+use crate::peer::ActivePeer;
 use crate::proto::fsp::should_apply_path_mtu;
 use crate::proto::lookup::{
-    LookupAction, LookupRequest, LookupResponse, MAX_BACKOFF_ENTRIES, MAX_RECENT_LOOKUP_REQUESTS,
+    LookupAction, LookupRequest, LookupResponse, MAX_BACKOFF_ENTRIES, MAX_FORWARD_ENTRIES,
+    MAX_RECENT_LOOKUP_REQUESTS,
 };
 use crate::proto::probe::LookupOutcomeKind;
+use crate::proto::stp::TreeState;
 use crate::transport::{TransportAddr, TransportId};
 use crate::{NodeAddr, PeerIdentity};
+use std::collections::HashMap;
 use tracing::{debug, info, trace, warn};
 
 /// Shell adapter exposing the live routing tables to the sans-IO discovery
 /// core's `RoutingView` read seam. Lives in `node` so it can read `Node`'s
-/// private `peers` map and call the crate-private tree/bloom predicates.
+/// private `peers` map and tree state.
 ///
-/// Holding `&Node` whole is fine for the forward path because it does not
-/// also need `&mut self.lookup` concurrently. A later commit whose core
-/// step needs `&mut discovery` while reading routing state should narrow this
-/// to borrow only `peers` + `tree_state` instead of the whole node.
+/// It borrows only the peer table and the tree state, not the whole node, so
+/// the transit forward can hand the core `&mut self.lookup` beside it.
 struct NodeRoutingView<'a> {
-    node: &'a Node,
+    peers: &'a HashMap<NodeAddr, ActivePeer>,
+    tree_state: &'a TreeState,
+    my_addr: NodeAddr,
+}
+
+impl<'a> NodeRoutingView<'a> {
+    /// The view over `node`, for callers that do not also borrow
+    /// `node.lookup` mutably; one that does builds the struct literal instead,
+    /// so the borrows stay disjoint.
+    fn of(node: &'a Node) -> Self {
+        Self {
+            peers: &node.peers,
+            tree_state: &node.tree_state,
+            my_addr: *node.node_addr(),
+        }
+    }
 }
 
 /// What [`Node::maybe_initiate_lookup`] did, for callers that act on the
@@ -64,11 +81,10 @@ impl LookupInitiateOutcome {
 
 impl crate::proto::lookup::RoutingView for NodeRoutingView<'_> {
     fn is_tree_peer(&self, addr: &NodeAddr) -> bool {
-        self.node.is_tree_peer(addr)
+        crate::node::is_tree_peer_of(self.tree_state, &self.my_addr, addr)
     }
     fn peers_reaching(&self, target: &NodeAddr) -> Vec<NodeAddr> {
-        self.node
-            .peers
+        self.peers
             .iter()
             .filter(|(_, peer)| peer.may_reach(target))
             .map(|(addr, _)| *addr)
@@ -193,16 +209,7 @@ impl Node {
                 self.send_lookup_response(&request).await;
             }
             RequestOutcome::Forward => {
-                self.metrics().lookup.req_forwarded.inc();
                 self.forward_lookup_request(from, request).await;
-            }
-            RequestOutcome::ForwardRateLimited => {
-                self.metrics().lookup.req_forward_rate_limited.inc();
-                debug!(
-                    request_id = request.request_id,
-                    target = %self.peer_display_name(&request.target),
-                    "Forward rate limited, suppressing LookupRequest"
-                );
             }
             RequestOutcome::TtlExhausted => {
                 self.metrics()
@@ -249,14 +256,31 @@ impl Node {
             &mut self.lookup,
             response.request_id,
             &response.target,
+            from,
+            response.proof_digest(),
         ) {
             crate::proto::lookup::ResponseRoute::AlreadyForwarded => {
-                // Already forwarded a response for this request — drop to
-                // prevent response routing loops.
+                // This response was already relayed for this request — drop,
+                // which is what ends a response routing loop.
                 debug!(
                     request_id = response.request_id,
+                    from = %self.peer_display_name(from),
                     target = %self.peer_display_name(&response.target),
-                    "Response already forwarded for this request, dropping"
+                    reason = "already-relayed",
+                    "LookupResponse already relayed for this request, dropping"
+                );
+            }
+            crate::proto::lookup::ResponseRoute::Ineligible(why) => {
+                // A request this node transited, but the response names
+                // another target or came from a peer the request was not sent
+                // to, so it cannot be the answer. Dropping it leaves the
+                // request open for the genuine one.
+                debug!(
+                    request_id = response.request_id,
+                    from = %self.peer_display_name(from),
+                    target = %self.peer_display_name(&response.target),
+                    reason = why.token(),
+                    "LookupResponse not eligible for relay, dropping"
                 );
             }
             crate::proto::lookup::ResponseRoute::Transit { from_peer } => {
@@ -317,9 +341,14 @@ impl Node {
                         self.metrics()
                             .lookup
                             .record_reject(DiscoveryReject::RespIdentityMiss);
-                        warn!(
+                        // Transits relay every distinct response from a peer
+                        // the request went to, so a peer on the path can
+                        // reach this once per frame it sends: debug, counted.
+                        debug!(
                             request_id = response.request_id,
+                            from = %self.peer_display_name(from),
                             target = %self.peer_display_name(&target),
+                            reason = "identity-miss",
                             "identity_cache miss for lookup target, cannot verify proof"
                         );
                         return;
@@ -338,9 +367,14 @@ impl Node {
                     self.metrics()
                         .lookup
                         .record_reject(DiscoveryReject::RespProofFailed);
-                    warn!(
+                    // Transits relay every distinct response from a peer the
+                    // request went to, forgeries included, so this is
+                    // reachable once per forged frame: debug, and counted.
+                    debug!(
                         request_id = response.request_id,
+                        from = %self.peer_display_name(from),
                         target = %self.peer_display_name(&target),
+                        reason = "proof-failed",
                         "LookupResponse proof verification failed, discarding"
                     );
                     return;
@@ -604,13 +638,45 @@ impl Node {
     async fn forward_lookup_request(&mut self, from: &NodeAddr, mut request: LookupRequest) {
         // Plan the forward with the sans-IO decision core. The core owns the
         // TTL decrement, tree/fallback peer selection, and single-encode
-        // fan-out; the shell keeps all metrics/logging and drives the sends.
-        let outcome = {
-            let rv = NodeRoutingView { node: self };
-            crate::proto::lookup::plan_forward(&mut request, from, &rv)
+        // fan-out, and records which peers the request went to, since only
+        // those may answer it; the shell keeps all metrics/logging and drives
+        // the sends.
+        let rv = NodeRoutingView {
+            peers: &self.peers,
+            tree_state: &self.tree_state,
+            my_addr: *self.node_addr(),
         };
+        let outcome = crate::proto::lookup::plan_transit_forward(
+            &mut self.lookup,
+            &mut request,
+            from,
+            &rv,
+            Self::now_ms(),
+        );
+        // A full limiter evicts rather than failing open; one warn for the
+        // flood that fills it, then counted until it drains.
+        let evicted = self.lookup.forward_limiter.take_evicted();
+        if self.forward_bound_log.refused(evicted) {
+            warn!(
+                bound = MAX_FORWARD_ENTRIES,
+                "Lookup forward limiter at its bound; the peer holding the most entries loses its oldest"
+            );
+        }
+        if !matches!(outcome, crate::proto::lookup::ForwardOutcome::RateLimited) {
+            self.metrics().lookup.req_forwarded.inc();
+        }
         match outcome {
             crate::proto::lookup::ForwardOutcome::TtlExhausted => {}
+            crate::proto::lookup::ForwardOutcome::RateLimited => {
+                self.metrics().lookup.req_forward_rate_limited.inc();
+                debug!(
+                    request_id = request.request_id,
+                    from = %self.peer_display_name(from),
+                    target = %self.peer_display_name(&request.target),
+                    reason = "rate-limited",
+                    "Forward rate limited, suppressing LookupRequest"
+                );
+            }
             crate::proto::lookup::ForwardOutcome::NoPeers => {
                 self.metrics().lookup.req_no_tree_peer.inc();
                 trace!(
@@ -706,10 +772,7 @@ impl Node {
         // Tree-peer bloom-match selection + single encode live in the sans-IO
         // core. The core keeps the tree-only (no non-tree fallback) behavior;
         // the shell drives the sends and keeps all metrics/logging.
-        let actions = {
-            let rv = NodeRoutingView { node: self };
-            crate::proto::lookup::plan_initiate(&request, &rv)
-        };
+        let actions = crate::proto::lookup::plan_initiate(&request, &NodeRoutingView::of(self));
 
         let peer_count = actions.len();
 
@@ -869,6 +932,21 @@ impl Node {
             info!(
                 evicted,
                 "Lookup failure table below its bound again; entries evicted while it was full"
+            );
+        }
+
+        // Entries of peers that have gone quiet are only cleared by the
+        // limiter's sweep, so run it here as well as on arrivals, or a
+        // flood that stops would hold the latch.
+        self.lookup.forward_limiter.prune(now_ms);
+        let at_bound = self.lookup.forward_limiter.entry_count() >= MAX_FORWARD_ENTRIES;
+        if let Some(evicted) = self
+            .forward_bound_log
+            .tick(at_bound, std::time::Instant::now())
+        {
+            info!(
+                evicted,
+                "Lookup forward limiter below its bound again; entries evicted while it was full"
             );
         }
     }

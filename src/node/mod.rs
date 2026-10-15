@@ -21,7 +21,7 @@ pub(crate) mod metrics;
 pub(crate) mod netmon;
 pub use netmon::NetmonTrigger;
 pub(crate) mod path_mtu;
-mod peer_error_budget;
+mod peer_budget;
 mod peering;
 mod rate_limit;
 pub(crate) mod reject;
@@ -37,7 +37,7 @@ mod tree;
 #[cfg(unix)]
 pub(crate) mod worker_set;
 
-use self::peer_error_budget::PeerErrorBudget;
+use self::peer_budget::PeerBudget;
 use self::rate_limit::{HandshakeRateLimiter, LookupSignRateLimiter, SessionSetupRateLimiter};
 use self::reloadable::Reloadable;
 
@@ -47,7 +47,7 @@ use self::reloadable::Reloadable;
 /// dual-initiation in symmetric-start meshes; the configured
 /// `node.rekey.after_secs` remains the nominal interval (mean preserved).
 pub(crate) const REKEY_JITTER_SECS: i64 = 15;
-use crate::cache::CoordCache;
+use crate::cache::{CoordCache, Funding, Placed};
 use crate::hosts::HostMap;
 use crate::ipv6tun::icmp_rate_limit::IcmpRateLimiter;
 use crate::ipv6tun::tun::{TunError, TunOutboundTx, TunState, TunTx};
@@ -353,6 +353,38 @@ struct PendingConnect {
     remote_addr: TransportAddr,
     /// The peer identity (for handshake initiation).
     peer_identity: PeerIdentity,
+}
+
+/// Whether `peer_addr` is a tree neighbour of the node at `my_addr`: its
+/// parent, or a child whose declaration names it as parent.
+///
+/// Takes the tree state rather than the node, so a caller holding a mutable
+/// borrow of another part of the node can still ask.
+pub(in crate::node) fn is_tree_peer_of(
+    tree_state: &TreeState,
+    my_addr: &NodeAddr,
+    peer_addr: &NodeAddr,
+) -> bool {
+    tree_role_of(tree_state, my_addr, peer_addr) != diag::TreeRole::None
+}
+
+/// The place of `peer_addr` in the spanning tree of the node at `my_addr`:
+/// its parent, its child (the peer's declaration names it as parent), or
+/// neither.
+fn tree_role_of(
+    tree_state: &TreeState,
+    my_addr: &NodeAddr,
+    peer_addr: &NodeAddr,
+) -> diag::TreeRole {
+    if !tree_state.is_root() && tree_state.my_declaration().parent_id() == peer_addr {
+        return diag::TreeRole::Parent;
+    }
+    if let Some(decl) = tree_state.peer_declaration(peer_addr)
+        && decl.parent_id() == my_addr
+    {
+        return diag::TreeRole::Child;
+    }
+    diag::TreeRole::None
 }
 
 /// How long a bounded table must stay below its bound before its log latch
@@ -685,6 +717,8 @@ pub struct Node {
     /// Log latch for the lookup failure table at its bound. Held here rather
     /// than inside `lookup` because the shell logs it on the monotonic clock.
     backoff_bound_log: BoundLog,
+    /// Log latch for the lookup forward limiter at `MAX_FORWARD_ENTRIES`.
+    forward_bound_log: BoundLog,
 
     // === Diagnostics ===
     /// In-flight `probe` jobs plus their per-target ownership claims. Driven
@@ -782,6 +816,10 @@ pub struct Node {
     /// on `ActivePeer`, for the same reason as `restart_dampener`: the
     /// removal it counts destroys the peer entry.
     silent_sessions: SilentSessions,
+    /// Per peer, the ephemerals of msg1s that promoted a peering not yet
+    /// heard from. Held beside `restart_dampener` for the same reason: a
+    /// replacement destroys the peer entry. See `MAX_REPLAYED_MSG1S`.
+    replayed_msg1s: handlers::handshake::ReplayedMsg1s,
 
     // === Rate Limiting ===
     /// Rate limiter for msg1 processing (DoS protection).
@@ -795,7 +833,11 @@ pub struct Node {
     /// only value at the emission point a sender cannot mint; the
     /// per-destination interval inside `routing` is keyed on a field the
     /// sender chooses and is an aggregate suppressor, not a bound.
-    peer_error_budget: PeerErrorBudget,
+    peer_error_budget: PeerBudget,
+    /// Budget each authenticated link peer pays coordinate-cache hints from,
+    /// in units of cache weight. Decides where a hint is placed, never whether
+    /// the frame carrying it is routed.
+    coord_hint_budget: PeerBudget,
     /// Routing-subsystem state (routing error-signal rate limiter).
     routing: Router,
     /// FMP connection-lifecycle decision anchor (stateless; drives the
@@ -1075,10 +1117,12 @@ impl Node {
             pending_outbound: HashMap::new(),
             restart_dampener: HashMap::new(),
             silent_sessions: SilentSessions::new(),
+            replayed_msg1s: Default::default(),
             msg1_rate_limiter,
             setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
-            peer_error_budget: PeerErrorBudget::new(),
+            peer_error_budget: PeerBudget::new(),
+            coord_hint_budget: PeerBudget::coord_hints(),
             routing: Router::new(),
             fmp: Fmp::new(),
             fsp: Fsp::new(),
@@ -1097,6 +1141,7 @@ impl Node {
             ),
             discovery_sign_limiter: LookupSignRateLimiter::new(),
             backoff_bound_log: BoundLog::default(),
+            forward_bound_log: BoundLog::default(),
             peering: peering::reconcile::Peering::new(),
             last_parent_reeval: None,
             last_congestion_log: None,
@@ -1253,10 +1298,12 @@ impl Node {
             pending_outbound: HashMap::new(),
             restart_dampener: HashMap::new(),
             silent_sessions: SilentSessions::new(),
+            replayed_msg1s: Default::default(),
             msg1_rate_limiter,
             setup_rate_limiter,
             icmp_rate_limiter: IcmpRateLimiter::new(),
-            peer_error_budget: PeerErrorBudget::new(),
+            peer_error_budget: PeerBudget::new(),
+            coord_hint_budget: PeerBudget::coord_hints(),
             routing: Router::new(),
             fmp: Fmp::new(),
             fsp: Fsp::new(),
@@ -1272,6 +1319,7 @@ impl Node {
             lookup: Lookup::new(LookupBackoff::new(), LookupForwardRateLimiter::new()),
             discovery_sign_limiter: LookupSignRateLimiter::new(),
             backoff_bound_log: BoundLog::default(),
+            forward_bound_log: BoundLog::default(),
             peering: peering::reconcile::Peering::new(),
             last_parent_reeval: None,
             last_congestion_log: None,
@@ -2256,6 +2304,12 @@ impl Node {
     #[cfg(test)]
     pub(crate) fn restart_dampener_stamp(&self, peer: &NodeAddr) -> Option<std::time::Instant> {
         self.restart_dampener.get(peer).copied()
+    }
+
+    /// How many msg1 ephemerals the replay memory holds for `peer`. Test-only.
+    #[cfg(test)]
+    pub(crate) fn replayed_msg1_count(&self, peer: &NodeAddr) -> usize {
+        self.replayed_msg1s.count(peer)
     }
 
     #[cfg(test)]
@@ -3724,21 +3778,13 @@ impl Node {
     /// Returns true if the peer is our current tree parent, or if the peer
     /// has declared us as their parent (making them our child).
     pub(crate) fn is_tree_peer(&self, peer_addr: &NodeAddr) -> bool {
-        self.tree_role(peer_addr) != diag::TreeRole::None
+        is_tree_peer_of(&self.tree_state, self.node_addr(), peer_addr)
     }
 
     /// The peer's place in the spanning tree: our parent, our child (its
     /// declaration names us as parent), or neither.
     pub(crate) fn tree_role(&self, peer_addr: &NodeAddr) -> diag::TreeRole {
-        if !self.tree_state.is_root() && self.tree_state.my_declaration().parent_id() == peer_addr {
-            return diag::TreeRole::Parent;
-        }
-        if let Some(decl) = self.tree_state.peer_declaration(peer_addr)
-            && decl.parent_id() == self.node_addr()
-        {
-            return diag::TreeRole::Child;
-        }
-        diag::TreeRole::None
+        tree_role_of(&self.tree_state, self.node_addr(), peer_addr)
     }
 
     /// Find next hop for a destination node address.
@@ -3767,14 +3813,47 @@ impl Node {
     /// increment site. The verified path is deliberately not routed through
     /// this: a caller that has checked a proof calls
     /// `CoordCache::insert_verified` directly and says so.
+    ///
+    /// **Foreign root: refused.** A coordinate under a root other than ours
+    /// can never route. `StpState::find_next_hop` returns `None` outright on a
+    /// root mismatch, and the bloom fallback compares against a `my_distance`
+    /// of `usize::MAX`, so no candidate is ever strictly closer. Caching one
+    /// therefore buys nothing and costs something real: the entry's presence
+    /// is what `synth_routing_error` reads to choose `PathBroken` over
+    /// `CoordsRequired`, so a foreign-root plant turns this node into a
+    /// one-packet reflector aimed at whatever source the datagram claimed.
+    /// `CoordCache::invalidate_other_roots` already applies this same
+    /// invariant whenever our own tree position moves; this applies it at
+    /// write time instead of waiting for the next move. It is checked here,
+    /// not at a caller, so that no write site can skip it.
+    ///
+    /// `funding` is what the writer can pay toward the cache space the hint
+    /// takes; see `CoordCache::insert_funded`. Returns what the write did, or
+    /// `None` if it was refused for a foreign root, which the caller logs with
+    /// the hint's source; the caller spends the returned `added_weight` from
+    /// the writer's budget.
     pub(crate) fn insert_coord_hint(
         &mut self,
         addr: NodeAddr,
         coords: TreeCoordinate,
         now_ms: u64,
-    ) {
-        let outcome = self.coord_cache.insert(addr, coords, now_ms);
-        self.metrics().forwarding.record_hint_outcome(outcome);
+        funding: Funding,
+    ) -> Option<Placed> {
+        if coords.root_id() != self.tree_state.my_coords().root_id() {
+            self.metrics().forwarding.record_warm_foreign_root();
+            return None;
+        }
+        let placed = self
+            .coord_cache
+            .insert_funded(addr, coords, now_ms, funding);
+        if placed.unfunded {
+            self.metrics().forwarding.record_hint_unfunded();
+        } else {
+            self.metrics()
+                .forwarding
+                .record_hint_outcome(placed.outcome);
+        }
+        Some(placed)
     }
 
     pub fn find_next_hop(&mut self, dest_node_addr: &NodeAddr) -> Option<&ActivePeer> {
@@ -3783,8 +3862,11 @@ impl Node {
             return None;
         }
 
-        // 2. Direct peer
-        if let Some(peer) = self.peers.get(dest_node_addr) {
+        // 2. Direct peer, once heard from: a peering promoted on a received
+        // msg1 may stand on a replayer's link until its first frame.
+        if let Some(peer) = self.peers.get(dest_node_addr)
+            && peer.is_heard()
+        {
             return Some(peer);
         }
 

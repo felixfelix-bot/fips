@@ -108,13 +108,16 @@ impl Rig {
     }
 
     /// Make the silent identity's session replaceable: idle past the
-    /// liveness interval without a frame, and no dampener stamp.
+    /// liveness interval without a frame, promoted that long ago (a peering
+    /// never heard from is aged from its promotion), and no dampener stamp.
     fn idle(&mut self, idle_ms: u64) {
         let peer = self.peer();
-        self.node
+        let session = self
+            .node
             .get_peer_mut(&peer)
-            .expect("the silent peer is present")
-            .test_set_last_seen(Node::now_ms() - idle_ms);
+            .expect("the silent peer is present");
+        session.test_set_last_seen(Node::now_ms() - idle_ms);
+        session.test_set_authenticated_at(Node::now_ms() - idle_ms);
         self.node.restart_dampener.clear();
     }
 

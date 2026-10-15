@@ -29,12 +29,13 @@ pub struct SessionStats {
     pub unknown_session: u64,
     /// Inbound session-layer message arrived for a `SessionEntry` whose
     /// state is incompatible with the message type (encrypted data
-    /// before Established; SessionAck outside Initiating; SessionMsg3
-    /// outside AwaitingMsg3).
+    /// before Established; SessionAck with no initiator leg; SessionMsg3
+    /// with no responder candidate).
     pub bad_state: u64,
     /// Inbound XK msg3 whose initiator static key does not derive the
-    /// source address the datagram claimed. The half-open session is
-    /// dropped and no identity is registered.
+    /// source address the datagram claimed. That responder candidate is
+    /// dropped, others for the address are kept, and no identity is
+    /// registered.
     pub addr_mismatch: u64,
     /// Inbound rekey XK msg3 whose initiator static key differs from
     /// the key the session was established with. The rekey is
@@ -335,6 +336,7 @@ pub struct ForwardingStatsSnapshot {
     pub coord_warm_key_mismatch: u64,
     pub coord_hint_changed: u64,
     pub coord_hint_rejected: u64,
+    pub coord_hint_unfunded: u64,
     pub ttl_exhausted_packets: u64,
     pub ttl_exhausted_bytes: u64,
     pub delivered_packets: u64,

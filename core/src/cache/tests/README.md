@@ -8,7 +8,9 @@ tests are named after it.
   there as `#[cfg(test)] mod tests;`; names `cache::tests::...`.
 - `coord_cache.rs`: tests for `coord_cache.rs` (`CoordCache` insertion,
   lookup, expiry, eviction, invalidation, and the hint and verification
-  rules), attached from there with
+  rules; the eviction indexes and their consistency after every
+  operation, the address bound, the probation segment and funded
+  writes), attached from there with
   `#[cfg(test)] #[path = "tests/coord_cache.rs"] mod tests;`; names
   `cache::coord_cache::tests::...`.
 - `entry.rs`: tests for `entry.rs` (`CacheEntry` and its expiry),

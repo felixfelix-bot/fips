@@ -313,6 +313,12 @@ pub struct ActivePeer {
     /// peer running the earlier gate would.
     #[cfg(test)]
     old_gate: bool,
+    /// Whether this peering has given any evidence that its peer is present
+    /// now: an authenticated frame on its session, or, for a peering this
+    /// node initiated, the msg2 that answered our fresh ephemeral. A
+    /// responder promotion is not such evidence, because the msg1 it was
+    /// promoted from carries nothing fresh and may be a replayed capture.
+    heard: bool,
 
     // === Published active-send-state (two-tier boundary) ===
     /// The send-critical subset read (and, on roam/responder-cutover, written)
@@ -363,6 +369,7 @@ impl ActivePeer {
             hs_lines: HsLineCounts::default(),
             #[cfg(test)]
             old_gate: false,
+            heard: true,
             send: PeerSendState::new(link_id, now, authenticated_at),
         }
     }
@@ -451,6 +458,7 @@ impl ActivePeer {
             hs_lines: HsLineCounts::default(),
             #[cfg(test)]
             old_gate: false,
+            heard: is_initiator,
             send,
         }
     }
@@ -858,6 +866,13 @@ impl ActivePeer {
         self.send.heard
     }
 
+    /// Whether this peering has been heard from: an authenticated frame
+    /// arrived on its session, or this node initiated it. A peering promoted
+    /// on a received msg1 is unheard until its first authenticated frame.
+    pub fn is_heard(&self) -> bool {
+        self.heard
+    }
+
     /// Time since last activity.
     pub fn idle_time(&self, current_time_ms: u64) -> u64 {
         current_time_ms.saturating_sub(self.send.last_seen)
@@ -915,8 +930,9 @@ impl ActivePeer {
     // === State Updates ===
 
     /// Record an authenticated frame from this peer: refresh the last-seen
-    /// time and mark the peer as heard.
+    /// time and mark the peer, and the peering, heard.
     pub fn touch(&mut self, current_time_ms: u64) {
+        self.heard = true;
         self.send.last_seen = current_time_ms;
         self.send.heard = true;
     }
@@ -926,6 +942,13 @@ impl ActivePeer {
     #[cfg(test)]
     pub(crate) fn test_set_last_seen(&mut self, current_time_ms: u64) {
         self.send.last_seen = current_time_ms;
+    }
+
+    /// Set when the peering was authenticated, as for one promoted that long
+    /// ago. A peering not yet heard from is aged from here.
+    #[cfg(test)]
+    pub(crate) fn test_set_authenticated_at(&mut self, authenticated_at: u64) {
+        self.authenticated_at = authenticated_at;
     }
 
     /// Update the link ID (e.g., on reconnect).

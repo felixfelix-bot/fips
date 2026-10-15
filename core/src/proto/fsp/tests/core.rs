@@ -7,15 +7,10 @@ use crate::proto::fsp::core::{
     mark_ipv6_ecn_ce, push_bounded_pending, should_apply_path_mtu,
 };
 use crate::proto::fsp::limits::FSP_CUTOVER_DELAY_MS;
-use crate::proto::stp::TreeCoordinate;
 use crate::testutil::make_node_addr;
 use alloc::collections::VecDeque;
 use alloc::vec;
 use alloc::vec::Vec;
-
-fn coords(byte: u8) -> TreeCoordinate {
-    TreeCoordinate::from_addrs(vec![make_node_addr(byte)]).unwrap()
-}
 
 /// A quiescent established-session snapshot: no pending cutover, no drain, no
 /// dampening, no expired initiation, zero ages/counter/jitter. Tests set only
@@ -695,37 +690,6 @@ fn cutover_timer_boundary() {
 }
 
 // ===== coords / MTU emit-policy =====
-
-#[test]
-fn plan_cache_coords_emits_present_in_order() {
-    let fsp = Fsp::new();
-    let src = make_node_addr(1);
-    let me = make_node_addr(2);
-    // Both present: src keyed by src_addr, dest keyed by my_addr, in order.
-    assert_eq!(
-        fsp.plan_cache_coords(src, me, Some(coords(3)), Some(coords(4))),
-        vec![
-            FspAction::CacheCoords {
-                addr: src,
-                coords: coords(3)
-            },
-            FspAction::CacheCoords {
-                addr: me,
-                coords: coords(4)
-            },
-        ]
-    );
-    // Only source present.
-    assert_eq!(
-        fsp.plan_cache_coords(src, me, Some(coords(3)), None),
-        vec![FspAction::CacheCoords {
-            addr: src,
-            coords: coords(3)
-        }]
-    );
-    // Neither present.
-    assert!(fsp.plan_cache_coords(src, me, None, None).is_empty());
-}
 
 #[test]
 fn plan_coords_required_lookup_gated_on_identity() {

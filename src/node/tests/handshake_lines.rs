@@ -19,7 +19,7 @@ use crate::testutil::{LogCapture, capture_logs_scoped};
 use tokio::time::timeout;
 
 const RESEND: &str = "Resent msg2 for duplicate msg1 (same epoch)";
-const REPLACE: &str = "Same-epoch msg1 from a peer heard from within the interval, dropping";
+const REPLACE: &str = "Same-epoch msg1 inside the peering's replacement interval, dropping";
 const PENDING: &str = "Rekey msg1 received but already have pending session, dropping";
 const OFF_LINK: &str = "Same-epoch msg1 off the established link while that link is up, dropping";
 const DUAL_WON: &str = "Dual rekey initiation: we win (smaller addr), dropping their msg1";
@@ -176,7 +176,7 @@ async fn a_peer_with_three_resends_logs_each_and_its_removal_reports_nothing_sup
 async fn repeated_msg1s_from_a_peer_heard_within_the_interval_log_three_lines_then_one_notice() {
     let mut e = established(5).await;
     let peer = e.node.get_peer_mut(&e.peer).unwrap();
-    peer.test_set_last_seen(Node::now_ms());
+    peer.touch(Node::now_ms());
     let (link, index) = (peer.link_id(), peer.our_index());
 
     let msg1s = fresh_msg1s(&e, 0x0A00, 8);

@@ -121,8 +121,9 @@ pub struct RateLimitConfig {
     /// (`node.rate_limit.session_setup_rate`).
     ///
     /// 16/s caps one neighbour's forced half-open occupancy at
-    /// `rate * handshake_timeout_secs` (480 entries at defaults) and its ack
-    /// amplification at `rate * (1 + handshake_max_resends)` (96 acks/s).
+    /// `rate * handshake_timeout_secs` (480 responder candidates at
+    /// defaults) and its ack amplification at `rate` (16 acks/s): a
+    /// responder sends one ack per admitted setup and does not resend it.
     ///
     /// Setup messages naming a peer this node is already established with
     /// are metered on a separate per-link bucket, derived from
@@ -340,8 +341,8 @@ pub struct LookupConfig {
     /// Maximum backoff cap in seconds (`node.lookup.backoff_max_secs`).
     #[serde(default = "LookupConfig::default_backoff_max_secs")]
     pub backoff_max_secs: u64,
-    /// Minimum interval between forwarded lookups for the same target in seconds
-    /// (`node.lookup.forward_min_interval_secs`).
+    /// Minimum interval between forwarded lookups for the same target from the
+    /// same link peer, in seconds (`node.lookup.forward_min_interval_secs`).
     /// Defense-in-depth against misbehaving nodes.
     #[serde(default = "LookupConfig::default_forward_min_interval_secs")]
     pub forward_min_interval_secs: u64,

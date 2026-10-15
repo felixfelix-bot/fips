@@ -67,6 +67,7 @@ pub mod io_radio;
 pub mod neighbor;
 pub mod pool;
 pub mod psm;
+mod recall;
 pub mod stats;
 pub mod stream_read;
 
@@ -81,6 +82,7 @@ use addr::BleAddr;
 use io::{BleIo, BleScanner, BleStream};
 use neighbor::NeighborBuffer;
 use pool::{BleConnection, ConnectionPool, Insert, Verify};
+use recall::Recall;
 use stats::BleStats;
 use stream_read::BleStreamRead;
 
@@ -195,21 +197,36 @@ pub struct BleTransport<I: BleIo> {
     /// node's [`connect_async`](Self::connect_async) alike — goes there. A
     /// peer that advertises nothing is dialled at the configured PSM.
     learned_psm: LearnedPsm,
+    /// Link addresses the scan + probe loop has resolved to a node identity;
+    /// a fresh memory for each loop started. See [`KnownNodes`].
+    known_node_of: KnownNodes,
 }
 
 /// Advertised listener PSM by link address, shared between the scan loop
 /// that learns it and the dials that need it. A plain mutex: never held
-/// across an await.
-type LearnedPsm = Arc<std::sync::Mutex<HashMap<BleAddr, u16>>>;
+/// across an await. Bounded: see [`Recall`].
+type LearnedPsm = Arc<std::sync::Mutex<Recall<u16>>>;
+
+/// Link addresses already resolved to a node identity by a completed pubkey
+/// exchange that was declined beside another link to that node, shared
+/// between the scan loop and its transport. Lets the loop skip an address it
+/// has *already* learned belongs to a peer it is connected to, instead of
+/// paying a full connect and exchange to rediscover that every cooldown.
+/// Rotation adds one per rotation, so an entry is dropped once its node no
+/// longer holds a verified link: a peer that genuinely goes away is probed
+/// again normally. A plain mutex: never held across an await. Bounded: see
+/// [`Recall`].
+type KnownNodes = Arc<std::sync::Mutex<Recall<NodeAddr>>>;
+
+/// Lock an address memory. A panic while it was held leaves nothing half
+/// written that its users rely on, so a poisoned lock is used as it is.
+fn recall<V>(memory: &Arc<std::sync::Mutex<Recall<V>>>) -> std::sync::MutexGuard<'_, Recall<V>> {
+    memory.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// The PSM to dial `addr` at: what it advertised, else `configured`.
 fn dial_psm_for(learned: &LearnedPsm, addr: &BleAddr, configured: u16) -> u16 {
-    learned
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(addr)
-        .copied()
-        .unwrap_or(configured)
+    recall(learned).get(addr).copied().unwrap_or(configured)
 }
 
 /// A learned PSM that refused a dial is stale — forget it, so the next
@@ -224,7 +241,7 @@ fn dial_psm_for(learned: &LearnedPsm, addr: &BleAddr, configured: u16) -> u16 {
 /// nothing would re-learn the entry — `DeviceAdded` fires once per
 /// discovery session.
 fn forget_psm(learned: &LearnedPsm, addr: &BleAddr, dialled: u16) {
-    let mut learned = learned.lock().unwrap_or_else(|e| e.into_inner());
+    let mut learned = recall(learned);
     if learned.get(addr) == Some(&dialled) {
         learned.remove(addr);
     }
@@ -260,7 +277,8 @@ impl<I: BleIo> BleTransport<I> {
             neighbor_buffer: Arc::new(NeighborBuffer::new(transport_id)),
             stats: Arc::new(BleStats::new()),
             local_pubkey: None,
-            learned_psm: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            learned_psm: Arc::default(),
+            known_node_of: Arc::default(),
         }
     }
 
@@ -369,6 +387,7 @@ impl<I: BleIo> BleTransport<I> {
         if self.config.scan() {
             match self.io.start_scanning().await {
                 Ok(scanner) => {
+                    self.known_node_of = KnownNodes::default();
                     self.scan_probe_task = Some(tokio::spawn(scan_probe_loop::<I>(
                         scanner,
                         Arc::clone(&self.io),
@@ -382,6 +401,7 @@ impl<I: BleIo> BleTransport<I> {
                         self.config.connect_timeout_ms(),
                         self.config.probe_cooldown_secs(),
                         Arc::clone(&self.learned_psm),
+                        Arc::clone(&self.known_node_of),
                         self.packet_tx.clone(),
                         self.transport_id,
                     )));
@@ -583,10 +603,11 @@ impl<I: BleIo> BleTransport<I> {
 
     /// Promote a newly established stream into the connection pool.
     ///
-    /// Spawns the receive loop and offers the link to the pool, after settling
-    /// it against any other link to the same node. An admitted link whose
-    /// remote sent its key is then announced; a refused one is not, since
-    /// there is no link behind it.
+    /// Offers the link to the pool, after settling it against any other link
+    /// to the same node, starting its receive loop once pooled. An admitted
+    /// link whose remote sent its key is then announced; a refused one is
+    /// not, since there is no link behind it. A link refused because the
+    /// address already holds one is not an error: the address is connected.
     async fn promote_connection(
         &self,
         addr: &TransportAddr,
@@ -597,7 +618,7 @@ impl<I: BleIo> BleTransport<I> {
     ) -> Result<(), TransportError> {
         let node_addr = peer.map(|(node, _)| node);
         let mut pool = self.pool.lock().await;
-        if let Dialled::Decline(kept) = settle_dialled(
+        match settle_dialled(
             &mut pool,
             local_node_of(self.local_pubkey),
             node_addr,
@@ -605,14 +626,22 @@ impl<I: BleIo> BleTransport<I> {
             addr,
             &self.stats,
         ) {
-            drop(pool);
-            if let Some((_, peer_pubkey)) = peer {
-                self.neighbor_buffer
-                    .add_peer_with_pubkey(&kept.unwrap_or_else(|| ble_addr.clone()), peer_pubkey);
+            Dialled::Keep => {}
+            Dialled::Decline(kept) => {
+                drop(pool);
+                if let Some((_, peer_pubkey)) = peer {
+                    self.neighbor_buffer.add_peer_with_pubkey(
+                        &kept.unwrap_or_else(|| ble_addr.clone()),
+                        peer_pubkey,
+                    );
+                }
+                return Ok(());
             }
-            return Ok(());
+            // Not announced: the link already at the address was announced
+            // when it was pooled.
+            Dialled::Occupied => return Ok(()),
         }
-        let conn = spawn_connection(
+        let (conn, receive) = spawn_connection(
             stream,
             reader,
             addr,
@@ -625,7 +654,7 @@ impl<I: BleIo> BleTransport<I> {
             &self.stats,
         );
         let admitted = conn.established_at;
-        let outcome = pool.insert(addr.clone(), conn, admitted);
+        let outcome = pool_link(&mut pool, addr, conn, admitted, receive);
         if !note_insert(
             &outcome,
             addr,
@@ -633,6 +662,9 @@ impl<I: BleIo> BleTransport<I> {
             &self.stats,
             pool.max_connections(),
         ) {
+            if outcome == Insert::Occupied {
+                return Ok(());
+            }
             return Err(TransportError::SendFailed("pool full".into()));
         }
         drop(pool);
@@ -739,7 +771,7 @@ impl<I: BleIo> BleTransport<I> {
                     // the address it just closed.
                     let peer_node = peer.map(|(node, _)| node);
                     let mut pool_guard = pool.lock().await;
-                    if let Dialled::Decline(kept) = settle_dialled(
+                    match settle_dialled(
                         &mut pool_guard,
                         local_node,
                         peer_node,
@@ -747,14 +779,20 @@ impl<I: BleIo> BleTransport<I> {
                         &addr_clone,
                         &stats,
                     ) {
-                        drop(pool_guard);
-                        if let Some((_, peer_pubkey)) = peer {
-                            neighbor_buffer
-                                .add_peer_with_pubkey(&kept.unwrap_or(ble_addr), peer_pubkey);
+                        Dialled::Keep => {}
+                        Dialled::Decline(kept) => {
+                            drop(pool_guard);
+                            if let Some((_, peer_pubkey)) = peer {
+                                neighbor_buffer
+                                    .add_peer_with_pubkey(&kept.unwrap_or(ble_addr), peer_pubkey);
+                            }
+                            return;
                         }
-                        return;
+                        // Not announced: the link already at the address was
+                        // announced when it was pooled.
+                        Dialled::Occupied => return,
                     }
-                    let conn = spawn_connection(
+                    let (conn, receive) = spawn_connection(
                         stream,
                         reader,
                         &addr_clone,
@@ -767,11 +805,12 @@ impl<I: BleIo> BleTransport<I> {
                         &stats,
                     );
                     let admitted = conn.established_at;
-                    let outcome = pool_guard.insert(addr_clone.clone(), conn, admitted);
+                    let outcome = pool_link(&mut pool_guard, &addr_clone, conn, admitted, receive);
                     let max = pool_guard.max_connections();
                     if !note_insert(&outcome, &addr_clone, "central", &stats, max) {
-                        // Not announced: there is no link behind the address,
-                        // and the node dialled it itself.
+                        // Not announced: the node dialled the address itself,
+                        // and either no link is behind it or the link already
+                        // there was announced when it was pooled.
                         return;
                     }
                     drop(pool_guard);
@@ -1036,6 +1075,11 @@ enum Admission {
     Decline(TransportAddr),
     /// The newcomer wins the tie-break: the link pooled at this address goes.
     Replace(TransportAddr),
+    /// The newcomer's address already holds a link claiming another node, or
+    /// none: keep it and drop the newcomer without announcing it. Unlike
+    /// `Decline`, nothing links the newcomer's claim to the kept link, so the
+    /// claim must not be reported at that link's address.
+    Occupied,
 }
 
 /// Arbitrate a newly identified link to `peer`, arriving at `ta`, against
@@ -1057,9 +1101,16 @@ enum Admission {
 /// first" leaves each side holding the channel the other just closed. The
 /// node ordering is shared; the arrival order is not.
 ///
-/// An unverified incumbent at the newcomer's own address is settled by the
-/// same rule inside the window and kept outside it, since the pool is keyed
-/// by link address and admitting the newcomer would replace it. Any other
+/// An incumbent at the newcomer's own address that claims another node, or
+/// none, is kept whatever its age or verification: the newcomer's claim is
+/// unproven and the incumbent may carry a session, and the pool is keyed by
+/// link address. The newcomer is refused as `Occupied`, never declined in
+/// favour of the incumbent, which would report the newcomer's node at a link
+/// that does not reach it.
+///
+/// An unverified incumbent at the newcomer's own address claiming the same
+/// node is settled by the same rule inside the window and kept outside it,
+/// since admitting the newcomer would replace it. Any other
 /// unverified incumbent — one in the same direction, which is a rotation
 /// rather than a race between the ends, or one older than the window —
 /// blocks nothing, and the newcomer is admitted beside it.
@@ -1073,6 +1124,12 @@ fn arbitrate<S>(
 ) -> Admission {
     if let Some(existing) = pool.find_verified(peer) {
         return Admission::Decline(existing);
+    }
+    if pool
+        .get(ta)
+        .is_some_and(|c| c.node_addr.as_ref() != Some(peer))
+    {
+        return Admission::Occupied;
     }
     let local_is_smaller = local < peer;
     let racing = |c: &BleConnection<S>| c.established_at.elapsed() < tie_window;
@@ -1124,6 +1181,9 @@ enum Dialled {
     /// Drop the dialled link. The peer stays on its incumbent, whose link
     /// address this is, read under the same guard as the decision.
     Decline(Option<BleAddr>),
+    /// Drop the dialled link without announcing it: its address already
+    /// holds a link claiming another node, or none.
+    Occupied,
 }
 
 /// Settle a link this side dialled at `ta` against the pool, under the
@@ -1168,14 +1228,24 @@ fn settle_dialled<S>(
             stats.record_duplicate_node_decline();
             Dialled::Decline(pool.get(&existing).map(|c| c.addr.clone()))
         }
+        Admission::Occupied => {
+            log_occupied(ta, "central");
+            Dialled::Occupied
+        }
     }
 }
 
-/// Start a link's writer and receive tasks and wrap it as a pool entry.
+/// Start a link's writer task and wrap it as a pool entry, returning the
+/// entry with its receive loop unstarted, for [`pool_link`] to start once
+/// the pool admits the link.
 ///
-/// The tasks are spawned before the entry is inserted, so callers that
-/// arbitrate do so and insert under one pool guard: a task cannot reap its
-/// entry until that guard is released, and dropping an entry aborts both.
+/// The writer is spawned before the entry is inserted, so callers that
+/// arbitrate do so and insert under one pool guard: it cannot reap its entry
+/// until that guard is released, and dropping an entry aborts it. It sends
+/// only what is queued on the entry, so a refused entry's writer sends
+/// nothing. The receive loop delivers packets under `ta` and removes `ta`
+/// from the pool when it ends, so it must not run for a link the pool
+/// refuses.
 #[allow(clippy::too_many_arguments)]
 fn spawn_connection<S: BleStream + 'static>(
     stream: Arc<S>,
@@ -1188,12 +1258,15 @@ fn spawn_connection<S: BleStream + 'static>(
     packet_tx: PacketTx,
     transport_id: TransportId,
     stats: &Arc<BleStats>,
-) -> BleConnection<Arc<S>> {
+) -> (
+    BleConnection<Arc<S>>,
+    impl std::future::Future<Output = ()> + Send + 'static,
+) {
     let send_mtu = stream.send_mtu();
     let recv_mtu = stream.recv_mtu();
     let admitted = tokio::time::Instant::now();
 
-    let recv_task = tokio::spawn(receive_loop(
+    let receive = receive_loop(
         reader,
         ta.clone(),
         Arc::clone(pool),
@@ -1201,7 +1274,7 @@ fn spawn_connection<S: BleStream + 'static>(
         transport_id,
         Arc::clone(stats),
         recv_mtu,
-    ));
+    );
 
     let (send_tx, send_rx) = tokio::sync::mpsc::channel(pool::SEND_QUEUE_DEPTH);
     let send_task = tokio::spawn(send_loop(
@@ -1212,11 +1285,11 @@ fn spawn_connection<S: BleStream + 'static>(
         Arc::clone(stats),
     ));
 
-    BleConnection {
+    let conn = BleConnection {
         stream,
         send_tx,
         send_task: Some(send_task),
-        recv_task: Some(recv_task),
+        recv_task: None,
         send_mtu,
         recv_mtu,
         established_at: admitted,
@@ -1225,7 +1298,8 @@ fn spawn_connection<S: BleStream + 'static>(
         outbound,
         addr,
         node_addr,
-    }
+    };
+    (conn, receive)
 }
 
 /// Report the outcome of offering a link to the pool, and whether it was
@@ -1241,8 +1315,9 @@ fn note_insert(
     stats: &BleStats,
     max: usize,
 ) -> bool {
-    let (Insert::Admitted { ended, .. } | Insert::Refused { ended, .. }) = outcome;
-    if let Some(n) = ended {
+    if let Insert::Admitted { ended, .. } | Insert::Refused { ended, .. } = outcome
+        && let Some(n) = ended
+    {
         info!(refused = n, "BLE pool refusal run ended");
     }
     match outcome {
@@ -1268,7 +1343,48 @@ fn note_insert(
             }
             false
         }
+        Insert::Occupied => {
+            log_occupied(ta, role);
+            false
+        }
     }
+}
+
+/// Log a link dropped because its address already holds one.
+///
+/// What the newcomer claims is unproven and the pooled link may carry a
+/// session, so the newcomer is dropped. Attacker input: debug only.
+fn log_occupied(ta: &TransportAddr, role: &'static str) {
+    debug!(
+        addr = %ta, role, outcome = "address-occupied",
+        "BLE link offered at an address already pooled, link dropped"
+    );
+}
+
+/// Offer a link to the pool, starting its receive loop only once it is pooled.
+///
+/// The loop delivers packets under `ta` and removes `ta` from the pool when it
+/// ends, so a loop started for a link the pool then refuses would act on the
+/// link that holds the address. `receive` is the loop's unstarted future: it
+/// is spawned under the caller's guard, and its handle is kept on the pooled
+/// link, whose drop stops it. A refused link drops it unstarted.
+fn pool_link<S, F>(
+    pool: &mut ConnectionPool<S>,
+    ta: &TransportAddr,
+    conn: BleConnection<S>,
+    now: tokio::time::Instant,
+    receive: F,
+) -> Insert
+where
+    F: std::future::Future<Output = ()> + Send + 'static,
+{
+    let outcome = pool.insert(ta.clone(), conn, now);
+    if matches!(outcome, Insert::Admitted { .. })
+        && let Some(conn) = pool.get_mut(ta)
+    {
+        conn.recv_task = Some(tokio::spawn(receive));
+    }
+    outcome
 }
 
 /// Exchange public keys over a newly established L2CAP connection.
@@ -1529,10 +1645,17 @@ async fn admit_inbound<S>(
             stats.record_duplicate_link_replacement();
             addr.clone()
         }
+        Admission::Occupied => {
+            drop(pool_guard);
+            // Not announced: the link already at the address was announced
+            // when it was pooled.
+            log_occupied(&ta, "peripheral");
+            return;
+        }
         Admission::Admit => addr.clone(),
     };
 
-    let conn = spawn_connection(
+    let (conn, receive) = spawn_connection(
         stream,
         reader,
         &ta,
@@ -1546,10 +1669,11 @@ async fn admit_inbound<S>(
     );
 
     let admitted = conn.established_at;
-    let outcome = pool_guard.insert(ta.clone(), conn, admitted);
+    let outcome = pool_link(&mut pool_guard, &ta, conn, admitted, receive);
     let max = pool_guard.max_connections();
     if !note_insert(&outcome, &ta, "peripheral", &stats, max) {
-        // Not announced: there is no link behind the address.
+        // Not announced: there is no link behind this inbound, and a link
+        // already at the address was announced when it was pooled.
         return;
     }
     drop(pool_guard);
@@ -1697,6 +1821,11 @@ impl PendingProbes {
         self.entries.iter().position(|e| &e.addr == addr)
     }
 
+    /// Whether `addr` is in the book.
+    fn contains(&self, addr: &BleAddr) -> bool {
+        self.position(addr).is_some()
+    }
+
     /// Record a sighting. A previously unseen address becomes immediately
     /// eligible; a known one keeps whatever backoff it has earned, so a
     /// scanner that re-reports the same address many times a second cannot
@@ -1775,6 +1904,22 @@ impl PendingProbes {
     }
 }
 
+/// Log the addresses an address memory forgot to stay within its bound.
+fn log_evicted(evicted: Vec<BleAddr>) {
+    for addr in evicted {
+        debug!(
+            addr = %addr, bound = recall::MAX_RECALLED_ADDRS, outcome = "recall-evicted",
+            "BLE probe memory full, forgot the oldest address not in use"
+        );
+    }
+}
+
+/// Whether the probe loop still depends on what it learned about `addr`: a
+/// link is pooled there, or the address is in the retry book.
+fn is_live<S>(pool: &ConnectionPool<S>, pending: &PendingProbes, addr: &BleAddr) -> bool {
+    pending.contains(addr) || pool.contains(&addr.to_transport_addr())
+}
+
 /// Combined scan + probe loop.
 ///
 /// Scanner events arrive continuously (both sides advertise continuously).
@@ -1801,6 +1946,7 @@ async fn scan_probe_loop<I: io::BleIo>(
     connect_timeout_ms: u64,
     cooldown_secs: u64,
     learned_psm: LearnedPsm,
+    known_node_of: KnownNodes,
     packet_tx: PacketTx,
     transport_id: TransportId,
 ) {
@@ -1810,14 +1956,6 @@ async fn scan_probe_loop<I: io::BleIo>(
     // an address leaves the book the moment it reaches a conclusive outcome,
     // after which the pool and `known_node_of` guards below cover it.
     let mut pending = PendingProbes::new(std::time::Duration::from_secs(cooldown_secs));
-    // Link addresses already resolved to a node identity by a completed pubkey
-    // exchange that was declined beside another link to that node. Lets the
-    // loop skip an address it has *already* learned belongs to a peer it is
-    // connected to, instead of paying a full connect and exchange to
-    // rediscover that every cooldown. Rotation means this grows by one per
-    // rotation, so entries are dropped once their node no longer holds a
-    // verified link: a peer that genuinely goes away is probed again normally.
-    let mut known_node_of: HashMap<BleAddr, NodeAddr> = HashMap::new();
     let retry_interval = tokio::time::interval(std::time::Duration::from_secs(cooldown_secs));
     tokio::pin!(retry_interval);
     retry_interval.tick().await; // consume initial tick
@@ -1830,10 +1968,13 @@ async fn scan_probe_loop<I: io::BleIo>(
                     Some(advert) => {
                         if let Some(psm) = advert.psm {
                             trace!(addr = %advert.addr, psm, "BLE scan: learned peer PSM");
-                            learned_psm
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .insert(advert.addr.clone(), psm);
+                            let pool_guard = pool.lock().await;
+                            log_evicted(recall(&learned_psm).note(
+                                &advert.addr,
+                                psm,
+                                tokio::time::Instant::now(),
+                                |a| is_live(&pool_guard, &pending, a),
+                            ));
                         }
                         advert.addr
                     }
@@ -1847,6 +1988,12 @@ async fn scan_probe_loop<I: io::BleIo>(
                 // Re-probe pending addresses that aren't connected
                 let pool_guard = pool.lock().await;
                 pending.drop_connected(|a| pool_guard.contains(&a.to_transport_addr()));
+                {
+                    let now = tokio::time::Instant::now();
+                    let live = |a: &BleAddr| is_live(&pool_guard, &pending, a);
+                    recall(&known_node_of).prune(now, live);
+                    recall(&learned_psm).prune(now, live);
+                }
                 drop(pool_guard);
                 // Rotating rather than always taking the head is what stops one
                 // slow or dead address from starving every other pending one.
@@ -1882,19 +2029,28 @@ async fn scan_probe_loop<I: io::BleIo>(
         // to. Without this the loop re-dials every rotated address of a live
         // peer once per cooldown, forever: the duplicate is declined so it
         // never enters the pool, so the pool-keyed guard above never sees it.
-        if let Some(node) = known_node_of.get(&addr) {
+        let known = recall(&known_node_of).get(&addr).copied();
+        if let Some(node) = known {
             // Only a verified link justifies the skip: an unverified claim to
             // the node must not hide the node's own address.
             let still_connected = {
                 let pool_guard = pool.lock().await;
-                pool_guard.find_verified(node).is_some()
+                let held = pool_guard.find_verified(&node).is_some();
+                if held {
+                    // Still in use: seen now.
+                    pending.resolve(&addr);
+                    log_evicted(
+                        recall(&known_node_of)
+                            .note(&addr, node, now, |a| is_live(&pool_guard, &pending, a)),
+                    );
+                }
+                held
             };
             if still_connected {
-                pending.resolve(&addr);
                 continue;
             }
             // That peer is gone — forget the mapping and probe normally.
-            known_node_of.remove(&addr);
+            recall(&known_node_of).remove(&addr);
         }
 
         // Record probe time (before attempt, so cooldown applies on failure too)
@@ -1982,7 +2138,15 @@ async fn scan_probe_loop<I: io::BleIo>(
                         // Remember what this address resolved to, so the next
                         // cooldown skips it outright rather than paying another
                         // connect and exchange to reach the same conclusion.
-                        known_node_of.insert(addr.clone(), peer_node);
+                        {
+                            let pool_guard = pool.lock().await;
+                            log_evicted(recall(&known_node_of).note(
+                                &addr,
+                                peer_node,
+                                tokio::time::Instant::now(),
+                                |a| is_live(&pool_guard, &pending, a),
+                            ));
+                        }
                         // Report the peer under the address its live link is on,
                         // so the node layer is not handed an alias with no
                         // connection behind it.
@@ -2003,11 +2167,22 @@ async fn scan_probe_loop<I: io::BleIo>(
                         );
                         stats.record_duplicate_link_replacement();
                     }
+                    Admission::Occupied => {
+                        // A link landed at the address during the probe and
+                        // was announced when it was pooled. Conclusive, as
+                        // the already-pooled skip above is, and nothing is
+                        // learned.
+                        drop(pool_guard);
+                        log_occupied(&ta, "central");
+                        pending.resolve(&addr);
+                        continue;
+                    }
                     Admission::Admit => {}
                 }
 
-                // Promote connection to pool — no second L2CAP connect needed
-                let conn = spawn_connection(
+                // Promote connection to pool — no second L2CAP connect needed.
+                // Its receive loop starts only once it is pooled.
+                let (conn, receive) = spawn_connection(
                     stream,
                     reader,
                     &ta,
@@ -2021,8 +2196,17 @@ async fn scan_probe_loop<I: io::BleIo>(
                 );
 
                 let admitted = conn.established_at;
-                let outcome = pool_guard.insert(ta.clone(), conn, admitted);
+                let outcome = pool_link(&mut pool_guard, &ta, conn, admitted, receive);
                 let max = pool_guard.max_connections();
+                if outcome == Insert::Occupied {
+                    // A link landed at the address during the probe and was
+                    // announced when it was pooled. Conclusive, as the
+                    // already-pooled skip above is, and nothing is learned.
+                    let _ = note_insert(&outcome, &ta, "central", &stats, max);
+                    drop(pool_guard);
+                    pending.resolve(&addr);
+                    continue;
+                }
                 if !note_insert(&outcome, &ta, "central", &stats, max) {
                     // The connection is dropped with `conn`, so there is
                     // nothing to report and nothing to resolve. Leaving the
@@ -3252,11 +3436,12 @@ mod tests {
         // directly: the loop's own probe of that advert is refused by this
         // mock and would forget it again, and the loop is not what is under
         // test here.
-        transport
-            .learned_psm
-            .lock()
-            .unwrap()
-            .insert(test_addr(2), 0x00C1);
+        let _ = transport.learned_psm.lock().unwrap().note(
+            &test_addr(2),
+            0x00C1,
+            tokio::time::Instant::now(),
+            |_| false,
+        );
 
         transport
             .connect_async(&test_addr(2).to_transport_addr())
@@ -3376,13 +3561,22 @@ mod tests {
         transport.start_async().await.unwrap();
 
         let learned = Arc::clone(&transport.learned_psm);
-        learned.lock().unwrap().insert(test_addr(2), 0x00C1);
+        let _ = learned.lock().unwrap().note(
+            &test_addr(2),
+            0x00C1,
+            tokio::time::Instant::now(),
+            |_| false,
+        );
         {
             let learned = Arc::clone(&learned);
             transport.io.set_connect_handler(move |addr, psm| {
                 dials.lock().unwrap().push((addr.clone(), psm));
                 // The peer re-advertised on a new PSM meanwhile.
-                learned.lock().unwrap().insert(addr.clone(), 0x00C2);
+                let _ =
+                    learned
+                        .lock()
+                        .unwrap()
+                        .note(addr, 0x00C2, tokio::time::Instant::now(), |_| false);
                 Err(TransportError::ConnectionRefused)
             });
         }
@@ -5010,5 +5204,788 @@ mod tests {
             }
             transport.stop_async().await.unwrap();
         }
+    }
+
+    // ------------------------------------------------------------------
+    // A link landing at an address that already holds one
+    // ------------------------------------------------------------------
+
+    /// Start an inbound from `from` and wait until the transport has sent its
+    /// half of the key exchange. The remote's half is held back; the returned
+    /// end must be kept alive, or the link closes.
+    async fn held_inbound(transport: &BleTransport<MockBleIo>, from: &BleAddr) -> MockBleStream {
+        let (ours, theirs) = MockBleStream::pair(test_addr(1), from.clone(), 2048);
+        transport.io.inject_inbound(ours).await;
+        let mut buf = [0u8; PUBKEY_EXCHANGE_SIZE];
+        let n = tokio::time::timeout(std::time::Duration::from_secs(5), theirs.recv(&mut buf))
+            .await
+            .expect("the transport starts the inbound's key exchange")
+            .unwrap();
+        assert_eq!(n, PUBKEY_EXCHANGE_SIZE);
+        theirs
+    }
+
+    /// Send the remote's half of the key exchange, claiming `claim`.
+    async fn release_claim(theirs: &MockBleStream, claim: &[u8; 32]) {
+        let mut msg = [0u8; PUBKEY_EXCHANGE_SIZE];
+        msg[0] = PUBKEY_EXCHANGE_PREFIX;
+        msg[1..].copy_from_slice(claim);
+        theirs.send(&msg).await.unwrap();
+    }
+
+    /// A transport holding the largest of three keys, whose every dial is
+    /// answered claiming the middle one, with a dial to `x` pooled while an
+    /// inbound from `x` waits on its exchange. Returns the transport, the
+    /// held inbound's remote end, and the smallest and middle keys.
+    async fn dial_lands_beside_a_held_inbound(
+        x: &BleAddr,
+    ) -> (BleTransport<MockBleIo>, MockBleStream, [u8; 32], [u8; 32]) {
+        let keys = pubkeys_by_node_addr(3);
+        let (p, q, ours) = (keys[0], keys[1], keys[2]);
+        let (mut transport, dials) = answering_transport(ours, q, identity_test_config());
+        transport.start_async().await.unwrap();
+
+        let inbound = held_inbound(&transport, x).await;
+        transport
+            .connect_async(&x.to_transport_addr())
+            .await
+            .unwrap();
+        wait_for("the dial to land at the address", || pooled(&transport, x)).await;
+        assert_eq!(dial_count(&dials, x), 1);
+        assert_eq!(claim_at(&transport, x).await, Some(node_of(&q)));
+        let _ = transport.neighbor_buffer.take();
+        (transport, inbound, p, q)
+    }
+
+    /// An inbound whose exchange completes after a dial landed at the same
+    /// address must not replace the dialled link, nor be announced.
+    #[tokio::test]
+    async fn an_inbound_completing_after_a_dial_landed_at_its_address_does_not_replace_it() {
+        let x = test_addr(5);
+        let (mut transport, inbound, p, q) = dial_lands_beside_a_held_inbound(&x).await;
+
+        release_claim(&inbound, &p).await;
+        // Decided when the refused inbound's link closes; on the defect it
+        // stays open, pooled over the dialled link.
+        let mut buf = [0u8; 64];
+        let closed =
+            tokio::time::timeout(std::time::Duration::from_secs(2), inbound.recv(&mut buf)).await;
+
+        assert_eq!(
+            claim_at(&transport, &x).await,
+            Some(node_of(&q)),
+            "the inbound replaced the dialled link at its address"
+        );
+        assert!(
+            matches!(closed, Ok(Ok(0))),
+            "the inbound at the occupied address is dropped: {closed:?}"
+        );
+        let announced = transport.neighbor_buffer.take();
+        assert!(
+            announced
+                .iter()
+                .all(|d| d.pubkey_hint.map(|k| NodeAddr::from_pubkey(&k)) != Some(node_of(&p))),
+            "the refused inbound's claim is not announced: {announced:?}"
+        );
+        transport.stop_async().await.unwrap();
+    }
+
+    /// A newcomer at an occupied address that closes as soon as its exchange
+    /// is done must leave the link already pooled there in place.
+    #[tokio::test]
+    async fn a_newcomer_at_an_occupied_address_that_closes_at_once_leaves_the_incumbent_pooled() {
+        let x = test_addr(5);
+        let (mut transport, inbound, p, q) = dial_lands_beside_a_held_inbound(&x).await;
+
+        release_claim(&inbound, &p).await;
+        drop(inbound);
+
+        let emptied = eventually(|| unpooled(&transport, &x)).await;
+        assert!(
+            !emptied,
+            "the address no longer holds the dialled link after the newcomer closed"
+        );
+        assert_eq!(claim_at(&transport, &x).await, Some(node_of(&q)));
+        {
+            let pool = transport.pool.lock().await;
+            let task = pool
+                .get(&x.to_transport_addr())
+                .and_then(|c| c.recv_task.as_ref());
+            assert!(
+                task.is_some_and(|t| !t.is_finished()),
+                "the dialled link's receive loop still runs"
+            );
+        }
+        transport.stop_async().await.unwrap();
+    }
+
+    /// A newcomer at an occupied address that sends an FMP frame right after
+    /// its key exchange must have none of its frames delivered under the
+    /// incumbent's address: its receive loop may start only once it is
+    /// pooled, and it never is.
+    #[tokio::test]
+    async fn a_refused_newcomers_frame_is_never_delivered_under_the_incumbents_address() {
+        let keys = pubkeys_by_node_addr(3);
+        let (p, q, ours) = (keys[0], keys[1], keys[2]);
+        let io = MockBleIo::new("hci0", test_addr(1));
+        let (peer_tx, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
+        io.set_connect_handler(move |addr, _psm| {
+            let (mine, theirs) = MockBleStream::pair(test_addr(1), addr.clone(), 2048);
+            peer_tx
+                .send(theirs)
+                .map_err(|_| TransportError::ConnectionRefused)?;
+            Ok(mine)
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut transport =
+            BleTransport::new(TransportId::new(1), None, identity_test_config(), io, tx);
+        transport.set_local_pubkey(ours);
+        transport.start_async().await.unwrap();
+
+        let x = test_addr(5);
+        let inbound = held_inbound(&transport, &x).await;
+        transport
+            .connect_async(&x.to_transport_addr())
+            .await
+            .unwrap();
+        let dialled = tokio::time::timeout(std::time::Duration::from_secs(5), peer_rx.recv())
+            .await
+            .expect("the dial reaches the remote")
+            .unwrap();
+        peer_side_exchange(&dialled, &q).await;
+        wait_for("the dial to land at the address", || pooled(&transport, &x)).await;
+        assert_eq!(claim_at(&transport, &x).await, Some(node_of(&q)));
+
+        // Hold the pool so the newcomer finishes its exchange, sends its
+        // frame and queues at its duplicate check; then queue a second
+        // holder behind it. The pool lock is first come, first served, so
+        // the newcomer's insert waits behind that holder, after the point
+        // where a receive loop spawned early would already be reading.
+        {
+            let held = transport.hold_pool().await;
+            release_claim(&inbound, &p).await;
+            inbound.send(&build_established_frame(24)).await.unwrap();
+            for _ in 0..20 {
+                settle().await;
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            let pool = Arc::clone(&transport.pool);
+            tokio::spawn(async move {
+                let g = pool.lock().await;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                drop(g);
+            });
+            settle().await;
+            drop(held);
+        }
+        for _ in 0..20 {
+            settle().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        assert_eq!(claim_at(&transport, &x).await, Some(node_of(&q)));
+        let leaked = rx.try_recv();
+        assert!(
+            leaked.is_err(),
+            "a frame from the refused newcomer was delivered under {x}: {leaked:?}"
+        );
+        drop(dialled);
+        transport.stop_async().await.unwrap();
+    }
+
+    /// A dial whose remote sends an FMP frame right after its key exchange,
+    /// completing after an inbound landed at the dialled address, must have
+    /// none of its frames delivered under the incumbent's address: the
+    /// dial's receive loop may start only once it is pooled, and it never is.
+    #[tokio::test]
+    async fn a_refused_dials_frame_is_never_delivered_under_the_incumbents_address() {
+        let keys = pubkeys_by_node_addr(3);
+        // Q < ours: the inbound from Q is kept by the inbound tie-breaker.
+        let (q, ours, p) = (keys[0], keys[1], keys[2]);
+        let io = MockBleIo::new("hci0", test_addr(1));
+        let (peer_tx, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
+        io.set_connect_handler(move |addr, _psm| {
+            let (mine, theirs) = MockBleStream::pair(test_addr(1), addr.clone(), 2048);
+            peer_tx
+                .send(theirs)
+                .map_err(|_| TransportError::ConnectionRefused)?;
+            Ok(mine)
+        });
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut transport =
+            BleTransport::new(TransportId::new(1), None, identity_test_config(), io, tx);
+        transport.set_local_pubkey(ours);
+        transport.start_async().await.unwrap();
+
+        let x = test_addr(5);
+        // The dial starts while the address is free.
+        transport
+            .connect_async(&x.to_transport_addr())
+            .await
+            .unwrap();
+        let dialled = tokio::time::timeout(std::time::Duration::from_secs(5), peer_rx.recv())
+            .await
+            .expect("the dial reaches the remote")
+            .unwrap();
+        // An inbound claiming Q lands at the address first.
+        let _inbound = dial_in(&transport, &x, &q).await;
+        wait_for("the inbound to land at the address", || {
+            pooled(&transport, &x)
+        })
+        .await;
+        assert_eq!(claim_at(&transport, &x).await, Some(node_of(&q)));
+
+        // Hold the pool while the dial's remote finishes its exchange as P
+        // and sends a frame at once; the dial then waits on the pool.
+        {
+            let held = transport.hold_pool().await;
+            peer_side_exchange(&dialled, &p).await;
+            dialled.send(&build_established_frame(24)).await.unwrap();
+            for _ in 0..20 {
+                settle().await;
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            drop(held);
+        }
+        for _ in 0..20 {
+            settle().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        assert_eq!(claim_at(&transport, &x).await, Some(node_of(&q)));
+        let leaked = rx.try_recv();
+        assert!(
+            leaked.is_err(),
+            "a frame from the refused dial was delivered under {x}: {leaked:?}"
+        );
+        drop(dialled);
+        transport.stop_async().await.unwrap();
+    }
+
+    /// The probe twin: a probe whose remote sends an FMP frame right after
+    /// its key exchange, completing after an inbound landed at the probed
+    /// address, must have none of its frames delivered under the incumbent's
+    /// address.
+    #[tokio::test]
+    async fn a_refused_probes_frame_is_never_delivered_under_the_incumbents_address() {
+        let keys = pubkeys_by_node_addr(3);
+        // Q < ours < P on both tie-breakers: the inbound from Q is kept, and
+        // the probe answered by P reaches the pool rather than yielding.
+        let (q, ours, p) = (keys[0], keys[1], keys[2]);
+        let io = MockBleIo::new("hci0", test_addr(1));
+        let (peer_tx, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
+        io.set_connect_handler(move |addr, _psm| {
+            let (mine, theirs) = MockBleStream::pair(test_addr(1), addr.clone(), 2048);
+            peer_tx
+                .send(theirs)
+                .map_err(|_| TransportError::ConnectionRefused)?;
+            Ok(mine)
+        });
+        let config = BleConfig {
+            scan: Some(true),
+            ..identity_test_config()
+        };
+        let (tx, mut rx) = tokio::sync::mpsc::channel(64);
+        let mut transport = BleTransport::new(TransportId::new(1), None, config, io, tx);
+        transport.set_local_pubkey(ours);
+        transport.start_async().await.unwrap();
+
+        let x = test_addr(5);
+        // The probe starts while the address is free.
+        transport.io.inject_scan_result(x.clone()).await;
+        let probed = tokio::time::timeout(std::time::Duration::from_secs(5), peer_rx.recv())
+            .await
+            .expect("the probe reaches the remote")
+            .unwrap();
+        // An inbound claiming Q lands at the address first.
+        let _inbound = dial_in(&transport, &x, &q).await;
+        wait_for("the inbound to land at the address", || {
+            pooled(&transport, &x)
+        })
+        .await;
+        assert_eq!(claim_at(&transport, &x).await, Some(node_of(&q)));
+
+        // Hold the pool while the probe's remote finishes its exchange as P
+        // and sends a frame at once; the probe then queues at its duplicate
+        // check. Queue a second holder behind it: the pool lock is first
+        // come, first served, so the probe's insert waits behind that
+        // holder, after the point where a receive loop spawned early would
+        // already be reading.
+        {
+            let held = transport.hold_pool().await;
+            peer_side_exchange(&probed, &p).await;
+            probed.send(&build_established_frame(24)).await.unwrap();
+            for _ in 0..20 {
+                settle().await;
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            let pool = Arc::clone(&transport.pool);
+            tokio::spawn(async move {
+                let g = pool.lock().await;
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                drop(g);
+            });
+            settle().await;
+            drop(held);
+        }
+        for _ in 0..20 {
+            settle().await;
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        assert_eq!(claim_at(&transport, &x).await, Some(node_of(&q)));
+        let leaked = rx.try_recv();
+        assert!(
+            leaked.is_err(),
+            "a frame from the refused probe was delivered under {x}: {leaked:?}"
+        );
+        drop(probed);
+        transport.stop_async().await.unwrap();
+    }
+
+    /// Collect announcements for a few seconds of the transport's clock and
+    /// report whether any of them names `node`.
+    async fn announces(transport: &BleTransport<MockBleIo>, node: NodeAddr) -> bool {
+        let mut seen = Vec::new();
+        eventually(|| {
+            seen.extend(transport.neighbor_buffer.take());
+            seen.iter()
+                .any(|d| d.pubkey_hint.map(|k| NodeAddr::from_pubkey(&k)) == Some(node))
+        })
+        .await
+    }
+
+    /// A dial whose exchange completes after an inbound landed at the dialled
+    /// address leaves the inbound in place and does not announce its claim.
+    #[tokio::test(start_paused = true)]
+    async fn a_dial_completing_at_an_address_an_inbound_holds_is_dropped_unannounced() {
+        let keys = pubkeys_by_node_addr(3);
+        let (p, q, ours) = (keys[0], keys[1], keys[2]);
+        let x = test_addr(5);
+        let open = Arc::new(tokio::sync::Notify::new());
+        let gate = Some((x.clone(), Arc::clone(&open)));
+        let (mut transport, dials) = gated_transport(ours, p, identity_test_config(), gate);
+        transport.start_async().await.unwrap();
+
+        transport
+            .connect_async(&x.to_transport_addr())
+            .await
+            .unwrap();
+        wait_for("the dial", || dial_count(&dials, &x) == 1).await;
+        let _inbound = dial_in(&transport, &x, &q).await;
+        wait_for("the inbound to land at the address", || {
+            pooled(&transport, &x)
+        })
+        .await;
+        assert_eq!(claim_at(&transport, &x).await, Some(node_of(&q)));
+        transport.neighbor_buffer.take();
+
+        open.notify_one();
+        assert!(
+            !announces(&transport, node_of(&p)).await,
+            "the dial refused at an occupied address announced its claim"
+        );
+        assert_eq!(claim_at(&transport, &x).await, Some(node_of(&q)));
+        transport.stop_async().await.unwrap();
+    }
+
+    /// A probe whose exchange completes after an inbound landed at the probed
+    /// address leaves the inbound in place and does not announce its claim.
+    #[tokio::test(start_paused = true)]
+    async fn a_probe_completing_at_an_address_an_inbound_holds_is_dropped_unannounced() {
+        let keys = pubkeys_by_node_addr(3);
+        // Q < ours < P on both tie-breakers: the inbound from Q is kept, and
+        // the probe answered by P reaches the pool rather than yielding.
+        let (q, ours, p) = (keys[0], keys[1], keys[2]);
+        let x = test_addr(5);
+        let config = BleConfig {
+            scan: Some(true),
+            ..identity_test_config()
+        };
+        let open = Arc::new(tokio::sync::Notify::new());
+        let gate = Some((x.clone(), Arc::clone(&open)));
+        let (mut transport, dials) = gated_transport(ours, p, config, gate);
+        transport.start_async().await.unwrap();
+
+        transport.io.inject_scan_result(x.clone()).await;
+        wait_for("the probe's dial", || dial_count(&dials, &x) == 1).await;
+        let _inbound = dial_in(&transport, &x, &q).await;
+        wait_for("the inbound to land at the address", || {
+            pooled(&transport, &x)
+        })
+        .await;
+        assert_eq!(claim_at(&transport, &x).await, Some(node_of(&q)));
+        transport.neighbor_buffer.take();
+
+        open.notify_one();
+        assert!(
+            !announces(&transport, node_of(&p)).await,
+            "the probe refused at an occupied address announced its claim"
+        );
+        assert_eq!(claim_at(&transport, &x).await, Some(node_of(&q)));
+        transport.stop_async().await.unwrap();
+    }
+
+    // ------------------------------------------------------------------
+    // The probe loop's memory of addresses it has seen
+    // ------------------------------------------------------------------
+
+    /// One of a flood of distinct link addresses.
+    fn flood_addr(i: u16) -> BleAddr {
+        let [hi, lo] = i.to_be_bytes();
+        BleAddr {
+            adapter: "hci0".to_string(),
+            device: [0x20, 0x00, 0x00, 0x00, hi, lo],
+        }
+    }
+
+    /// Distinct addresses in each probe-memory flood: far more than any
+    /// bound the memory could reasonably have.
+    const FLOOD: u16 = 1_000;
+
+    /// A peer that advertised its PSM once, connected and went away is not
+    /// live, so a flood of new advertising addresses must not leave its PSM
+    /// remembered for ever: an unbounded memory keeps every one of them.
+    #[tokio::test]
+    async fn a_departed_peers_learned_psm_is_not_kept_through_a_thousand_new_advertising_addresses()
+    {
+        let keys = pubkeys_by_node_addr(2);
+        let (ours, peer) = (keys[0], keys[1]);
+        let a = test_addr(2);
+        let io = MockBleIo::new("hci0", test_addr(1));
+        let dials: DialLog = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (peer_tx, mut peer_rx) = tokio::sync::mpsc::unbounded_channel();
+        {
+            let dials = Arc::clone(&dials);
+            let a = a.clone();
+            io.set_connect_handler(move |addr, psm| {
+                dials.lock().unwrap().push((addr.clone(), psm));
+                let (mine, theirs) = MockBleStream::pair(test_addr(1), addr.clone(), 2048);
+                if *addr == a {
+                    peer_tx
+                        .send(theirs)
+                        .map_err(|_| TransportError::ConnectionRefused)?;
+                }
+                // Every other remote hangs up at once, so its exchange fails
+                // and nothing is pooled.
+                Ok(mine)
+            });
+        }
+        let config = BleConfig {
+            scan: Some(true),
+            accept_connections: Some(false),
+            ..identity_test_config()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut transport = BleTransport::new(TransportId::new(1), None, config, io, tx);
+        transport.set_local_pubkey(ours);
+        transport.start_async().await.unwrap();
+
+        // The peer advertises its PSM once, is probed and pooled, then leaves.
+        transport
+            .io
+            .inject_scan_advert(io::ScanAdvert::with_psm(a.clone(), 0x00C1))
+            .await;
+        let theirs = tokio::time::timeout(std::time::Duration::from_secs(5), peer_rx.recv())
+            .await
+            .expect("the peer is probed")
+            .unwrap();
+        peer_side_exchange(&theirs, &peer).await;
+        wait_for("the peer to be pooled", || pooled(&transport, &a)).await;
+        drop(theirs);
+        wait_for("the peer's link to close", || unpooled(&transport, &a)).await;
+
+        for i in 0..FLOOD {
+            transport
+                .io
+                .inject_scan_advert(io::ScanAdvert::with_psm(flood_addr(i), 0x00C3))
+                .await;
+        }
+        let stats = Arc::clone(&transport.stats);
+        wait_for("every flood address to be probed", || {
+            stats.snapshot().pubkey_exchange_failures >= u64::from(FLOOD)
+        })
+        .await;
+
+        // The departed peer is seen again by a scan that carries no PSM.
+        transport.io.inject_scan_result(a.clone()).await;
+        let redial = {
+            let dials = Arc::clone(&dials);
+            let a = a.clone();
+            move || {
+                dials
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .filter(|(d, _)| *d == a)
+                    .count()
+                    >= 2
+            }
+        };
+        wait_for("the departed peer to be probed again", redial).await;
+        let psms: Vec<u16> = dials
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(d, _)| *d == a)
+            .map(|(_, psm)| *psm)
+            .collect();
+        assert_eq!(
+            psms,
+            vec![0x00C1, DEFAULT_PSM],
+            "the probe memory still held the departed peer's PSM after {FLOOD} newer \
+             advertising addresses"
+        );
+        transport.stop_async().await.unwrap();
+    }
+
+    /// An address the probe declined beside its node's verified link is
+    /// remembered so it is not probed again; a flood of new declined
+    /// addresses must not leave every one of them remembered for ever.
+    #[tokio::test]
+    async fn an_old_declined_address_is_not_remembered_through_a_thousand_new_declined_addresses() {
+        let keys = pubkeys_by_node_addr(2);
+        let (ours, n) = (keys[0], keys[1]);
+        let (mut transport, dials) = scanning_transport(ours, n, false);
+        transport.start_async().await.unwrap();
+
+        // The node's verified link, at address 2.
+        transport.io.inject_scan_result(test_addr(2)).await;
+        wait_for("the node's link to be pooled", || {
+            pooled(&transport, &test_addr(2))
+        })
+        .await;
+        transport
+            .mark_verified(&test_addr(2).to_transport_addr(), &node_of(&n))
+            .await;
+
+        // Address 3 claims the same node and is declined, and remembered.
+        let a = test_addr(3);
+        transport.io.inject_scan_result(a.clone()).await;
+        let stats = Arc::clone(&transport.stats);
+        wait_for("the first decline", || {
+            stats.snapshot().duplicate_node_declines == 1
+        })
+        .await;
+
+        for i in 0..FLOOD {
+            transport.io.inject_scan_result(flood_addr(i)).await;
+        }
+        wait_for("every flood address to be declined", || {
+            stats.snapshot().duplicate_node_declines == 1 + u64::from(FLOOD)
+        })
+        .await;
+
+        // Address 3 is seen again. A bounded memory has forgotten it among
+        // the thousand newer ones, so it is probed (and declined) again.
+        transport.io.inject_scan_result(a.clone()).await;
+        let redialled = eventually(|| dial_count(&dials, &a) == 2).await;
+        assert!(
+            redialled,
+            "the probe memory still remembered the old declined address after {FLOOD} \
+             newer declined addresses, so it was skipped without a dial"
+        );
+        transport.stop_async().await.unwrap();
+    }
+
+    /// A probing transport holding `ours`, whose dials to `peer_at` hand the
+    /// remote end to the returned receiver and whose every other dial is
+    /// hung up at once, so its exchange fails and nothing is pooled.
+    fn psm_flood_transport(
+        ours: [u8; 32],
+        peer_at: &BleAddr,
+    ) -> (
+        BleTransport<MockBleIo>,
+        tokio::sync::mpsc::UnboundedReceiver<MockBleStream>,
+    ) {
+        let io = MockBleIo::new("hci0", test_addr(1));
+        let (peer_tx, peer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let peer_at = peer_at.clone();
+        io.set_connect_handler(move |addr, _psm| {
+            let (mine, theirs) = MockBleStream::pair(test_addr(1), addr.clone(), 2048);
+            if *addr == peer_at {
+                peer_tx
+                    .send(theirs)
+                    .map_err(|_| TransportError::ConnectionRefused)?;
+            }
+            Ok(mine)
+        });
+        let config = BleConfig {
+            scan: Some(true),
+            accept_connections: Some(false),
+            ..identity_test_config()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        let mut transport = BleTransport::new(TransportId::new(1), None, config, io, tx);
+        transport.set_local_pubkey(ours);
+        (transport, peer_rx)
+    }
+
+    /// Advertise each of `FLOOD` new addresses with a PSM and wait until
+    /// every one has been probed and has failed its exchange.
+    async fn flood_psm_adverts(transport: &BleTransport<MockBleIo>) {
+        let before = transport.stats.snapshot().pubkey_exchange_failures;
+        for i in 0..FLOOD {
+            transport
+                .io
+                .inject_scan_advert(io::ScanAdvert::with_psm(flood_addr(i), 0x00C3))
+                .await;
+        }
+        let stats = Arc::clone(&transport.stats);
+        wait_for("every flood address to be probed", || {
+            stats.snapshot().pubkey_exchange_failures >= before + u64::from(FLOOD)
+        })
+        .await;
+    }
+
+    /// Advertisements from ever new addresses whose exchanges fail must not
+    /// grow the probe memory past its bound on non-live addresses, plus the
+    /// retry book's addresses, which are live.
+    #[tokio::test]
+    async fn advertisements_from_ever_new_addresses_do_not_grow_the_probe_memory_past_its_bound() {
+        let keys = pubkeys_by_node_addr(1);
+        let (mut transport, _peer_rx) = psm_flood_transport(keys[0], &test_addr(2));
+        transport.start_async().await.unwrap();
+
+        flood_psm_adverts(&transport).await;
+
+        let remembered = recall(&transport.learned_psm).len();
+        assert!(
+            remembered <= recall::MAX_RECALLED_ADDRS + MAX_PENDING_PROBES,
+            "the probe memory holds {remembered} PSMs after {FLOOD} new advertising addresses"
+        );
+        transport.stop_async().await.unwrap();
+    }
+
+    /// A pooled peer is live, so a flood of new advertising addresses must
+    /// not cost it the PSM it advertised.
+    #[tokio::test]
+    async fn a_pooled_peers_learned_psm_survives_an_address_flood() {
+        let keys = pubkeys_by_node_addr(2);
+        let (ours, peer) = (keys[0], keys[1]);
+        let a = test_addr(2);
+        let (mut transport, mut peer_rx) = psm_flood_transport(ours, &a);
+        transport.start_async().await.unwrap();
+
+        transport
+            .io
+            .inject_scan_advert(io::ScanAdvert::with_psm(a.clone(), 0x00C1))
+            .await;
+        let theirs = tokio::time::timeout(std::time::Duration::from_secs(5), peer_rx.recv())
+            .await
+            .expect("the peer is probed")
+            .unwrap();
+        peer_side_exchange(&theirs, &peer).await;
+        wait_for("the peer to be pooled", || pooled(&transport, &a)).await;
+
+        flood_psm_adverts(&transport).await;
+
+        assert!(pooled(&transport, &a), "the peer's link is still pooled");
+        assert_eq!(
+            recall(&transport.learned_psm).get(&a).copied(),
+            Some(0x00C1),
+            "the pooled peer's learned PSM was lost to the flood"
+        );
+        drop(theirs);
+        transport.stop_async().await.unwrap();
+    }
+
+    /// An inbound at the address of a young link claiming another node is
+    /// refused without announcing its claim and without counting as a
+    /// duplicate-node decline: the kept link does not reach the newcomer's
+    /// node, so reporting the newcomer there would have the node dial it over
+    /// that link.
+    #[tokio::test]
+    async fn an_inbound_at_a_young_links_address_claiming_another_node_is_refused_silently() {
+        let x = test_addr(5);
+        let (mut transport, inbound, p, q) = dial_lands_beside_a_held_inbound(&x).await;
+        let declines = transport.stats.snapshot().duplicate_node_declines;
+        {
+            let pool = transport.pool.lock().await;
+            let incumbent = pool
+                .get(&x.to_transport_addr())
+                .expect("the dial is pooled");
+            assert!(
+                incumbent.established_at.elapsed() < transport.tie_window(),
+                "precondition: the dialled link is still inside the tie window"
+            );
+        }
+
+        release_claim(&inbound, &p).await;
+        let mut buf = [0u8; 64];
+        let closed =
+            tokio::time::timeout(std::time::Duration::from_secs(2), inbound.recv(&mut buf)).await;
+        assert!(
+            matches!(closed, Ok(Ok(0))),
+            "the inbound at the occupied address is dropped: {closed:?}"
+        );
+
+        assert_eq!(claim_at(&transport, &x).await, Some(node_of(&q)));
+        assert!(
+            !announces(&transport, node_of(&p)).await,
+            "the refused inbound's claim was announced"
+        );
+        assert_eq!(
+            transport.stats.snapshot().duplicate_node_declines,
+            declines,
+            "a refusal at an occupied address is not a duplicate-node decline"
+        );
+        transport.stop_async().await.unwrap();
+    }
+
+    /// A dialled newcomer at an address that holds a link claiming another
+    /// node is refused before the tie-break: winning it against a young rival
+    /// link to its claimed node at another address would remove that rival,
+    /// and the pool would then refuse the newcomer anyway.
+    #[tokio::test]
+    async fn a_newcomer_at_an_occupied_address_does_not_evict_a_rival_elsewhere() {
+        fn node(n: u8) -> NodeAddr {
+            let mut b = [0u8; 16];
+            b[0] = n;
+            NodeAddr::from_bytes(b)
+        }
+        fn ble(n: u8) -> BleAddr {
+            BleAddr {
+                adapter: "hci0".to_string(),
+                device: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, n],
+            }
+        }
+        fn conn(n: u8, claims: u8, outbound: bool) -> BleConnection<()> {
+            let now = tokio::time::Instant::now();
+            BleConnection {
+                stream: (),
+                send_tx: tokio::sync::mpsc::channel(1).0,
+                send_task: None,
+                recv_task: None,
+                send_mtu: 2048,
+                recv_mtu: 2048,
+                established_at: now,
+                verified: false,
+                grace_from: now,
+                outbound,
+                addr: ble(n),
+                node_addr: Some(node(claims)),
+            }
+        }
+        let (local, p) = (node(1), node(2));
+        let x = ble(5).to_transport_addr();
+        let y = ble(6).to_transport_addr();
+        let mut pool: ConnectionPool<()> =
+            ConnectionPool::new(7, std::time::Duration::from_secs(10));
+        let now = tokio::time::Instant::now();
+        // X holds a link claiming node 3; Y holds a young inbound link claiming P.
+        let _ = pool.insert(x.clone(), conn(5, 3, false), now);
+        let _ = pool.insert(y.clone(), conn(6, 2, false), now);
+        let stats = BleStats::new();
+        let tie = std::time::Duration::from_secs(5);
+        let dialled = settle_dialled(&mut pool, Some(local), Some(p), tie, &x, &stats);
+        if matches!(dialled, Dialled::Keep) {
+            let _ = pool_link(&mut pool, &x, conn(5, 2, true), now, async {});
+        }
+        assert!(
+            pool.contains(&y),
+            "the rival link to P at Y survives a newcomer refused at the occupied X"
+        );
+        assert_eq!(pool.get(&x).and_then(|c| c.node_addr), Some(node(3)));
     }
 }
