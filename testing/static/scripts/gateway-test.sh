@@ -295,18 +295,53 @@ print(found.pop())
 ' "$@"
 }
 
-# The set of input interfaces on the DNAT rules whose destination lies in pool
-# $1, comma-joined and sorted, from `nft list table inet fips_gateway`. Port
-# forward DNATs, whose destination is the gateway's own address, are not
-# counted. Fails when no such rule exists or one has no iifname match.
+# The reply source of the conntrack entries for PROTO $1 to port $2, from
+# `conntrack -L -f ipv6`: the second src= of each line. For a flow DNATed to a
+# mesh node it is that node's mesh address; for a flow the gateway answered
+# itself it is the address the flow was sent to. Fails when no entry matches
+# or the matching entries disagree.
+reply_src() {
+    python3 -c '
+import ipaddress, sys
+proto, dport = sys.argv[1], sys.argv[2]
+found = set()
+for line in sys.stdin:
+    f = line.split()
+    if not f or f[0] != proto:
+        continue
+    dports = [t[6:] for t in f if t.startswith("dport=")]
+    srcs = [t[4:] for t in f if t.startswith("src=")]
+    if not dports or dports[0] != dport:
+        continue
+    try:
+        found.add(ipaddress.ip_address(srcs[1]))
+    except (IndexError, ValueError):
+        sys.exit(1)
+if len(found) != 1:
+    sys.exit(1)
+print(found.pop())
+' "$@"
+}
+
+# The set of input interfaces on the DNAT rules in chain prerouting whose
+# destination lies in pool $1, comma-joined and sorted, from `nft list table
+# inet fips_gateway`. Port forward DNATs, whose destination is the gateway's
+# own address, are not counted, nor are the output chain's DNATs of the
+# gateway host's own traffic, which match no interface. Fails when no such
+# rule exists or one has no iifname match.
 dnat_iifs() {
     python3 -c '
 import ipaddress, re, sys
 pool = ipaddress.ip_network(sys.argv[1])
 found = set()
 lines = 0
+chain = None
 for line in sys.stdin:
-    if not re.search(r"\bdnat\b", line):
+    c = re.match(r"\s*chain (\S+) \{", line)
+    if c:
+        chain = c.group(1)
+        continue
+    if chain != "prerouting" or not re.search(r"\bdnat\b", line):
         continue
     m = re.search(r"\bip6 daddr ([0-9a-f:]+)\b", line)
     if not m:
@@ -327,15 +362,23 @@ print(",".join(sorted(found)))
 ' "$@"
 }
 
-# The mesh address the DNAT rule for virtual IP $1 translates to, from
-# `nft list table inet fips_gateway`. Fails when no rule or more than one
-# matches.
+# The mesh address the DNAT rule for virtual IP $1 in chain $2 (default
+# prerouting) translates to, from `nft list table inet fips_gateway`. Fails
+# when no rule or more than one matches in that chain.
 dnat_to() {
     python3 -c '
 import ipaddress, re, sys
 want = ipaddress.ip_address(sys.argv[1])
+want_chain = sys.argv[2] if len(sys.argv) > 2 else "prerouting"
 found = []
+chain = None
 for line in sys.stdin:
+    c = re.match(r"\s*chain (\S+) \{", line)
+    if c:
+        chain = c.group(1)
+        continue
+    if chain != want_chain:
+        continue
     m = re.search(r"\bdaddr ([0-9a-f:]+) .*\bdnat\b.*?\bto \[?([0-9a-f:]+)", line)
     if not m:
         continue
@@ -347,6 +390,36 @@ for line in sys.stdin:
 if len(found) != 1:
     sys.exit(1)
 print(found[0])
+' "$@"
+}
+
+# How many DNAT rules in chain $1 have a destination in pool $2, from `nft
+# list table inet fips_gateway`. Fails when the listing has no chain $1, so a
+# failed listing cannot read as zero rules.
+dnat_count() {
+    python3 -c '
+import ipaddress, re, sys
+want_chain, pool = sys.argv[1], ipaddress.ip_network(sys.argv[2])
+chain = None
+seen = False
+count = 0
+for line in sys.stdin:
+    c = re.match(r"\s*chain (\S+) \{", line)
+    if c:
+        chain = c.group(1)
+        seen = seen or chain == want_chain
+        continue
+    if chain != want_chain or not re.search(r"\bdnat\b", line):
+        continue
+    m = re.search(r"\bip6 daddr ([0-9a-f:]+)\b", line)
+    try:
+        if m and ipaddress.ip_address(m.group(1)) in pool:
+            count += 1
+    except ValueError:
+        sys.exit(1)
+if not seen:
+    sys.exit(1)
+print(count)
 ' "$@"
 }
 
@@ -561,6 +634,39 @@ print(tables[0]["handle"], pool, forward, forged)
 '
 }
 
+# The table handle and the packet counter of the input chain's reject of
+# unmapped pool traffic, from `nft -j list table inet fips_gateway`, as
+# "HANDLE PACKETS". Every rebuild recreates the table, resetting the counter
+# and changing the handle, so two readings compare only when their handles
+# agree. Fails when the table or a counted reject in chain input is missing.
+pool_reject() {
+    python3 -c '
+import json, sys
+try:
+    doc = json.load(sys.stdin)
+except ValueError:
+    sys.exit(1)
+entries = [e for e in doc.get("nftables", []) if isinstance(e, dict)]
+tables = [e["table"] for e in entries if "table" in e]
+if len(tables) != 1 or "handle" not in tables[0]:
+    sys.exit(1)
+found = []
+for e in entries:
+    r = e.get("rule")
+    if not isinstance(r, dict) or r.get("chain") != "input":
+        continue
+    exprs = [x for x in r.get("expr", []) if isinstance(x, dict)]
+    if not any("reject" in x for x in exprs):
+        continue
+    for x in exprs:
+        if isinstance(x.get("counter"), dict) and isinstance(x["counter"].get("packets"), int):
+            found.append(x["counter"]["packets"])
+if len(found) != 1:
+    sys.exit(1)
+print(tables[0]["handle"], found[0])
+'
+}
+
 # Succeeds when $1 and $2 are the same IPv6 address in any written form.
 same_addr() {
     python3 -c '
@@ -691,6 +797,47 @@ gw_selftest() {
         dnat_to fd01:0:0:0::1 || fails=$((fails + 1))
     gw_case "dnat_to: no rule" 1 "" "$nft_lan" dnat_to fd01::9 || fails=$((fails + 1))
 
+    # nft_out adds the output chain's DNAT of the gateway host's own traffic,
+    # which matches no interface, and the host masquerade. dnat_iifs and the
+    # default dnat_to read only prerouting; dnat_to with a chain argument
+    # reads that chain. nft_out_noiif drops prerouting's iifname match, which
+    # dnat_iifs must still catch beside the output DNAT. nft_out_two names a
+    # second mesh address for the virtual IP in prerouting only.
+    local nft_out nft_out_noiif nft_out_two
+    nft_out=$(awk '
+        /^\tchain postrouting/ {
+            print "\tchain output {"
+            print "\t\ttype nat hook output priority dstnat; policy accept;"
+            print "\t\tmeta nfproto ipv6 ip6 daddr fd01::1 dnat ip6 to fd3c:9a51:7e02:4b18::2"
+            print "\t}"
+            print ""
+        }
+        {print}
+        /iifname "eth0" oifname "fips0" masquerade/ {
+            print "\t\tmeta nfproto ipv6 oifname \"fips0\" ip6 daddr @fips_mesh_sources masquerade"
+        }' <<< "$nft_lan")
+    nft_out_noiif=${nft_out//iifname \"eth0\" meta nfproto ipv6 ip6 daddr/meta nfproto ipv6 ip6 daddr}
+    nft_out_two=$(awk '/iifname "eth0" .*daddr fd01::1 dnat/ {print; sub(/::2$/, "::3")} {print}' <<< "$nft_out")
+    gw_case "dnat_iifs: output DNAT without iifname not counted" 0 eth0 "$nft_out" \
+        dnat_iifs fd01::/112 || fails=$((fails + 1))
+    gw_case "dnat_iifs: prerouting DNAT without iifname beside an output DNAT" 1 "" "$nft_out_noiif" \
+        dnat_iifs fd01::/112 || fails=$((fails + 1))
+    gw_case "dnat_to: prerouting beside an output DNAT" 0 fd3c:9a51:7e02:4b18::2 "$nft_out" \
+        dnat_to fd01::1 || fails=$((fails + 1))
+    gw_case "dnat_to: output chain" 0 fd3c:9a51:7e02:4b18::2 "$nft_out" \
+        dnat_to fd01::1 output || fails=$((fails + 1))
+    gw_case "dnat_to: no output chain" 1 "" "$nft_lan" dnat_to fd01::1 output || fails=$((fails + 1))
+    gw_case "dnat_to: two prerouting rules, one output rule" 0 fd3c:9a51:7e02:4b18::2 "$nft_out_two" \
+        dnat_to fd01::1 output || fails=$((fails + 1))
+    gw_case "dnat_to: two prerouting rules" 1 "" "$nft_out_two" dnat_to fd01::1 || fails=$((fails + 1))
+    gw_case "dnat_count: prerouting" 0 1 "$nft_out" dnat_count prerouting fd01::/112 || fails=$((fails + 1))
+    gw_case "dnat_count: output" 0 1 "$nft_out" dnat_count output fd01::/112 || fails=$((fails + 1))
+    gw_case "dnat_count: prerouting with two rules" 0 2 "$nft_out_two" \
+        dnat_count prerouting fd01::/112 || fails=$((fails + 1))
+    gw_case "dnat_count: no output chain" 1 "" "$nft_lan" dnat_count output fd01::/112 || fails=$((fails + 1))
+    gw_case "dnat_count: empty input" 1 "" "" dnat_count prerouting fd01::/112 || fails=$((fails + 1))
+    gw_case "masq_iface: beside the host masquerade" 0 eth0 "$nft_out" masq_iface || fails=$((fails + 1))
+
     # The forward and raw chains as `nft -j` 1.0.9 printed a rebuild of the
     # gateway's table in a network namespace, trimmed to the two drops.
     # json_mask names the wrong ct states, and json_nolo lacks the lo
@@ -792,6 +939,31 @@ print(json.dumps(a))
     gw_case "reply_dst: only another port's entry" 1 "" "$ct_other" reply_dst tcp 18080 || fails=$((fails + 1))
     gw_case "reply_dst: empty input" 1 "" "" reply_dst tcp 18080 || fails=$((fails + 1))
     gw_case "reply_dst: entries disagree" 1 "" "$ct_split" reply_dst tcp 18080 || fails=$((fails + 1))
+
+    # Written in the kernel's format for the gateway host's own flow to a
+    # virtual IP: ct_host translated to the mapped node and masqueraded, and
+    # ct_local answered by a listener on the gateway itself.
+    local ct_host ct_local
+    ct_host='tcp      6 119 TIME_WAIT src=fd02::10 dst=fd01::3 sport=41000 dport=8009 src=fd3c:9a51:7e02:4b18::2 dst=fd3c:9a51:7e02:4b18::1 sport=8009 dport=41000 [ASSURED] mark=0 use=1'
+    ct_local='tcp      6 119 TIME_WAIT src=fd02::10 dst=fd01::3 sport=41001 dport=8009 src=fd01::3 dst=fd02::10 sport=8009 dport=41001 [ASSURED] mark=0 use=1'
+    gw_case "reply_src: translated to the mapped node" 0 fd3c:9a51:7e02:4b18::2 "$ct_host" \
+        reply_src tcp 8009 || fails=$((fails + 1))
+    gw_case "reply_src: answered on the gateway" 0 fd01::3 "$ct_local" reply_src tcp 8009 || fails=$((fails + 1))
+    gw_case "reply_src: entries disagree" 1 "" "$ct_host"$'\n'"$ct_local" \
+        reply_src tcp 8009 || fails=$((fails + 1))
+    gw_case "reply_src: another port" 1 "" "$ct_host" reply_src tcp 8000 || fails=$((fails + 1))
+    gw_case "reply_src: empty input" 1 "" "" reply_src tcp 8009 || fails=$((fails + 1))
+    gw_case "reply_dst: translated and masqueraded" 0 fd3c:9a51:7e02:4b18::1 "$ct_host" \
+        reply_dst tcp 8009 || fails=$((fails + 1))
+    # The input chain's reject, written from the documented `nft -j` format;
+    # json_reject_none has the chain but no reject in it.
+    local json_reject json_reject_none
+    json_reject='{"nftables": [{"table": {"family": "inet", "name": "fips_gateway", "handle": 11}}, {"rule": {"family": "inet", "table": "fips_gateway", "chain": "input", "handle": 4, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "nfproto"}}, "right": "ipv6"}}, {"match": {"op": "==", "left": {"payload": {"protocol": "ip6", "field": "daddr"}}, "right": {"prefix": {"addr": "fd01::", "len": 112}}}}, {"match": {"op": "==", "left": {"meta": {"key": "l4proto"}}, "right": "ipv6-icmp"}}, {"match": {"op": "==", "left": {"payload": {"protocol": "icmpv6", "field": "type"}}, "right": "nd-neighbor-solicit"}}, {"accept": null}]}}, {"rule": {"family": "inet", "table": "fips_gateway", "chain": "input", "handle": 5, "expr": [{"match": {"op": "==", "left": {"meta": {"key": "nfproto"}}, "right": "ipv6"}}, {"match": {"op": "==", "left": {"payload": {"protocol": "ip6", "field": "daddr"}}, "right": {"prefix": {"addr": "fd01::", "len": 112}}}}, {"counter": {"packets": 6, "bytes": 480}}, {"reject": {"type": "icmpx", "expr": "port-unreachable"}}]}}]}'
+    json_reject_none=${json_reject//\{\"reject\": \{\"type\": \"icmpx\", \"expr\": \"port-unreachable\"\}\}/\{\"drop\": null\}}
+    gw_case "pool_reject: the counted reject" 0 "11 6" "$json_reject" pool_reject || fails=$((fails + 1))
+    gw_case "pool_reject: no reject in chain input" 1 "" "$json_reject_none" pool_reject || fails=$((fails + 1))
+    gw_case "pool_reject: a table without the input chain" 1 "" "$json_ok" pool_reject || fails=$((fails + 1))
+    gw_case "pool_reject: empty input" 1 "" "" pool_reject || fails=$((fails + 1))
     gw_case "same_addr: two forms of one address" 0 "" "" same_addr fd02:0:0:0::10 fd02::10 || fails=$((fails + 1))
     gw_case "same_addr: different addresses" 1 "" "" same_addr fd01::1 fd02::10 || fails=$((fails + 1))
 
@@ -1178,7 +1350,8 @@ else
 fi
 
 # Only traffic arriving on the LAN interface is translated onto the mesh:
-# every mapping DNAT and the fips0 masquerade match iifname LAN_IF, and the
+# every prerouting mapping DNAT and the LAN fips0 masquerade match iifname
+# LAN_IF (the gateway host's own traffic is Phase 6d's), and the
 # forward and raw chains drop other interfaces' traffic into fips0 and to the
 # pool. The drops are read from `nft -j`, whose fields do not depend on how
 # one nft version renders the ct state match.
@@ -1398,6 +1571,272 @@ else
     fi
 fi
 docker exec "$GATEWAY" sh -c "ip link del gwext0 2>/dev/null; ip netns del $P6C_NS 2>/dev/null" \
+    >/dev/null 2>&1 || true
+
+# Phase 6d: the gateway host's own connections to a virtual IP
+#
+# Locally generated packets pass the output hook, not prerouting, and every
+# pool address is local to the gateway (`local <pool> dev lo`), so only the
+# output chain's DNAT keeps the gateway host's own connection to a virtual IP
+# from reaching the gateway itself. A decoy listener on the gateway, on the
+# same port, stands in for a router service such as dropbear: without the
+# DNAT it answers. Both fetches bind their source to the gateway's LAN
+# address, as a router's own connections often are, so the host masquerade
+# must rewrite it to the fips0 address or gw-server has no route back. The
+# gate is the prerouting DNAT, which exists without the output rules, so the
+# body check runs, and can fail, on a gateway without them. The mapping this
+# phase makes is reclaimed with the others in Phase 8.
+echo ""
+echo "Phase 6d: The gateway host's own connections to a virtual IP"
+P6D_PORT=8009
+P6D_TOKEN="p6d-$$-$RANDOM$RANDOM"
+P6D_SRV_DIR="/tmp/$P6D_TOKEN-server"
+P6D_GW_DIR="/tmp/$P6D_TOKEN-decoy"
+P6D_MESH=$(docker exec "$SERVER" bash -c \
+    "ip -6 -o addr show fips0 | awk '/inet6 fd/ {print \$4}' | cut -d/ -f1 | head -1" \
+    2>/dev/null || echo "")
+P6D_GW=$(docker exec "$GATEWAY" bash -c \
+    "ip -6 -o addr show fips0 | awk '/inet6 fd/ {print \$4}' | cut -d/ -f1 | head -1" \
+    2>/dev/null || echo "")
+P6D_SUM=""
+P6D_READY=false
+if docker exec "$SERVER" sh -c "
+    mkdir '$P6D_SRV_DIR' &&
+    echo '$P6D_TOKEN' > '$P6D_SRV_DIR/token' &&
+    head -c 262144 /dev/urandom > '$P6D_SRV_DIR/big'
+" >/dev/null 2>&1; then
+    P6D_SUM=$(docker exec "$SERVER" sha256sum "$P6D_SRV_DIR/big" 2>/dev/null | awk '{print $1}' || echo "")
+fi
+P6D_DECOY=false
+if docker exec "$GATEWAY" sh -c "
+    mkdir '$P6D_GW_DIR' &&
+    echo gateway-decoy > '$P6D_GW_DIR/token' &&
+    echo gateway-decoy > '$P6D_GW_DIR/big'
+" >/dev/null 2>&1; then
+    P6D_DECOY=true
+fi
+# Each server writes its own pid, so cleanup kills exactly it.
+docker exec -d "$SERVER" sh -c \
+    "echo \$\$ > '$P6D_SRV_DIR.pid'; exec python3 -m http.server $P6D_PORT -b :: -d '$P6D_SRV_DIR'" \
+    >/dev/null 2>&1 || true
+docker exec -d "$GATEWAY" sh -c \
+    "echo \$\$ > '$P6D_GW_DIR.pid'; exec python3 -m http.server $P6D_PORT -b :: -d '$P6D_GW_DIR'" \
+    >/dev/null 2>&1 || true
+P6D_LISTENING=false
+for _ in $(seq 1 10); do
+    if docker exec "$SERVER" ss -6lnt 2>/dev/null | grep -q ":$P6D_PORT " \
+        && docker exec "$GATEWAY" ss -6lnt 2>/dev/null | grep -q ":$P6D_PORT "; then
+        P6D_LISTENING=true
+        break
+    fi
+    sleep 0.5
+done
+if [ -z "$P6D_MESH" ] || [ -z "$P6D_GW" ] || [ -z "$P6D_SUM" ] || [ "$P6D_DECOY" != true ] \
+    || [ "$P6D_LISTENING" != true ]; then
+    check "Gateway-host setup (server mesh '$P6D_MESH', gateway mesh '$P6D_GW', checksum '$P6D_SUM', decoy $P6D_DECOY, listening $P6D_LISTENING)" 1
+else
+    P6D_READY=true
+    P6D_GATE=false
+    for P6D_TRY in 1 2 3; do
+        # The gateway's DNS listens on [::]:53, so the gateway host can ask
+        # it at its own LAN address, as a router's resolver would forward.
+        P6D_VIP=$(docker exec "$GATEWAY" dig +short AAAA "${NPUB_B}.fips" "@$GW_DNS" 2>/dev/null \
+            | grep -m1 "^fd01::" || true)
+        for _ in $(seq 1 10); do
+            P6D_NFT=$(docker exec "$GATEWAY" nft list table inet fips_gateway 2>/dev/null || true)
+            if [ -n "$P6D_VIP" ] && P6D_TO=$(dnat_to "$P6D_VIP" <<< "$P6D_NFT") \
+                && same_addr "$P6D_TO" "$P6D_MESH"; then
+                P6D_GATE=true
+                break
+            fi
+            sleep 0.5
+        done
+        if [ "$P6D_GATE" = true ]; then
+            break
+        fi
+        echo "  try $P6D_TRY: no prerouting DNAT of '$P6D_VIP' to $P6D_MESH"
+    done
+    if [ "$P6D_GATE" != true ]; then
+        check "Gateway host resolves ${NPUB_B:0:20}...fips to a mapped virtual IP (no conclusive try in 3)" 1
+    else
+        P6D_BODY=$(docker exec "$GATEWAY" curl -6 -s --max-time 5 --interface "$GW_DNS" \
+            "http://[$P6D_VIP]:$P6D_PORT/token" 2>&1 || true)
+        P6D_GOT=$(docker exec "$GATEWAY" sh -c \
+            "curl -6 -s --max-time 10 --interface '$GW_DNS' 'http://[$P6D_VIP]:$P6D_PORT/big' | sha256sum" \
+            2>/dev/null | awk '{print $1}' || echo "")
+        if [ "$P6D_BODY" = "$P6D_TOKEN" ]; then
+            check "Gateway host reaches $SERVER through $P6D_VIP (token returned)" 0
+        elif [ "$P6D_BODY" = gateway-decoy ]; then
+            check "Gateway host's connection to $P6D_VIP reached the gateway itself (body 'gateway-decoy')" 1
+        else
+            check "Gateway host's connection to $P6D_VIP (body '${P6D_BODY:0:60}', expected the token)" 1
+        fi
+        if [ "$P6D_GOT" = "$P6D_SUM" ]; then
+            check "Gateway host fetches 256 KiB from $SERVER through $P6D_VIP intact" 0
+        else
+            check "Gateway host's 256 KiB fetch through $P6D_VIP (sha256 '${P6D_GOT:0:16}', expected '${P6D_SUM:0:16}')" 1
+        fi
+        P6D_NFT=$(docker exec "$GATEWAY" nft list table inet fips_gateway 2>/dev/null || true)
+        if P6D_OUT_TO=$(dnat_to "$P6D_VIP" output <<< "$P6D_NFT") && same_addr "$P6D_OUT_TO" "$P6D_MESH"; then
+            check "Output DNAT translates $P6D_VIP to $SERVER's mesh address" 0
+        else
+            check "Output DNAT of $P6D_VIP to $P6D_MESH (read '${P6D_OUT_TO:-none}')" 1
+        fi
+        P6D_CT=$(docker exec "$GATEWAY" conntrack -L -f ipv6 2>/dev/null || true)
+        if P6D_RDST=$(reply_dst tcp "$P6D_PORT" <<< "$P6D_CT") && same_addr "$P6D_RDST" "$P6D_GW"; then
+            check "The gateway host's flow is masqueraded to its fips0 address $P6D_GW" 0
+        else
+            check "The gateway host's flow reply destination '${P6D_RDST:-none}', expected its fips0 address $P6D_GW" 1
+        fi
+        if P6D_RSRC=$(reply_src tcp "$P6D_PORT" <<< "$P6D_CT") && same_addr "$P6D_RSRC" "$P6D_MESH"; then
+            check "The gateway host's flow is answered by $SERVER's mesh address" 0
+        else
+            check "The gateway host's flow reply source '${P6D_RSRC:-none}', expected $P6D_MESH" 1
+        fi
+        if [ "${FIPS_GW_DEBUG:-}" = 1 ]; then
+            grep -E "dport=$P6D_PORT\b" <<< "$P6D_CT" | sed 's/^/    /' || true
+        fi
+    fi
+fi
+
+# Phase 6e: a pool address with no mapping is rejected
+#
+# Every pool address is local to the gateway, and a mapping's DNAT rewrites
+# the destination before the input hook, so whatever reaches input still
+# addressed to the pool has no mapping: an expired one, or an address written
+# by hand. The input chain rejects it, from the gateway host and from the LAN
+# alike, rather than let it reach a listener on the gateway, here 6d's decoy.
+# A rejected connection is refused at once (curl exit 7), and the reject's
+# counter rises. A mapped virtual IP still reaches its node from the LAN, and
+# a unicast neighbour solicitation for a proxied virtual IP, which a LAN client
+# sends to check the neighbour and which connection tracking leaves untracked
+# and so untranslated, is still answered. Uses 6d's servers, so it runs only
+# when their setup succeeded, and is a failure, never a skip, otherwise.
+echo ""
+echo "Phase 6e: Pool addresses without a mapping are rejected"
+if [ "$P6D_READY" != true ]; then
+    check "Unmapped pool address setup (Phase 6d's servers are not running)" 1
+else
+    P6E_NFT=$(docker exec "$GATEWAY" nft list table inet fips_gateway 2>/dev/null || true)
+    P6E_ADDR=""
+    for P6E_CAND in fd01::fffe fd01::fffd fd01::fffc; do
+        if [ -n "$P6E_NFT" ] && ! dnat_to "$P6E_CAND" <<< "$P6E_NFT" >/dev/null \
+            && ! dnat_to "$P6E_CAND" output <<< "$P6E_NFT" >/dev/null; then
+            P6E_ADDR="$P6E_CAND"
+            break
+        fi
+    done
+    if [ -z "$P6E_ADDR" ]; then
+        check "An unmapped pool address to probe (none of three candidates, or no listing)" 1
+    else
+        P6E_DONE=false
+        for P6E_TRY in 1 2 3; do
+            P6E_BEFORE=$(docker exec "$GATEWAY" nft -j list table inet fips_gateway 2>/dev/null | pool_reject || echo "")
+            P6E_GW_RC=0
+            P6E_GW_BODY=$(docker exec "$GATEWAY" curl -6 -s --max-time 5 --interface "$GW_DNS" \
+                "http://[$P6E_ADDR]:$P6D_PORT/token" 2>/dev/null) || P6E_GW_RC=$?
+            P6E_LAN_RC=0
+            P6E_LAN_BODY=$(docker exec "$CLIENT" curl -6 -s --max-time 5 \
+                "http://[$P6E_ADDR]:$P6D_PORT/token" 2>/dev/null) || P6E_LAN_RC=$?
+            P6E_AFTER=$(docker exec "$GATEWAY" nft -j list table inet fips_gateway 2>/dev/null | pool_reject || echo "")
+            read -r P6E_H0 P6E_N0 <<< "$P6E_BEFORE"
+            read -r P6E_H1 P6E_N1 <<< "$P6E_AFTER"
+            if [ -n "$P6E_BEFORE" ] && [ -n "$P6E_AFTER" ] && [ "$P6E_H0" != "$P6E_H1" ]; then
+                echo "  try $P6E_TRY: table rebuilt during the probe ('$P6E_BEFORE' then '$P6E_AFTER'), retrying"
+                continue
+            fi
+            P6E_DONE=true
+            break
+        done
+        if [ "$P6E_DONE" != true ]; then
+            check "Unmapped pool address probe (no conclusive try in 3)" 1
+        else
+            for P6E_WHO in "gateway host:$P6E_GW_RC:$P6E_GW_BODY" "LAN client:$P6E_LAN_RC:$P6E_LAN_BODY"; do
+                P6E_LABEL="${P6E_WHO%%:*}"
+                P6E_REST="${P6E_WHO#*:}"
+                P6E_RC="${P6E_REST%%:*}"
+                P6E_BODY="${P6E_REST#*:}"
+                if [ "$P6E_BODY" = gateway-decoy ]; then
+                    check "The $P6E_LABEL's connection to unmapped $P6E_ADDR reached the gateway itself (body 'gateway-decoy')" 1
+                elif [ "$P6E_RC" = 7 ] && [ -z "$P6E_BODY" ]; then
+                    check "The $P6E_LABEL's connection to unmapped $P6E_ADDR is refused" 0
+                else
+                    check "The $P6E_LABEL's connection to unmapped $P6E_ADDR (curl exit $P6E_RC, body '${P6E_BODY:0:40}'; expected refused)" 1
+                fi
+            done
+            if [ -n "$P6E_BEFORE" ] && [ -n "$P6E_AFTER" ] && [ "$P6E_N1" -ge $((P6E_N0 + 2)) ]; then
+                check "The pool reject counted both ($P6E_N0 -> $P6E_N1)" 0
+            else
+                check "The pool reject counted both (read '$P6E_BEFORE' then '$P6E_AFTER')" 1
+            fi
+        fi
+    fi
+
+    # A mapped virtual IP still reaches its node from the LAN.
+    P6E_VIP=""
+    P6E_GATE=false
+    for _ in $(seq 1 10); do
+        P6E_VIP=$(docker exec "$CLIENT" dig +short AAAA "${NPUB_B}.fips" "@$GW_DNS" 2>/dev/null \
+            | grep -m1 "^fd01::" || true)
+        P6E_NFT=$(docker exec "$GATEWAY" nft list table inet fips_gateway 2>/dev/null || true)
+        if [ -n "$P6E_VIP" ] && P6E_TO=$(dnat_to "$P6E_VIP" <<< "$P6E_NFT") && same_addr "$P6E_TO" "$P6D_MESH"; then
+            P6E_GATE=true
+            break
+        fi
+        sleep 0.5
+    done
+    if [ "$P6E_GATE" != true ]; then
+        check "LAN client resolves ${NPUB_B:0:20}...fips to a mapped virtual IP (got '$P6E_VIP')" 1
+    else
+        P6E_MAPPED=$(docker exec "$CLIENT" curl -6 -s --max-time 5 "http://[$P6E_VIP]:$P6D_PORT/token" 2>&1 || true)
+        if [ "$P6E_MAPPED" = "$P6D_TOKEN" ]; then
+            check "A LAN client still reaches $SERVER through mapped $P6E_VIP" 0
+        else
+            check "A LAN client's fetch through mapped $P6E_VIP (body '${P6E_MAPPED:0:40}', expected the token)" 1
+        fi
+
+        # The client sends the solicitation itself, as neighbour
+        # unreachability detection does: to the virtual IP, hop limit 255.
+        # Any advertisement for the virtual IP answers this probe: the
+        # client routes the pool via $GW_DNS, so its kernel resolves only
+        # that next hop and never solicits the virtual IP itself.
+        if [ -n "$LAN_IF" ] && P6E_PROXY=$(docker exec "$GATEWAY" ip -6 neigh show proxy 2>/dev/null \
+            | proxy_dev "$P6E_VIP") && [ "$P6E_PROXY" = "$LAN_IF" ]; then
+            P6E_NS=$(docker exec "$CLIENT" python3 -c '
+import ipaddress, select, socket, struct, sys, time
+vip = sys.argv[1]
+target = ipaddress.IPv6Address(vip).packed
+s = socket.socket(socket.AF_INET6, socket.SOCK_RAW, socket.IPPROTO_ICMPV6)
+s.setsockopt(socket.IPPROTO_IPV6, socket.IPV6_UNICAST_HOPS, 255)
+ns = struct.pack("!BBHI", 135, 0, 0, 0) + target
+for _ in range(3):
+    s.sendto(ns, (vip, 0))
+    end = time.time() + 1
+    while time.time() < end:
+        ready, _, _ = select.select([s], [], [], max(0, end - time.time()))
+        if not ready:
+            break
+        data, _ = s.recvfrom(2048)
+        if len(data) >= 24 and data[0] == 136 and data[8:24] == target:
+            print("answered")
+            sys.exit(0)
+print("unanswered")
+' "$P6E_VIP" 2>&1 || true)
+            if [ "$P6E_NS" = answered ]; then
+                check "A unicast neighbour solicitation for $P6E_VIP is answered" 0
+            else
+                check "A unicast neighbour solicitation for $P6E_VIP ('${P6E_NS:0:60}', expected answered)" 1
+            fi
+        else
+            check "Proxy NDP entry for $P6E_VIP on the LAN interface '$LAN_IF' (none found)" 1
+        fi
+    fi
+fi
+docker exec "$SERVER" sh -c \
+    "kill \$(cat '$P6D_SRV_DIR.pid') 2>/dev/null; rm -rf '$P6D_SRV_DIR' '$P6D_SRV_DIR.pid'" \
+    >/dev/null 2>&1 || true
+docker exec "$GATEWAY" sh -c \
+    "kill \$(cat '$P6D_GW_DIR.pid') 2>/dev/null; rm -rf '$P6D_GW_DIR' '$P6D_GW_DIR.pid'" \
     >/dev/null 2>&1 || true
 
 # Phase 7: Inbound port-forward rules — UDP and a second simultaneous TCP
@@ -2014,7 +2453,8 @@ natbig_allocated() {
 natbig_kernel() {
     NATBIG_RC=0
     NATBIG_NFT=$(docker exec "$GATEWAY" nft list table inet fips_gateway 2>&1) || NATBIG_RC=$?
-    NATBIG_DNAT=$(grep -cE "daddr fd01:[0-9a-f:]* .*dnat" <<< "$NATBIG_NFT" || true)
+    NATBIG_DNAT=$(dnat_count prerouting fd01::/112 <<< "$NATBIG_NFT" || echo -1)
+    NATBIG_ODNAT=$(dnat_count output fd01::/112 <<< "$NATBIG_NFT" || echo -1)
     NATBIG_SNAT=$(grep -cE "saddr [0-9a-f:]+ .*snat" <<< "$NATBIG_NFT" || true)
     NATBIG_MASQ=$(grep -c "masquerade" <<< "$NATBIG_NFT" || true)
 }
@@ -2090,7 +2530,8 @@ natbig_phase() {
     local nat_fail
     nat_fail=$(grep -c "Failed to add NAT rules" <<< "$NATBIG_LOG" || true)
     echo "  [$(($(natbig_now) - t0))s] allocated=$NATBIG_ALLOCATED nat_add_fail=$nat_fail" \
-        "table_rc=$NATBIG_RC dnat=$NATBIG_DNAT snat=$NATBIG_SNAT masquerade=$NATBIG_MASQ settle=${settle}s"
+        "table_rc=$NATBIG_RC dnat=$NATBIG_DNAT output_dnat=$NATBIG_ODNAT snat=$NATBIG_SNAT" \
+        "masquerade=$NATBIG_MASQ settle=${settle}s"
     if [ "$nat_fail" -gt 0 ]; then
         grep "Failed to add NAT rules" <<< "$NATBIG_LOG" | sed 's/\x1b\[[0-9;]*m//g' \
             | sed -n '1p;$p' | sed 's/^/    /'
@@ -2106,15 +2547,16 @@ natbig_phase() {
     else
         check "NAT batch: nft list table failed (rc $NATBIG_RC)" 1
     fi
-    if [ "$NATBIG_DNAT" -eq "$NATBIG_ALLOCATED" ] && [ "$NATBIG_SNAT" -eq "$NATBIG_ALLOCATED" ]; then
-        check "NAT batch: kernel holds a DNAT and SNAT rule per mapping ($NATBIG_DNAT)" 0
+    if [ "$NATBIG_DNAT" -eq "$NATBIG_ALLOCATED" ] && [ "$NATBIG_ODNAT" -eq "$NATBIG_ALLOCATED" ] \
+        && [ "$NATBIG_SNAT" -eq "$NATBIG_ALLOCATED" ]; then
+        check "NAT batch: kernel holds a prerouting DNAT, output DNAT and SNAT rule per mapping ($NATBIG_DNAT)" 0
     else
-        check "NAT batch: kernel rules (dnat $NATBIG_DNAT, snat $NATBIG_SNAT, allocated $NATBIG_ALLOCATED)" 1
+        check "NAT batch: kernel rules (prerouting dnat $NATBIG_DNAT, output dnat $NATBIG_ODNAT, snat $NATBIG_SNAT, allocated $NATBIG_ALLOCATED)" 1
     fi
-    if [ "$NATBIG_MASQ" -eq 2 ]; then
-        check "NAT batch: fips0 and LAN masquerades present" 0
+    if [ "$NATBIG_MASQ" -eq 3 ]; then
+        check "NAT batch: LAN fips0, host fips0 and port-forward LAN masquerades present" 0
     else
-        check "NAT batch: masquerade rules ($NATBIG_MASQ, expected 2)" 1
+        check "NAT batch: masquerade rules ($NATBIG_MASQ, expected 3: LAN fips0, host fips0, port-forward LAN)" 1
     fi
 
     docker stop --time=10 "$GATEWAY" >/dev/null 2>&1 || true
