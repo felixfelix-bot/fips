@@ -10,7 +10,8 @@ against the sizes here.
 The root crate's `src/noise.rs` re-exports the handshake, session,
 replay and cipher-state items and the sizes under `fips::noise`. It does
 not re-export the `aead` module: root code meets `AeadKey` only as the
-type the sessions' key hand-outs return. `HandshakeState` takes the
+type the sessions' key hand-outs return, and in the compile-time tie
+that pins that type to `ring`. `HandshakeState` takes the
 host's entropy source as a type parameter, for its ephemeral keys; the
 root fixes it with the alias
 `fips::noise::HandshakeState = HandshakeState<OsEntropy>`, so its

@@ -27,7 +27,8 @@ moves in from the root crate one module at a time. So far it holds:
   window, the cipher state and the AEAD under it, with the handshake
   message sizes. All but the AEAD are re-exported under `fips::noise`;
   the root crate meets `AeadKey` only as the type the sessions' key
-  hand-outs return;
+  hand-outs return, and in the compile-time tie that pins that type to
+  `ring`;
 - the protocol itself, `proto`: the wire codecs and sans-IO state
   machines of every layer (link, session, spanning tree, bloom filters,
   routing, lookups, metrics, probes). The root crate reaches it as

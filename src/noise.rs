@@ -4,7 +4,7 @@
 //! `fips-core`. This module re-exports all but the AEAD, with the handshake
 //! drawing its ephemeral keys from [`OsEntropy`](crate::identity::OsEntropy);
 //! the AEAD key type is reached only as what the sessions' key hand-outs
-//! return.
+//! return, and in the compile-time tie below that pins it to `ring`.
 
 pub use fips_core::noise::{
     CipherState, EPOCH_ENCRYPTED_SIZE, EPOCH_SIZE, HANDSHAKE_MSG1_SIZE, HANDSHAKE_MSG2_SIZE,

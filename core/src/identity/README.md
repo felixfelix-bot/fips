@@ -8,8 +8,10 @@ public key; the node's IPv6 address; a remote peer's identity; the
 authentication challenge and response; and the NIP-19 npub and nsec
 encodings.
 
-The root crate re-exports all of it under `fips::identity`, next to the
-deprecated `FipsAddress` alias it keeps. `Identity` and `AuthChallenge`
+The root crate re-exports the types, the encodings and `init_secp`
+under `fips::identity`, next to the deprecated `FipsAddress` alias it
+keeps; it does not re-export `secp` or `sha256`, and re-exports
+`ErasingKeypair` only as `pub(crate)`. `Identity` and `AuthChallenge`
 take the host's entropy source as a type parameter; the root crate fixes
 it with type aliases at the same paths,
 `fips::identity::Identity = Identity<OsEntropy>` and likewise
@@ -89,11 +91,11 @@ algebraic structure.
   of its own. A source that returns predictable bytes makes the keys
   predictable, and one that returns only zeros makes
   `Identity::generate` panic on an invalid secret key.
-- **Public only for the root crate.** `secp`, `sha256` and
-  `ErasingKeypair` are `pub` so the root crate can reach them, and
-  `#[doc(hidden)]` because they are not part of the crate's interface.
-  The root crate re-exports `ErasingKeypair` as `pub(crate)`; it does
-  not name `secp` or `sha256`.
+- **Public but hidden.** `secp`, `sha256` and `ErasingKeypair` are
+  `pub` and `#[doc(hidden)]`, because they are not part of the crate's
+  interface. The root crate re-exports `ErasingKeypair` as `pub(crate)`;
+  no crate outside this one names `secp` or `sha256`, so they could be
+  narrowed.
 - **`hex_encode` stays private.** It formats `NodeAddr` for display and
   is not re-exported.
 - **`IdentityError`.** The `From` impls for the `secp256k1`, `bech32`

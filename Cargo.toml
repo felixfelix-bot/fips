@@ -31,7 +31,8 @@ profiling = []
 [dependencies]
 ratatui = "0.30"
 secp256k1 = { version = "0.30", features = ["rand", "global-context"] }
-# `zeroize` clears SHA-256 states on drop.
+# `zeroize` clears SHA-256 states on drop. No root code hashes a secret now;
+# `fips-core` enables the feature too, so it is on in every root build.
 sha2 = { version = "0.11", features = ["zeroize"] }
 ring = "0.17"
 zeroize = { version = "1.9", features = ["zeroize_derive"] }
