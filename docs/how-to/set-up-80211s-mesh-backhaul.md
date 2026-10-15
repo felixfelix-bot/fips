@@ -12,9 +12,9 @@ For the transport design, see
 For all `transports.ethernet.*` configuration keys, see
 [../reference/configuration.md](../reference/configuration.md).
 
-## Why open, why forwarding off
+## Why open, why forwarding off, why fixed basic rates
 
-Two deliberate choices distinguish this from a stock 802.11s setup:
+Three deliberate choices distinguish this from a stock 802.11s setup:
 
 - **`encryption none`** — the mesh is open on purpose. Every FIPS peer
   link is already authenticated and encrypted by the Noise
@@ -28,11 +28,28 @@ Two deliberate choices distinguish this from a stock 802.11s setup:
   open up to the daemon's max-peers cap. What you concede: any nearby
   radio can peer and reach the FIPS overlay surface; L2 metadata (MAC
   addresses, frame sizes) is visible in the air; a hostile radio can
-  burn airtime — all inherent to an open radio link.
+  burn airtime — all inherent to an open radio link. Router services
+  (LuCI, SSH, DNS) and the daemon's UDP and mDNS ports are not reachable
+  over the mesh: the helper puts the mesh interface in the `fips_mesh`
+  firewall zone, which rejects all IP input and forwarding.
 - **`mesh_fwding 0`** — disables 802.11s's own HWMP routing so each
   mesh link is a plain neighbor link. FIPS is the routing layer; two
   routing layers would fight, and broadcast discovery beacons would
   flood the whole mesh instead of reaching direct neighbors only.
+- **`basic_rate '6000 12000 24000'`**: mesh points peer only when
+  they join with the same basic rates, and OpenWrt releases pick
+  different ones when none is set. On 2.4 GHz, 24.10 joins through
+  `iw` with the radio's (by default 6, 12 and 24 Mb/s) and 25.12 with
+  the kernel's (1, 2, 5.5 and 11 Mb/s), so a 24.10 router and a 25.12
+  router hear each other's beacons and never peer. The helper sets 6,
+  12 and 24 Mb/s, which 24.10 and later honour and which costs less
+  airtime than the 802.11b rates. A `basic_rate` you set yourself on
+  a mesh interface is kept, and overrides one set on the radio.
+  OpenWrt 22.03 and 23.05 pass no basic rates to a mesh join, so on
+  2.4 GHz they join with 1, 2, 5.5 and 11 Mb/s whatever is set, and
+  do not peer with routers on these rates. To keep such a router in a
+  2.4 GHz mesh, set `basic_rate '1000 2000 5500 11000'` on the mesh
+  interface of every 24.10 or later router in it.
 
 The interface is **not** bridged into `br-lan` — the FIPS Ethernet
 transport binds it directly.
@@ -70,11 +87,15 @@ backhaul:
 fips-mesh-setup radio1
 ```
 
-This creates an open 802.11s interface with mesh ID `fips-mesh` and
-HWMP forwarding off, attaches it to an unmanaged netifd interface (no
-IP configuration — none is needed), and reloads the radio. It does not
-touch `/etc/fips/fips.yaml`: the matching `meshN` transport ships
-enabled and the daemon binds the interface once it exists (see Step 2). Interfaces are named by radio index: `radio0` → `fips-mesh0`,
+This creates an open 802.11s interface with mesh ID `fips-mesh`,
+HWMP forwarding off and basic rates 6, 12 and 24 Mb/s, attaches it to
+an unmanaged netifd interface (no IP configuration — none is needed),
+puts it in the `fips_mesh` firewall
+zone, which rejects all IP input and forwarding (the Ethernet transport
+is not IP and is not affected), and reloads the firewall and then the
+radio. It does not touch `/etc/fips/fips.yaml`: the matching `meshN`
+transport ships enabled and the daemon binds the interface once it
+exists (see Step 2). Interfaces are named by radio index: `radio0` → `fips-mesh0`,
 `radio1` → `fips-mesh1`. Pass a second argument to use a different
 mesh ID.
 
@@ -121,12 +142,21 @@ set wireless.fips_mesh_radio1.mode='mesh'
 set wireless.fips_mesh_radio1.mesh_id='fips-mesh'
 set wireless.fips_mesh_radio1.encryption='none'
 set wireless.fips_mesh_radio1.mesh_fwding='0'
+set wireless.fips_mesh_radio1.basic_rate='6000 12000 24000'
 set wireless.fips_mesh_radio1.ifname='fips-mesh1'
 set wireless.fips_mesh_radio1.network='fips_mesh_radio1'
 set network.fips_mesh_radio1=interface
 set network.fips_mesh_radio1.proto='none'
+set firewall.fips_mesh=zone
+set firewall.fips_mesh.name='fips_mesh'
+set firewall.fips_mesh.input='REJECT'
+set firewall.fips_mesh.output='ACCEPT'
+set firewall.fips_mesh.forward='REJECT'
+set firewall.fips_mesh.auto_helper='0'
+add_list firewall.fips_mesh.device='fips-mesh1'
 EOF
 uci commit
+/etc/init.d/firewall reload
 wifi reload
 ```
 
@@ -222,12 +252,28 @@ in this order:
    ```
 
    Its mesh ID visible → transmission works, peering is failing
-   (mesh ID typo, or one side has encryption set). Nothing visible →
+   (mesh ID typo, one side has encryption set, or the basic rates
+   differ; see the next item). Nothing visible →
    check `wifi status` on the other router, remember the ~60 s DFS
    CAC wait, and confirm the country code is set
    (`uci get wireless.radio1.country`) — an unset regdomain can
    block channels entirely.
-4. `logread | grep -iE "mesh|fips-mesh0"` on both sides.
+4. **Basic rates differ**: beacons are heard both ways and the
+   station dump stays empty. Compare
+   `uci get wireless.fips_mesh_radio1.basic_rate` on both routers. A
+   mesh interface made by a fips package up to 0.5.2 has none, and on
+   OpenWrt 25.12 joins with 1, 2, 5.5 and 11 Mb/s, which no router on
+   `6000 12000 24000` peers with. Upgrading the package sets the rates
+   on such an interface; `fips-mesh-setup rates` does the same by hand.
+   Either way they apply at the next reboot or network reload of any
+   kind (`wifi reload`, a LuCI apply, or the fips gateway starting,
+   which an upgrade does when the gateway is enabled). Until every
+   router in the mesh is upgraded and reloaded, one left on the old
+   rates stops peering with the upgraded ones, so upgrade routers you
+   reach over the mesh one at a time, farthest first. A router on OpenWrt 22.03 or
+   23.05 joins a 2.4 GHz mesh with 1, 2, 5.5 and 11 Mb/s whatever its
+   `basic_rate`; see the basic rates item at the top of this guide.
+5. `logread | grep -iE "mesh|fips-mesh0"` on both sides.
 
 Then the FIPS layer on top:
 

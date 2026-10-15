@@ -11,7 +11,7 @@ OpenWrt 22.03+ router via the standard `opkg` package system.
 | `/usr/bin/fipsctl` | CLI control tool (`fipsctl show peers`, `fipsctl show links`, …) |
 | `/usr/bin/fipstop` | Live TUI dashboard |
 | `/usr/bin/fips-gateway` | Outbound LAN gateway service (not started by default) |
-| `/usr/bin/fips-mesh-setup` | Opt-in helper — creates an open 802.11s mesh interface for router↔router backhaul |
+| `/usr/bin/fips-mesh-setup` | Opt-in helper — creates an open 802.11s mesh interface for router↔router backhaul, in the `fips_mesh` firewall zone, with basic rates 6, 12 and 24 Mb/s |
 | `/usr/bin/fips-ap-setup` | Opt-in helper — creates the open `!FIPS` access SSID for client devices |
 | `/etc/init.d/fips` | procd service for the daemon (auto-start, crash respawn) |
 | `/etc/init.d/fips-gateway` | procd service for the gateway (disabled by default) |
@@ -274,6 +274,72 @@ uci commit firewall
 /etc/init.d/firewall reload
 ```
 
+### The 802.11s mesh zone
+
+`fips-mesh-setup` puts each mesh interface it creates in a firewall zone of its
+own, `fips_mesh`, before it brings the radio up:
+
+```text
+config zone 'fips_mesh'
+        option name 'fips_mesh'
+        option input 'REJECT'
+        option output 'ACCEPT'
+        option forward 'REJECT'
+        option auto_helper '0'
+        list device 'fips-mesh0'
+```
+
+The mesh is open at the radio layer, so anyone in radio range can join it. An
+interface in no zone meets the default input policy, which on stock OpenWrt
+22.03 is ACCEPT, and would let them reach router services such as LuCI, SSH
+and DNS at the interface's link-local address. The zone rejects all IP input
+and forwarding on the mesh, including FIPS UDP (port 2121) and mDNS, so FIPS
+peers over the mesh use the Ethernet transport, which is not IP and does not
+pass the firewall.
+
+The zone holds each interface by its name. If you put a mesh interface in a
+zone of your own before running `fips-mesh-setup`, it is left there, and the
+helper prints a warning that names the zone, saying router services are
+reachable over the mesh when that zone's input policy is ACCEPT. The zone is
+created once and is yours from then on: the helper adds and removes
+interfaces but does not rewrite its options, and warns when its input policy
+is ACCEPT or the zone is disabled. If you rename a mesh interface by hand, add
+the new name to the zone (`uci add_list firewall.fips_mesh.device=<name>`, then
+commit and reload).
+
+`fips-mesh-setup remove` takes each interface out of the zone, and deletes the
+zone with the last one. An upgrade adds mesh interfaces made by older packages,
+which put them in no zone, to the zone. A reinstall of the same version with a
+plain `opkg install` does not run the package's setup, so run the helper's
+`zone` subcommand yourself:
+
+```bash
+fips-mesh-setup zone
+```
+
+As with the `fips` zone, the helper and the upgrade check the loaded ruleset
+after the firewall reload. If the reload failed, IP traffic arriving on the mesh
+interfaces is dropped until the firewall reloads cleanly, and a warning says
+so. If the firewall configuration cannot be saved, `fips-mesh-setup` does not
+create the mesh, and an upgrade drops IP traffic arriving on the mesh
+interfaces until the firewall next reloads (`fips-mesh-setup close` does the
+same by hand). When the save left the file damaged, the warning names the
+copy to restore before any reload or reboot:
+
+```bash
+uci import firewall < /tmp/fips-mesh-firewall.uci
+/etc/init.d/firewall reload
+```
+
+Removing the package leaves the zone, because the mesh interfaces stay
+configured. Once you have removed the mesh, delete the zone with:
+
+```bash
+uci delete firewall.fips_mesh
+uci commit firewall
+/etc/init.d/firewall reload
+```
+
 ## Service management
 
 ```bash
@@ -294,6 +360,36 @@ section in `/etc/fips/fips.yaml`:
 ```bash
 /etc/init.d/fips-gateway enable
 /etc/init.d/fips-gateway start
+```
+
+The first start gives `br-lan` the address `2001:2:f1b5::1/64`
+(`network.lan.ip6addr`), replacing any address you set there: Android
+and Chrome send no AAAA queries on a LAN that has only ULA addresses.
+The address lies in an unassigned part of IANA's `2001::/23` block and
+is not routed on the internet. It stays across stops and restarts
+while the service is enabled, because changing it reloads the network,
+which on OpenWrt 25.12 recreates `br-lan` and drops the LAN for a few
+seconds. Turning the gateway off deletes it: `disable` of a stopped
+gateway, `stop` of a disabled one (so `stop` and `disable` in either
+order), a start with `gateway.enabled` not true in `fips.yaml`, and
+removing the package. Disabling a running gateway and then rebooting
+deletes nothing: `disable` keeps the address while the gateway runs,
+and a disabled service is neither stopped at shutdown nor started at
+boot. Run `/etc/init.d/fips-gateway stop` once afterwards; it deletes
+the address and withdraws the gateway's RA settings.
+
+On a router with upstream IPv6, while the address is present, LAN
+clients may use it as the source for connections to destinations in
+`2001::/16`, which share a longer prefix with it than with a real
+global address, and those connections then fail or fall back slowly.
+
+A sysupgrade that keeps settings but drops the package runs none of
+the steps above. Delete the address by hand:
+
+```bash
+uci delete network.lan.ip6addr
+uci commit network
+/etc/init.d/network reload
 ```
 
 See `docs/tutorials/deploy-fips-gateway.md` in the source tree for
@@ -332,6 +428,9 @@ using the same command that installs it:
 ```bash
 apk add --allow-untrusted /tmp/fips_<new-version>_<arch>.apk
 ```
+
+On a router with no internet access, add `--no-network --repositories-file
+/dev/null` so apk does not try the package feeds.
 
 The `.apk` package's upgrade scripts stop `fips` and `fips-gateway`, start
 `fips` again, and start `fips-gateway` only if it was enabled; see
@@ -463,4 +562,76 @@ uci set firewall.fips_ping.family=ipv6
 uci set firewall.fips_ping.target=ACCEPT
 uci commit firewall
 /etc/init.d/firewall reload
+```
+
+### Upgrading from 0.5.2 or earlier: the 802.11s mesh's basic rates
+
+802.11s mesh points peer only when they join with the same basic rates. The
+`fips-mesh-setup` in those packages set none, and OpenWrt releases then differ:
+24.10 joins through `iw` with the radio's basic rates, by default 6, 12 and
+24 Mb/s on 2.4 GHz, while 25.12 joins with the kernel's, 1, 2, 5.5 and 11 Mb/s
+on 2.4 GHz. A 24.10 router and a 25.12 router each hear the other's beacons and
+never peer. `fips-mesh-setup` now sets `basic_rate '6000 12000 24000'` on every
+mesh interface it creates, which 24.10 and 25.12 both honour. On those releases
+a `basic_rate` on the interface overrides one set on the radio, so a rate
+choice you made on the radio (`basic_rate`, `legacy_rates` or `cell_density`)
+no longer applies to the mesh; set it on the mesh interface instead.
+
+The upgrade sets that value on each mesh interface `fips-mesh-setup` made that
+has no `basic_rate`, and prints a line naming them. It leaves wireless
+interfaces the helper did not make alone, and keeps a `basic_rate` you set on a
+fips mesh interface yourself, printing a line that names it. Running
+`fips-mesh-setup <radio>` again also keeps one. The upgrade saves the wireless
+configuration and does not run `wifi reload` itself, but the rates apply at the
+next reboot or network reload of any kind: `wifi reload`,
+`/etc/init.d/network reload`, a LuCI apply, or the fips gateway starting or
+being turned off. On a router with the gateway enabled, an upgrade from 0.5.2
+or earlier starts the gateway, which reloads the network to set the LAN
+prefix, so the rates apply during the upgrade itself.
+
+From then on the router peers only with mesh points that join with the same
+rates. A router still on the old package, or upgraded but not yet reloaded,
+stops peering with it if it joins with other rates: on 2.4 GHz that is a 25.12
+router, or any 22.03 or 23.05 router (see below), while a 24.10 router on
+default settings already uses these rates. On 5 GHz both releases are expected
+to use these rates already; that has not been checked on a router.
+
+When you reach routers over the mesh, upgrade them one at a time, farthest
+first, and run `wifi reload` on each right after its upgrade. A router that
+loses its peerings then is at the edge of what you reach, and the routers you
+reach it through keep theirs until their own turn, when the link to it comes
+back. Upgrading a near router first can cut off every router reached through
+it, which then needs another path, such as its LAN, to finish the upgrade.
+
+OpenWrt 22.03 and 23.05 pass no basic rates to a mesh join, whatever is set on
+the interface or the radio, so on 2.4 GHz they join with 1, 2, 5.5 and 11 Mb/s.
+Upgrading the package does not change that, and such a router stops peering
+with 24.10 and later routers once those are upgraded and reloaded. To keep a
+22.03 or 23.05 router in a 2.4 GHz mesh, set the rates it uses on the 2.4 GHz
+mesh interface of every 24.10 or later router in that mesh (here the one on
+`radio1`); the upgrade keeps them:
+
+```bash
+uci set wireless.fips_mesh_radio1.basic_rate='1000 2000 5500 11000'
+uci commit wireless
+wifi reload
+```
+
+A reinstall of the same version with a plain `opkg install` does not run the
+package's setup, so run the helper's `rates` subcommand yourself:
+
+```bash
+fips-mesh-setup rates
+wifi reload
+```
+
+If the wireless configuration cannot be saved, the upgrade says so, and its
+setup runs again at each boot until it can save. When the upgrade could not
+save the firewall configuration, which can mean the overlay is full, it leaves
+the wireless configuration alone and sets the rates at a later boot. When the
+save left `/etc/config/wireless` damaged, the warning says so; free space on the
+overlay and restore it before the router reboots:
+
+```bash
+uci import wireless < /tmp/fips-mesh-wireless.uci
 ```
