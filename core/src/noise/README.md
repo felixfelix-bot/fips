@@ -1,28 +1,52 @@
 # core/src/noise
 
-The fixed sizes of Noise handshake messages and their parts, and the
-AEAD that Noise seals and opens with. The link-layer wire codec in
-`proto/fmp/wire.rs` checks frame lengths against the sizes.
+The Noise Protocol Framework as FIPS uses it, over secp256k1: the IK
+handshake that authenticates a link (FMP), the XK handshake that opens
+an end-to-end session (FSP), the transport session each produces, the
+replay window, and the ChaCha20-Poly1305 AEAD they seal and open with.
+The link-layer wire codec in `proto/fmp/wire.rs` checks frame lengths
+against the sizes here.
 
-The handshake itself, the sessions, the replay window and the cipher
-state stay in the root crate's `noise` module for now, which re-exports
-these constants, so `fips::noise::TAG_SIZE` and the rest are unchanged.
-The root crate's XK message sizes are built from them there, and its
-cipher state seals and opens through `aead`.
+The root crate's `src/noise.rs` re-exports the handshake, session,
+replay and cipher-state items and the sizes under `fips::noise`. It does
+not re-export the `aead` module: root code meets `AeadKey` only as the
+type the sessions' key hand-outs return. `HandshakeState` takes the
+host's entropy source as a type parameter, for its ephemeral keys; the
+root fixes it with the alias
+`fips::noise::HandshakeState = HandshakeState<OsEntropy>`, so its
+callers are unchanged. The root also reaches `take_cleared` and
+`clear_slot` (hidden from the docs here) and, from its tests only,
+`open`, which is behind the `test-hooks` feature.
 
 ## Files
 
-- `mod.rs`: six `usize` constants. `TAG_SIZE` (the AEAD tag),
+- `mod.rs`: declares the submodules and re-exports their public items,
+  then holds the six size constants. `TAG_SIZE` (the AEAD tag),
   `PUBKEY_SIZE` (a compressed secp256k1 key) and `EPOCH_SIZE` (the
   startup epoch) are the parts; `EPOCH_ENCRYPTED_SIZE`,
   `HANDSHAKE_MSG1_SIZE` and `HANDSHAKE_MSG2_SIZE` are built from them.
+- `cipher.rs`: the module's former root header: the module
+  documentation of the two patterns, the protocol names, the XK message
+  sizes, `MAX_MESSAGE_SIZE`, `REPLAY_WINDOW_SIZE`, `NoiseError`,
+  `HandshakeRole`, `NoisePattern` and `HandshakeProgress`; then
+  `CipherState`, the transport cipher with its nonce counter, its
+  `seal` and `open` helpers, and `take_cleared` and `clear_slot`, which
+  clear the bytes a moved-out secret leaves in its slot.
+- `handshake.rs`: `HandshakeState<E>`, the IK and XK state machines,
+  and the symmetric state under them; `into_session` turns a completed
+  handshake into a `NoiseSession`.
+- `session.rs`: `NoiseSession`, the two cipher states and the replay
+  window of a completed handshake, and the key hand-outs
+  (`send_cipher_clone`, `recv_cipher_clone`) and counter calls the
+  root crate's encrypt and decrypt workers use.
+- `replay.rs`: `ReplayWindow`, the sliding window that rejects repeated
+  or too-old counters.
 - `aead.rs`: ChaCha20-Poly1305 (RFC 8439) behind the `Aead` trait, with
   two backends. `AeadKey` is the one this build uses: `ring`'s
   `LessSafeKey` when the crate's `ring` feature is on, RustCrypto's
   `ChaCha20Poly1305` otherwise. `nonce(counter)` builds the transport's
   nonce: four zero bytes, then the counter little-endian.
-- `tests/`: the AEAD's known-answer and cross-backend tests. Its own
-  README describes it.
+- `tests/`: the module's unit tests. Its own README describes it.
 
 ## Choosing the AEAD backend
 
@@ -36,17 +60,45 @@ always a dependency, so the cross-backend tests can run in any build
 that has `ring` on. When both are present `ring` wins, which keeps the
 features additive.
 
+The root's `src/noise.rs` holds a compile-time tie: a function from
+`AeadKey` to `ring::aead::LessSafeKey`, which fails to compile if the
+root's `fips-core` line loses the `ring` feature. On Unix the workers'
+use of the handed-out keys would fail too; on Windows, where those
+paths are not built, the tie is the check that keeps the daemon on
+`ring`.
+
 ## Invariants
 
 - **The sizes and the nonce layout are wire format.** Every node must
   agree on them, and they do not change on the deployed lines. A new
   handshake message adds a constant rather than changing one.
+- **The handshake's AEAD calls pass empty associated data**
+  (`SymmetricState`, `handshake.rs`). That is wire behaviour: binding
+  the handshake hash into the AAD would change every handshake message.
 - **The two backends compute the same function.** A node on one
   interoperates with a node on the other; the cross-backend tests in
-  `tests/aead.rs` hold them to it.
+  `tests/aead.rs` hold them to it, and
+  `test_cipher_state_output_is_pinned` checks `CipherState`'s output
+  on each.
 - **The trait's methods are `with_key`, `seal` and `open`.** `ring`'s
   `LessSafeKey` has inherent `new` and `open_in_place`, and an inherent
   method wins over a trait method of the same name, so the trait must
   not reuse those names.
-- **No keys or session state here.** `AeadKey` is a keyed cipher that a
-  caller builds and holds; this module keeps none.
+- **The small per-packet calls are `#[inline]`**: `NoiseSession`'s
+  `take_send_counter`, `current_send_counter`, `check_replay`,
+  `accept_replay` and `highest_received_counter`, and `ReplayWindow`'s
+  `check`, `accept` and `highest`. The root crate calls them per packet
+  across the crate boundary. Measured on the release daemon, the leaf
+  calls inline across it without the attribute; `ReplayWindow::accept`
+  is the one whose code the attribute changes, inlined into the daemon
+  rather than called. What counts is the daemon's call counts, not the
+  attribute.
+- **The key hand-out is deliberately not `#[inline]`**
+  (`send_cipher_clone`, `recv_cipher_clone`, `CipherState::cipher_clone`).
+  It builds and returns a keyed cipher, and inlining it into the root
+  measured slower on the `handout/send_cipher_clone` row of
+  `benches/noise_aead.rs`.
+- **The randomness comes from the host.** The ephemeral secret is filled
+  by `E::fill`, and the ephemeral public key is derived with the shared
+  context from `identity::secp()`; nothing here reads a random source
+  of its own.

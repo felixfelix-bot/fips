@@ -15,8 +15,9 @@ changing anything here.
   parameter; the core never reads a random source of its own.
 - `identity/`: node and peer identity types and their encodings. Its own
   README describes it.
-- `noise/`: the fixed sizes of Noise handshake messages and their parts.
-  Its own README describes it.
+- `noise/`: the Noise handshakes, the transport sessions, the replay
+  window, the cipher state and the AEAD under it, and the fixed sizes of
+  the handshake messages. Its own README describes it.
 - `proto/`: the protocol: wire codecs and sans-IO state machines for
   every layer. The root crate reaches it as `crate::proto`. Its own
   README describes it.

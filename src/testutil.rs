@@ -2,9 +2,6 @@
 
 use crate::NodeAddr;
 
-/// The host entropy source under the test name the core uses.
-pub(crate) type TestEntropy = crate::identity::OsEntropy;
-
 /// Build a `NodeAddr` from a single discriminating byte in position 0.
 pub(crate) fn make_node_addr(val: u8) -> NodeAddr {
     let mut bytes = [0u8; 16];

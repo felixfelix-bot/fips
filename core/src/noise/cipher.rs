@@ -35,27 +35,14 @@
 //! end-to-end encryption** between arbitrary network addresses, with stronger
 //! initiator identity protection.
 
-mod handshake;
-mod replay;
-mod session;
-
-use aead::{Aead, AeadKey};
+use super::aead::{self, Aead, AeadKey};
 use alloc::string::String;
 use alloc::vec::Vec;
 use core::fmt;
 use thiserror::Error;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
-pub(crate) use fips_core::noise::aead;
-pub use fips_core::noise::{
-    EPOCH_ENCRYPTED_SIZE, EPOCH_SIZE, HANDSHAKE_MSG1_SIZE, HANDSHAKE_MSG2_SIZE, PUBKEY_SIZE,
-    TAG_SIZE,
-};
-/// The Noise handshake, drawing its ephemeral keys from
-/// [`OsEntropy`](crate::identity::OsEntropy).
-pub type HandshakeState = handshake::HandshakeState<crate::identity::OsEntropy>;
-pub use replay::ReplayWindow;
-pub use session::NoiseSession;
+use super::{EPOCH_ENCRYPTED_SIZE, PUBKEY_SIZE, TAG_SIZE};
 
 /// Protocol name for Noise IK with secp256k1 (link layer).
 /// Format: Noise_IK_secp256k1_ChaChaPoly_SHA256
@@ -413,7 +400,7 @@ impl CipherState {
     /// Copy out the retained key bytes, so a test can observe zeroization
     /// without reading freed memory.
     #[cfg(test)]
-    fn key_bytes(&self) -> [u8; 32] {
+    pub(super) fn key_bytes(&self) -> [u8; 32] {
         self.key
     }
 
@@ -465,7 +452,7 @@ fn seal(
 /// Decrypt `ciphertext` (with appended tag) with the given keyed AEAD,
 /// counter, and AAD, returning the plaintext as a `Vec<u8>`. Truncates
 /// in place to drop the AEAD tag.
-pub(crate) fn open(
+pub fn open(
     cipher: Option<&AeadKey>,
     counter: u64,
     aad: &[u8],
@@ -496,7 +483,7 @@ pub(crate) fn open(
 /// [`clear_slot`] instead: unwrapping after the slot has been cleared makes
 /// the optimiser keep a second copy of the value on the stack, because it
 /// can no longer copy the value straight from the slot to where it ends up.
-pub(crate) fn take_cleared<T>(slot: &mut Option<T>) -> Option<T> {
+pub fn take_cleared<T>(slot: &mut Option<T>) -> Option<T> {
     let value = slot.take();
     clear_slot(slot);
     value
@@ -508,7 +495,7 @@ pub(crate) fn take_cleared<T>(slot: &mut Option<T>) -> Option<T> {
 /// The zeros are volatile writes, which the optimiser keeps. Meant for a
 /// slot whose value has just been moved out, so the bytes the move left
 /// behind are cleared.
-pub(crate) fn clear_slot<T>(slot: &mut Option<T>) {
+pub fn clear_slot<T>(slot: &mut Option<T>) {
     *slot = None;
     let raw: *mut Option<T> = slot;
     // SAFETY: `raw` comes from a live `&mut`, so it is valid and aligned for
@@ -523,6 +510,3 @@ pub(crate) fn clear_slot<T>(slot: &mut Option<T>) {
         raw.write(None);
     }
 }
-
-#[cfg(test)]
-mod tests;

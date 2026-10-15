@@ -22,8 +22,11 @@ moves in from the root crate one module at a time. So far it holds:
   The transports themselves stay in the root crate;
 - `SessionIndex`, re-exported under `fips::utils::index`. Its random
   allocator stays in the root crate;
-- the Noise handshake message sizes, re-exported under `fips::noise`.
-  The handshake itself stays in the root crate;
+- Noise: the IK and XK handshakes, the transport sessions, the replay
+  window, the cipher state and the AEAD under it, with the handshake
+  message sizes. All but the AEAD are re-exported under `fips::noise`;
+  the root crate meets `AeadKey` only as the type the sessions' key
+  hand-outs return;
 - the protocol itself, `proto`: the wire codecs and sans-IO state
   machines of every layer (link, session, spanning tree, bloom filters,
   routing, lookups, metrics, probes). The root crate reaches it as
@@ -80,15 +83,16 @@ synthetic timestamps.
 **Randomness is an argument.** Never reach for a thread-local or OS
 random source. Code that needs random bytes or a nonce takes them from
 its caller, or takes the host's source as a type parameter bounded by
-`entropy::EntropySource`, as `Identity<E>`, `AuthChallenge<E>` and
-`CoordCache<E>` do. The host fixes the parameter once, in a type alias
-at the path its callers already use: the root crate's
-`fips::identity::Identity`, for example, is `Identity<OsEntropy>`, and
-`OsEntropy` is `rand`'s thread-local generator. The source must be
-cryptographically secure; keys derived from predictable bytes are
-predictable. The shared secp256k1 context in `identity` follows this
-too: the host blinds it by calling `identity::init_secp(seed)` at
-start-up with 32 bytes from its own random source, as the daemon does.
+`entropy::EntropySource`, as `Identity<E>`, `AuthChallenge<E>`,
+`CoordCache<E>` and `HandshakeState<E>` do. The host fixes the
+parameter once, in a type alias at the path its callers already use:
+the root crate's `fips::identity::Identity`, for example, is
+`Identity<OsEntropy>`, and `OsEntropy` is `rand`'s thread-local
+generator. The source must be cryptographically secure; keys derived
+from predictable bytes are predictable. The shared secp256k1 context in
+`identity` follows this too: the host blinds it by calling
+`identity::init_secp(seed)` at start-up with 32 bytes from its own
+random source, as the daemon does.
 
 **No OS calls and no target `cfg`.** No `cfg(target_os = ...)`,
 `cfg(unix)`, `cfg(windows)` or similar. If behaviour differs by
@@ -126,6 +130,13 @@ dependency must build without `std`.
 not a precedent: its only default is `arch`, kept so the bloom
 false-positive estimate uses the implementation the root crate used
 before the move.
+
+`ring` is optional, behind this crate's `ring` feature, and is the one
+dependency that must never be enabled for a bare-metal build: it does
+not build for those targets. The root crate enables the feature, so
+hosted builds seal and open with `ring`'s assembly; a build of this
+crate alone uses the RustCrypto AEAD instead. The bare-metal script
+builds `-p fips-core` alone and never enables it.
 
 The workspace build unifies features across members, so a feature the
 root crate turns on for its own use also applies to the core in a
