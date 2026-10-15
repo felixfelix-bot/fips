@@ -9,5 +9,7 @@ Unit tests for the files one level up.
 - `index.rs`: tests for `index.rs`, attached from there with
   `#[cfg(test)] #[path = "tests/index.rs"] mod tests;`, so they keep
   their names (`utils::index::tests::...`). They check the byte
-  round trip and the hex display. The allocator's tests stay with the
-  allocator in the root crate.
+  round trip and the hex display, and the allocator: allocation, freeing,
+  reserving, clearing and uniqueness, under `TestEntropy`, and that it
+  draws its indices from its entropy source (under `FixedEntropy<1>`
+  every draw is the same value, so the second allocation is exhausted).

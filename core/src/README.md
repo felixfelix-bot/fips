@@ -24,8 +24,9 @@ changing anything here.
 - `transport/`: the transport value types (identifiers, address,
   statistics) that transports and the protocol cores both name. Its own
   README describes it.
-- `utils/`: small shared value types: the session index, and the hash
-  map for keys a peer can choose, keyed from the host's entropy source.
+- `utils/`: small shared value types: the session index and its
+  allocator, which draws from the host's entropy source, and the hash
+  map for keys a peer can choose, keyed from that source.
   Its own README describes it.
 - `testutil.rs`: fixtures shared by the crate's unit tests
   (`make_node_addr`, `make_keypair`; `TestEntropy`, the random source
