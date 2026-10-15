@@ -38,3 +38,48 @@ impl crate::entropy::EntropySource for TestEntropy {
         rand::Rng::fill_bytes(&mut rand::rng(), dest);
     }
 }
+
+/// An instant of [`TestClock`]: whole milliseconds from 0.
+///
+/// Durations convert to whole milliseconds; a fraction of a millisecond is
+/// dropped.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct TestInstant(pub(crate) u64);
+
+impl crate::time::Instant for TestInstant {
+    fn saturating_duration_since(self, earlier: Self) -> crate::time::Duration {
+        crate::time::Duration::from_millis(self.0.saturating_sub(earlier.0))
+    }
+
+    fn checked_add(self, d: crate::time::Duration) -> Option<Self> {
+        let ms = u64::try_from(d.as_millis()).ok()?;
+        self.0.checked_add(ms).map(Self)
+    }
+
+    fn checked_sub(self, d: crate::time::Duration) -> Option<Self> {
+        let ms = u64::try_from(d.as_millis()).ok()?;
+        self.0.checked_sub(ms).map(Self)
+    }
+}
+
+/// The clock for tests: it reads what the test last set, starting at 0, and
+/// moves only when the test advances it.
+#[derive(Debug, Default)]
+pub(crate) struct TestClock {
+    now: core::cell::Cell<TestInstant>,
+}
+
+impl TestClock {
+    /// Move the clock forward by `ms` milliseconds.
+    pub(crate) fn advance(&self, ms: u64) {
+        self.now.set(TestInstant(self.now.get().0 + ms));
+    }
+}
+
+impl crate::time::Clock for TestClock {
+    type Instant = TestInstant;
+
+    fn now(&self) -> TestInstant {
+        self.now.get()
+    }
+}
