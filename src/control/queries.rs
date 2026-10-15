@@ -2456,28 +2456,58 @@ pub(crate) fn show_stats_history_all_peers_from_handle(
 /// [`crate::control::listening`] and [`crate::control::firewall_state`]
 /// for the per-half implementations.
 pub fn show_listening_sockets(node: &Node) -> Value {
-    render_listening_sockets(node.identity().node_addr())
+    let tun = node
+        .tun_name()
+        .unwrap_or_else(|| node.config().tun.name())
+        .to_string();
+    render_listening_sockets(node.identity().node_addr(), &tun)
 }
 
 /// Off-loop variant of [`show_listening_sockets`]: renders from the
 /// [`ControlReadHandle`](super::read_handle::ControlReadHandle) in the control
-/// task. Reads only the node identity (from `NodeContext`) plus host-OS facts
-/// (`/proc` socket enumeration, nftables firewall classification) — no `Node`
-/// state — so it never round-trips the rx_loop.
+/// task. Reads only the node identity (from `NodeContext`), the TUN name (from
+/// the published stats snapshot, falling back to the configured name), plus
+/// host-OS facts (`/proc` socket enumeration, nftables firewall
+/// classification) — no `Node` state — so it never round-trips the rx_loop.
 pub(crate) fn show_listening_sockets_from_handle(
     handle: &super::read_handle::ControlReadHandle,
 ) -> Value {
-    render_listening_sockets(handle.context().identity.node_addr())
+    let tun = handle
+        .stats()
+        .tun_name
+        .clone()
+        .unwrap_or_else(|| handle.context().config.tun.name().to_string());
+    render_listening_sockets(handle.context().identity.node_addr(), &tun)
 }
 
-/// Shared renderer for the listening-sockets panel. Given the node's
-/// `NodeAddr` it derives the fips0 address, enumerates listening sockets, and
-/// classifies each against the shipped firewall baseline.
-fn render_listening_sockets(node_addr: &NodeAddr) -> Value {
+/// Shell for the listening-sockets panel. Given the node's `NodeAddr` and
+/// TUN name it derives the fips0 address, enumerates listening sockets,
+/// queries the loaded firewall, and hands all three to [`render`].
+fn render_listening_sockets(node_addr: &NodeAddr, tun: &str) -> Value {
     let fips0 = crate::Ipv6Address::from_node_addr(node_addr).to_ipv6();
     let sockets = super::listening::enumerate(fips0);
     let classifier = super::firewall_state::FilterClassifier::query();
+    render(&classifier, tun, fips0, &sockets)
+}
 
+/// Pure renderer for the listening-sockets panel: classifies each socket
+/// against the loaded firewall baseline and builds the JSON reply.
+///
+/// A loaded table that does not police `tun` (scoped to another interface,
+/// or scoped in a way the classifier cannot read) protects nothing on the
+/// TUN, so the reply reports it exactly as if no table were loaded.
+pub(super) fn render(
+    classifier: &super::firewall_state::FilterClassifier,
+    tun: &str,
+    fips0: std::net::Ipv6Addr,
+    sockets: &[super::listening::ListeningSocket],
+) -> Value {
+    let unpoliced = super::firewall_state::FilterClassifier::no_firewall();
+    let classifier = if classifier.polices(tun) {
+        classifier
+    } else {
+        &unpoliced
+    };
     let rows: Vec<Value> = sockets
         .iter()
         .map(|s| {
@@ -3825,5 +3855,101 @@ mod tests {
                 && std::sync::Arc::ptr_eq(&next[1], &again[1]),
             "an unchanged republish must reuse every row Arc"
         );
+    }
+
+    /// `nft -j list table inet fips` output for the shipped
+    /// `packaging/common/fips.nft` (drop-in include removed), captured
+    /// from nft 1.0.9 with the table loaded in a scratch network
+    /// namespace. Its inbound chain opens with `iifname != "fips0" return`.
+    fn stock_fips_nft_json() -> Value {
+        json!({"nftables": [
+            {"metainfo": {"version": "1.0.9", "release_name": "Old Doc Yak #3", "json_schema_version": 1}},
+            {"table": {"family": "inet", "name": "fips", "handle": 1}},
+            {"chain": {"family": "inet", "table": "fips", "name": "inbound", "handle": 1,
+                "type": "filter", "hook": "input", "prio": 0, "policy": "accept"}},
+            {"rule": {"family": "inet", "table": "fips", "chain": "inbound", "handle": 2, "expr": [
+                {"match": {"op": "!=", "left": {"meta": {"key": "iifname"}}, "right": "fips0"}},
+                {"return": null}
+            ]}},
+            {"rule": {"family": "inet", "table": "fips", "chain": "inbound", "handle": 3, "expr": [
+                {"match": {"op": "in", "left": {"ct": {"key": "state"}}, "right": ["established", "related"]}},
+                {"accept": null}
+            ]}},
+            {"rule": {"family": "inet", "table": "fips", "chain": "inbound", "handle": 4, "expr": [
+                {"match": {"op": "==", "left": {"payload": {"protocol": "icmpv6", "field": "type"}}, "right": "echo-request"}},
+                {"accept": null}
+            ]}},
+            {"rule": {"family": "inet", "table": "fips", "chain": "inbound", "handle": 5, "expr": [
+                {"counter": {"packets": 0, "bytes": 0}},
+                {"drop": null}
+            ]}}
+        ]})
+    }
+
+    /// Two wildcard listeners with no drop-in allow rule: one TCP, one UDP.
+    fn two_wildcard_listeners() -> Vec<crate::control::listening::ListeningSocket> {
+        use crate::control::listening::{ListeningSocket, Proto};
+        vec![
+            ListeningSocket {
+                proto: Proto::Tcp,
+                local_addr: std::net::Ipv6Addr::UNSPECIFIED,
+                port: 22,
+                pid: Some(100),
+                process: Some("sshd".into()),
+                wildcard_bind: true,
+            },
+            ListeningSocket {
+                proto: Proto::Udp,
+                local_addr: std::net::Ipv6Addr::UNSPECIFIED,
+                port: 5353,
+                pid: Some(200),
+                process: Some("avahi-daemon".into()),
+                wildcard_bind: true,
+            },
+        ]
+    }
+
+    fn fixture_fips0_addr() -> std::net::Ipv6Addr {
+        "fd97::1".parse().unwrap()
+    }
+
+    #[test]
+    fn listening_sockets_report_no_firewall_when_the_table_polices_another_interface() {
+        let classifier =
+            crate::control::firewall_state::FilterClassifier::from_nft_json(&stock_fips_nft_json());
+        let sockets = two_wildcard_listeners();
+        let out = super::render(&classifier, "mesh0", fixture_fips0_addr(), &sockets);
+
+        let rows = out["sockets"].as_array().unwrap();
+        assert_eq!(rows.len(), 2, "both fixture listeners must be rendered");
+        assert_eq!(
+            out["firewall_active"],
+            json!(false),
+            "a table scoped to fips0 does not police TUN mesh0, so the report \
+             must not claim an active firewall; got {out}"
+        );
+        for row in rows {
+            assert_eq!(
+                row["filter"],
+                json!("no_firewall"),
+                "a listener reachable on unpoliced mesh0 must be reported as \
+                 unfiltered; got {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn listening_sockets_report_filtered_rows_when_the_table_polices_the_tun() {
+        let classifier =
+            crate::control::firewall_state::FilterClassifier::from_nft_json(&stock_fips_nft_json());
+        let sockets = two_wildcard_listeners();
+        let out = super::render(&classifier, "fips0", fixture_fips0_addr(), &sockets);
+
+        let rows = out["sockets"].as_array().unwrap();
+        assert_eq!(rows.len(), 2);
+        assert_eq!(out["firewall_active"], json!(true));
+        for row in rows {
+            assert_eq!(row["filter"], json!("drop"), "row {row}");
+        }
     }
 }

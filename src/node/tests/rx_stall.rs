@@ -1277,7 +1277,9 @@ async fn fire_site(row: ReplySite, dead: bool) -> (Reply, bool, ConnectionState)
 #[tokio::test]
 async fn every_rx_loop_handshake_send_to_dead_tcp_link_is_bounded() {
     // Every row runs before any assertion, so one red names all the sites
-    // that dial rather than only the first.
+    // that dial rather than only the first. Each row's future is boxed: the
+    // node's handler futures together outgrow the test thread's stack in a
+    // debug build when held inline in this one.
     let mut found = Vec::new();
     for row in [
         ReplySite::DuplicateMsg1,
@@ -1294,14 +1296,14 @@ async fn every_rx_loop_handshake_send_to_dead_tcp_link_is_bounded() {
         ReplySite::LinkMessage,
         ReplySite::LinkMessageInbound,
     ] {
-        let (r, delivered, _) = fire_site(row, false).await;
+        let (r, delivered, _) = Box::pin(fire_site(row, false)).await;
         println!("{row:?} control link alive: {r:?}, delivered {delivered}");
         found.extend(dial_findings(&format!("{row:?} control"), &r));
         if !delivered {
             found.push(format!("{row:?} control: the send was not delivered"));
         }
 
-        let (r, _, state) = fire_site(row, true).await;
+        let (r, _, state) = Box::pin(fire_site(row, true)).await;
         println!("{row:?} dead link closed: {r:?}, afterwards {state:?}");
         found.extend(dial_findings(&format!("{row:?} to a closed link"), &r));
         let expected = if row.connects() {

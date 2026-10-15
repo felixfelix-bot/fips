@@ -17,7 +17,6 @@
 use super::limits::FSP_CUTOVER_DELAY_MS;
 use super::quorum::QuorumVerdict;
 use crate::identity::{Ipv6Address, NodeAddr};
-use crate::proto::stp::TreeCoordinate;
 use alloc::vec;
 use alloc::vec::Vec;
 
@@ -96,12 +95,6 @@ pub enum FspAction {
     /// spent without an inbound frame showing the peer received it. The session
     /// itself is kept; only the retained payload is dropped.
     ReleaseInitialMsg3 { addr: NodeAddr },
-    /// Cache `coords` for `addr` in the shared coordinate cache
-    /// (`coord_cache.insert`).
-    CacheCoords {
-        addr: NodeAddr,
-        coords: TreeCoordinate,
-    },
     /// Invalidate the shared cached coordinates for `addr`
     /// (`coord_cache.remove`).
     InvalidateCoords { addr: NodeAddr },
@@ -410,34 +403,6 @@ impl Fsp {
             }
             DecryptSlot::Previous => EpochReaction::None,
         }
-    }
-
-    /// Decide which cleartext-coords (CP flag) present on an inbound encrypted
-    /// frame to cache. Emits an ordered `CacheCoords` per present coordinate:
-    /// the source's coords keyed by `src_addr`, then the destination's coords
-    /// keyed by `my_addr` (our own address). Mirrors the pre-refactor
-    /// `handle_encrypted_session_msg` CP-coords caching order.
-    pub fn plan_cache_coords(
-        &self,
-        src_addr: NodeAddr,
-        my_addr: NodeAddr,
-        src_coords: Option<TreeCoordinate>,
-        dest_coords: Option<TreeCoordinate>,
-    ) -> Vec<FspAction> {
-        let mut actions = Vec::new();
-        if let Some(coords) = src_coords {
-            actions.push(FspAction::CacheCoords {
-                addr: src_addr,
-                coords,
-            });
-        }
-        if let Some(coords) = dest_coords {
-            actions.push(FspAction::CacheCoords {
-                addr: my_addr,
-                coords,
-            });
-        }
-        actions
     }
 
     /// Decide the discovery reaction to a `CoordsRequired` signal: trigger a

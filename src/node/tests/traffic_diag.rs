@@ -586,11 +586,20 @@ async fn a_dedup_eviction_logs_the_evicted_entrys_age_and_whether_it_was_answere
     let from = make_node_addr(0xAA);
     let start = Instant::now();
     let mut node = node_with_full_share(&from).await;
-    // A response for request 1 goes back on its reverse path.
-    node.handle_lookup_response(&make_node_addr(0xAB), &response_payload(1))
+    // A response for request 1 goes back on its reverse path. Only a peer
+    // the request was sent on to may answer it, so request 1 is recorded as
+    // forwarded to the responder.
+    let responder = make_node_addr(0xAB);
+    node.lookup
+        .recent_requests
+        .get_mut(&1)
+        .expect("request 1 is cached")
+        .forwarded_to
+        .push(responder);
+    node.handle_lookup_response(&responder, &response_payload(1))
         .await;
     assert!(
-        node.lookup.recent_requests[&1].response_forwarded,
+        !node.lookup.recent_requests[&1].relayed.is_empty(),
         "setup: request 1 was answered"
     );
 

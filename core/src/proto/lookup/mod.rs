@@ -23,12 +23,23 @@ mod tests;
 pub use core::{
     ForwardOutcome, InitiateDecision, LookupAction, RequestOutcome, ResponseRoute,
     ResponseRouteDecision, RoutingView, classify_request, classify_response, initiate_failed,
-    initiate_gate, on_response_accepted, plan_forward, plan_initiate, plan_response_route,
+    initiate_gate, on_response_accepted, plan_initiate, plan_response_route, plan_transit_forward,
     poll_pending,
 };
+// The shell forwards through `plan_transit_forward`; the planner it wraps is
+// named directly only by the tests of its peer selection.
+#[cfg(test)]
+pub(crate) use core::plan_forward;
+// The shell reads the refusal reason off `ResponseRoute::Ineligible` without
+// naming its type; only the tests name it.
+#[cfg(test)]
+pub(crate) use core::Ineligibility;
 pub use limits::{
-    LookupBackoff, LookupForwardRateLimiter, MAX_BACKOFF_ENTRIES, MAX_RECENT_LOOKUP_REQUESTS,
+    LookupBackoff, LookupForwardRateLimiter, MAX_BACKOFF_ENTRIES, MAX_FORWARD_ENTRIES,
+    MAX_RECENT_LOOKUP_REQUESTS,
 };
+#[cfg(test)]
+pub(crate) use state::MAX_RELAYED_DIGESTS;
 #[cfg(any(test, feature = "test-hooks"))]
 pub use state::RecentRequest;
 pub use state::{Lookup, PendingLookup};

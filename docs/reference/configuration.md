@@ -187,8 +187,9 @@ exactly as `established_handshake_*` is, so a stranger flood cannot suppress
 rekey traffic sharing the link.
 
 At the defaults one neighbour can force at most
-`session_setup_rate * handshake_timeout_secs` half-open entries (480) and
-`session_setup_rate * (1 + handshake_max_resends)` acks per second (96). The
+`session_setup_rate * handshake_timeout_secs` half-open responder candidates
+(480) and `session_setup_rate` acks per second (16): a responder sends one ack
+per admitted setup and does not resend it on a timer. The
 node-wide ceiling is still that times the peer count, since the limiter bounds
 each neighbour rather than the aggregate. A legitimate peer whose traffic
 reaches this node over the *same* link as an attacker's shares that
@@ -328,7 +329,7 @@ Controls caching of tree coordinates and identity mappings.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
-| `node.cache.coord_size` | usize | `50000` | Max entries in coordinate cache |
+| `node.cache.coord_size` | usize | `50000` | Max entries in the coordinate cache's main segment, which also stores at most `16 × coord_size` coordinate addresses in total (a deeper entry is stored and counts its depth against that total). Hints a link peer's budget cannot pay for go to a probation segment of `max(1, coord_size / 32)` further entries, so the cache can hold up to `coord_size + max(1, coord_size / 32)` entries |
 | `node.cache.coord_ttl_secs` | u64 | `300` | Coordinate cache entry TTL (5 minutes) |
 | `node.cache.identity_size` | usize | `10000` | Max entries in identity cache (LRU, no TTL) |
 
@@ -349,7 +350,7 @@ the current coordinates of a mesh address the node already knows.
 | `node.lookup.recent_expiry_secs` | u64 | `10` | Dedup cache expiry for recent request IDs |
 | `node.lookup.backoff_base_secs` | u64 | `0` | Optional post-failure suppression base in seconds; doubles per consecutive failure. `0` disables (default); the per-attempt sequence is the only retry pacing |
 | `node.lookup.backoff_max_secs` | u64 | `0` | Cap on optional post-failure backoff |
-| `node.lookup.forward_min_interval_secs` | u64 | `2` | Transit-side rate limiting: minimum interval between forwarded lookups for the same target |
+| `node.lookup.forward_min_interval_secs` | u64 | `2` | Transit-side rate limiting: minimum interval between forwarded lookups for the same target from the same link peer |
 
 ### Peer Rendezvous (`node.rendezvous.*`)
 
@@ -627,7 +628,7 @@ hides the line protocol; see
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `tun.enabled` | bool | `false` | Enable TUN virtual interface |
-| `tun.name` | string | `"fips0"` | Interface name |
+| `tun.name` | string | `"fips0"` | Interface name. The mesh firewall baseline `/etc/fips/fips.nft` polices only the interface its `fips_if` define names (`"fips0"` as shipped); if you change this, change the define to match, or the firewall polices nothing on the TUN (see [Enable the mesh-interface firewall](../how-to/enable-mesh-firewall.md#if-you-rename-the-tun)). |
 | `tun.mtu` | u16 | `1280` | Interface MTU (IPv6 minimum) |
 
 ## DNS Responder (`dns.*`)
@@ -639,7 +640,7 @@ with the node for routing.
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `dns.enabled` | bool | `true` | Enable DNS responder |
-| `dns.bind_addr` | string | `"::1"` | Bind address. Default is IPv6 loopback only; the shipped `fips-dns-setup` configures systemd-resolved to forward `.fips` queries to `[::1]:5354`. A non-loopback address (e.g. `"::"` for all interfaces) answers every host that can reach it: set one only to serve other hosts, such as LAN clients, or a gateway that reaches the daemon over IPv4. On Linux, macOS and FreeBSD, when the daemon creates its own TUN, queries arriving on the mesh interface are dropped, so mesh peers are not served, unless the daemon logs 'Mesh interface index unresolved; DNS mesh filter disabled' at start, in which case they are; on Windows, or with an application-supplied TUN, they are. The reply goes to the query's source address by the routing table, so a host on one of those networks that forges a mesh source address (`fd00::/8`) has the reply sent into the mesh, from this node's mesh address, to the address and port it forged. |
+| `dns.bind_addr` | string | `"::1"` | Bind address. Default is IPv6 loopback only; the shipped `fips-dns-setup` configures systemd-resolved to forward `.fips` queries to `[::1]:5354`. A non-loopback address (e.g. `"::"` for all interfaces) answers every host that can reach it: set one only to serve other hosts, such as LAN clients, or a gateway that reaches the daemon over IPv4. On Linux, macOS and FreeBSD, when the daemon creates its own TUN, queries arriving on the mesh interface are dropped, so mesh peers are not served, unless the daemon logs 'Mesh interface index unresolved; DNS mesh filter disabled' at start, in which case they are; on Windows, or with an application-supplied TUN, they are. On Linux, with the wildcard bind `"::"`, a query from a mesh source address (`fd00::/8`) is answered only out of the interface it arrived on, so the reply to a host on one of those networks that forges a mesh source address is not sent into the mesh (it may still reach that host by another route, such as a default route on the interface the query arrived on; and on a node that forwards IPv6 from that network into the mesh, a router that routes `fd00::/8` back to the node can return the reply, which the node then forwards into the mesh as it would any packet from that network to a mesh address); two rare cases also go unanswered: a ULA client whose queries arrive by a different interface than the one that reaches it, and a local process that sends from its own mesh address to a non-mesh address of the node. On Linux, with one specific address (for example a LAN address), a socket always replies from that address and the kernel does not then hold the reply to the arrival interface, so a query from a mesh source address that arrives on any interface other than the mesh interface gets no reply at all; this includes on-link ULA clients, so use `"::"` to serve a ULA LAN. The specific-address case needs the mesh interface index: with an application-supplied TUN, or when the daemon logs 'Mesh interface index unresolved', a specific bind sends replies to mesh source addresses out of the arrival interface as `"::"` does, but cannot hold them there, so they can still reach the mesh. The `"::"` case does not depend on the index. On Android, macOS, FreeBSD and other platforms the reply goes to the query's source address by the routing table, so a host on one of those networks that forges a mesh source address has the reply sent into the mesh, from this node's mesh address, to the address and port it forged. |
 | `dns.port` | u16 | `5354` | Listen port |
 | `dns.ttl` | u32 | `300` | AAAA record TTL in seconds. Values above 2147483647 are treated as 2147483647. |
 
@@ -1137,8 +1138,11 @@ default for that protocol).
 Optional list of inbound port-forward rules. Each rule maps a TCP or
 UDP port on the gateway's `fips0` mesh-side address to a `host:port`
 on the LAN. Mesh peers connect to the gateway's mesh address on the
-listen port; the gateway terminates the connection and forwards the
-payload to the LAN target. This is the inverse of the outbound mode:
+listen port; the kernel rewrites the destination to the LAN target
+(DNAT) and forwards the packets, and the gateway's LAN-side masquerade
+makes them arrive from the gateway's LAN address. The mesh firewall baseline
+does not filter these connections; see the gateway how-to for a rule
+that does. This is the inverse of the outbound mode:
 the LAN service is exposed to the mesh, not the other way around. See
 [../how-to/deploy-gateway.md](../how-to/deploy-gateway.md) for the
 operator recipe.

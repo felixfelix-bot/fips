@@ -186,16 +186,34 @@ the forward path (e.g., after tree reconvergence).
 
 ### Simultaneous Initiation
 
-When both nodes attempt to establish a session simultaneously ("crossing
-hellos"), a deterministic tie-breaker resolves the conflict, mirroring
-IKEv2's simultaneous initiation resolution (RFC 7296 §2.8):
+When both nodes send a SessionSetup to each other at the same time
+("crossing hellos"), the handshake initiated by the node with the smaller
+address wins, as in IKEv2's simultaneous initiation (RFC 7296 §2.8). A
+SessionSetup proves nothing about its sender until its msg3 arrives, so
+the rule is applied in a way a forged setup cannot use to block the
+address owner's session:
 
-- If `local_node_addr < remote_node_addr`: Continue as initiator, ignore
-  incoming setup
-- If `local_node_addr > remote_node_addr`: Abort own initiation, switch to
-  responder role
+- The winner (smaller address) drops the peer's setup while its own setup
+  is less than 5 s old, since the peer will answer it. If its own setup
+  has gone unanswered for 5 s, it gives up its own leg and answers the
+  peer's setup instead.
+- The loser (larger address) answers the peer's setup and keeps its own
+  initiator leg beside it, with its resends paused. The resends resume
+  once the peer's setup has been held for 5 s with nothing completed, or
+  at once if no half-open setup from the peer is left.
 
-This lowest-address-wins approach ensures exactly one handshake completes.
+Each setup a node answers is held as a half-open responder setup with its
+own handshake and SessionAck, up to four per address. If the loser's own
+leg completes first, it keeps the winner's half-open setups beside its
+session, and a msg3 completing one of them replaces its session, so both
+sides end on the same handshake. The winner, once established, keeps none.
+
+Each half-open setup expires on its own deadline, a handshake timeout
+(30 s by default) after it was admitted, including those the loser keeps
+beside an established session. With four held, a new setup replaces the
+oldest one that is at least 5 s old, preferring one that arrived over the
+same link peer, and is refused if none is that old. A forged setup
+therefore cannot be evicted before it is 5 s old.
 
 ### Data Transfer
 
@@ -435,8 +453,39 @@ transit, CP-flagged data packets, LookupResponse — write to the same cache.
   (default 300s)
 - **Refresh on use**: Active routing through a cache entry resets its TTL,
   keeping hot entries alive
-- **LRU eviction**: When the cache is full, least recently used entries are
-  evicted first
+- **LRU eviction**: When the cache is full, the least recently used entry is
+  evicted, skipping entries whose verification (from a lookup whose proof
+  this node checked) is still live; a hint is refused only when every entry
+  is live-verified. An expired entry is not sought out first: every hint
+  carries the same TTL, so the least recently used entry is also the first
+  to expire. The victim is found through an ordered index, so an insert at
+  capacity costs O(log n) rather than a scan of the cache, and ties are
+  broken by insertion order, never by address
+- **Address bound**: Besides its entry count, the cache bounds the coordinate
+  addresses it stores at 16 per configured entry. Each entry is charged its
+  coordinate length or 16, whichever is larger, and a write that would exceed
+  the bound evicts like a write to a full cache. Deep coordinates still cache
+  and route; they reduce how many entries fit. A coordinate heavier than the
+  whole bound is stored alone
+- **Per-link-peer budget**: Each authenticated link peer pays for the hints it
+  writes through this node, in units of the weight above, at 1,024 units a
+  second up to 4,096; a newly seen peer starts with none, and a peer keeps
+  what it accrues while it stays connected. A new destination the peer can pay
+  for goes into the cache's main segment, or into probation if every main
+  entry is live-verified. One it cannot pay for goes into a
+  probation segment of `max(1, coord_size / 32)` entries on top, which evicts
+  only its own least recently used entries, so the frame is still routed and
+  nothing a paid write placed is displaced. A later write of the same
+  destination that pays its whole weight, and at least the most weight
+  probation has held for it, promotes it; using an entry does not. A write
+  of an expired entry is placed as a new destination's would be. An update
+  is charged only for depth beyond the most the entry has been charged for,
+  and one that is not paid for keeps the old coordinates; making an entry
+  shallower does not lower its charge, so a forged shallow rewrite
+  does not make the honest correction cost anything. Writes this node's own
+  handshakes make (the SessionAck's source coordinates) and verified lookup
+  results are not charged. The `coord_hint_unfunded` counter counts unpaid
+  writes
 - **Flush on parent change**: When the local node's tree parent changes, the
   entire coordinate cache is flushed. Tree parent changes mean the node's own
   coordinates have changed, making cached coordinates for other nodes

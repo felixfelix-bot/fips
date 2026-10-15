@@ -33,6 +33,12 @@ use std::time::Duration;
 use tracing::{debug, error, info, warn};
 
 const OPEN_DISCOVERY_RETRY_LIFETIME_MULTIPLIER: u64 = 2;
+/// Parallel dial attempts to one peer over its candidate paths. Applies to
+/// LAN candidates and to a configured peer's addresses, never to transport
+/// neighbours, whose key is the remote's unproven claim. Every handshake in
+/// flight expecting the peer counts against it, on any transport, so links
+/// whose unproven claim names a configured peer can still hold that peer's
+/// configured-address dials back while their handshakes live.
 const MAX_PARALLEL_PATH_CANDIDATES_PER_PEER: usize = 4;
 const MAX_DISCOVERY_CONNECTS_PER_TICK: usize = 16;
 
@@ -1042,18 +1048,19 @@ impl Node {
         // "fresh enough to skip" check, and the "already connecting on this exact
         // path" check. The surviving beacons become the opportunistic pool, in
         // transport-then-beacon iteration order; the core owns the connected /
-        // discovery-connect-budget / per-peer-cap decisions over them.
+        // admission / discovery-connect-budget decisions over them, and dials
+        // each distinct path once.
         //
         // Collect-then-dial (as before): the pool snapshot is frozen while the
-        // dataplane maps are unmutated, so the core's per-peer cap sees a stable
-        // in-flight count — the same guarantee the old collect-then-dial had.
+        // dataplane maps are unmutated, so the core sees stable slot counts —
+        // the same guarantee the old collect-then-dial had.
         //
         // Anonymous (None-identity) beacons are first-contact links learned from
         // an unauthenticated shared-media beacon; their identity is only learned
         // from XX msg2. They carry `active_refresh = false`, have no NodeAddr to
-        // key the per-peer cap, and — matching next's poll_transport_discovery —
-        // bypass the discovery connect budget in the core. The driver-only
-        // `addr_to_link` dedup below is their sole gate.
+        // key admission or the per-path dedupe, and — matching next's
+        // poll_transport_discovery — bypass the discovery connect budget in the
+        // core. The driver-only `addr_to_link` dedup below is their sole gate.
         let mut transport_neighbors: Vec<Candidate> = Vec::new();
         for (transport_id, transport) in &self.transports {
             if !transport.is_operational() {
@@ -2167,6 +2174,10 @@ impl Node {
                             };
                             self.supervisor.ipv6tun.spawn_tun(device, threads)?;
                             self.tun_state = TunState::Active;
+                            #[cfg(target_os = "linux")]
+                            if let Some(tun) = self.tun_name() {
+                                crate::control::firewall_state::spawn_scope_check(tun);
+                            }
                             Event::SubstrateUp { child }
                         }
                         None => {
@@ -3176,8 +3187,8 @@ impl Node {
     /// Snapshot the live dataplane maps into the reconciler's [`Observed`] input.
     ///
     /// The `connected` / `connecting` sets gate the floor, retry-dial, overlay,
-    /// and LAN layers; `in_flight_by_peer` feeds the opportunistic layer's
-    /// per-peer parallel cap, computed exactly as the deleted
+    /// and LAN layers; `in_flight_by_peer` feeds the LAN layer's per-peer
+    /// parallel cap, computed exactly as the deleted
     /// `path_candidate_attempt_budget` did: `pending legs(expected == addr) +
     /// pending_connects(addr)`. The scalar counts stay unpopulated at the
     /// ceiling-only posture (no layer reads them; see [`Observed`]).

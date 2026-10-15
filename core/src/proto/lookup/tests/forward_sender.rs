@@ -30,6 +30,7 @@ fn forward(from: &NodeAddr, rv: &MockRoutingView) -> Option<(Vec<NodeAddr>, bool
         ForwardOutcome::NoPeers => None,
         ForwardOutcome::TtlExhausted => panic!("TTL 3 must not be exhausted"),
         ForwardOutcome::LeafNoForward => panic!("the mock view is not a leaf"),
+        ForwardOutcome::RateLimited => panic!("plan_forward does not consult the limiter"),
     }
 }
 

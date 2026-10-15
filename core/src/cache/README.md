@@ -15,9 +15,12 @@ its callers name it as before.
 
 - `mod.rs`: declares the submodules and re-exports their public items;
   `CacheError` and `CacheStats`.
-- `coord_cache.rs`: `CoordCache`: insertion from hints and from verified
-  lookups, lookup with and without refreshing an entry, invalidation,
-  expiry and eviction; the default size (50,000 entries) and TTL;
+- `coord_cache.rs`: `CoordCache`: insertion from hints, from hints a
+  link peer pays for (`insert_funded`, with `Funding` and the `Placed`
+  result) and from verified lookups, lookup with and without refreshing
+  an entry, invalidation, expiry and eviction; the default size (50,000
+  entries) and TTL; the address bound (`ADDRS_PER_ENTRY`) and the
+  probation segment (`PROBATION_SHARE_DIVISOR`, `Segment`);
   `HintOutcome`, what a hint write did.
 - `entry.rs`: `CacheEntry`, one cached coordinate with its times, path
   MTU and source; `CoordSource` (`Verified` or `Hint`);
@@ -34,6 +37,10 @@ its callers name it as before.
   which of several equally eligible entries eviction picks, and the row
   order of the cache snapshot the root crate reports. Neither may come
   to depend on address order.
+- **Test hooks.** `eviction_examined`, `segment_of`, `probation_len` and
+  `stored_addrs` let tests measure eviction work and read where entries
+  are. They are gated `#[cfg(any(test, feature = "test-hooks"))]`, since
+  the root crate's node tests read them.
 - **Time is an argument.** Every method that needs the time takes
   `current_time_ms: u64`, in Unix milliseconds; nothing here reads a
   clock.
@@ -47,9 +54,31 @@ its callers name it as before.
   destination's real move. After the window the entry stays usable but
   a hint may replace it.
 - **Eviction never makes room for a hint at a verified entry's
-  expense.** When the cache is full, eviction removes an expired entry
-  if there is one, otherwise the least recently used entry that is not
-  live-verified. If every entry is live-verified it removes nothing, and
-  the hint is refused rather than the cache growing past its cap.
-  Otherwise a flood of hints could age a verified entry into the
-  eviction slot and then plant a value in the space it left.
+  expense.** When the main segment is full, eviction removes the least
+  recently used entry that is not live-verified. If every entry is
+  live-verified it removes nothing, and an uncharged hint is refused
+  rather than the cache growing past its cap (a link peer's write goes
+  to probation instead). Otherwise a flood of hints could age a verified
+  entry into the eviction slot and then plant a value in the space it
+  left. Eviction orders by last use, not by expiry; an expired entry is
+  removed when its key is written, when `get_and_touch` reads it, or by
+  `purge_expired`.
+- **Eviction finds its victim through ordered indexes, not a scan.**
+  Entries eviction may take are kept in a `BTreeMap` by last use, and
+  live-verified ones are parked by when their verification lapses, so an
+  insert at capacity costs O(log n) amortised. Touching an entry does no
+  index work; eviction restamps a stale key when it reaches one. Ties
+  are broken by a per-cache insertion sequence, never by address, which
+  a peer chooses. Every mutator keeps the indexes level with the map.
+- **The main segment is bounded by entries and by stored addresses.**
+  Each entry weighs its coordinate depth, at least `ADDRS_PER_ENTRY`,
+  and the main segment holds at most `max_entries * ADDRS_PER_ENTRY`
+  weight as well as `max_entries` entries; a write that would exceed
+  either evicts until it fits.
+- **An unpaid write never displaces a paid one.** A hint whose writer
+  cannot pay its weight (`Funding`) goes to a probation segment on top
+  of main, `max(1, max_entries / PROBATION_SHARE_DIVISOR)` entries,
+  which evicts only its own least recently used entries. A paid write of
+  a probation key promotes it to main; using an entry does not. An
+  unpaid update that would deepen a main entry keeps the old
+  coordinates.

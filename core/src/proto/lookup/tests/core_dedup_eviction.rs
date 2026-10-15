@@ -28,8 +28,7 @@ fn request(request_id: u64, target: NodeAddr) -> LookupRequest {
 }
 
 /// Deliver one transit request from `from`, discarding the route
-/// decision: these tests are about which entries survive, and the
-/// forward limiter's verdict does not affect what is cached.
+/// decision: these tests are about which entries survive.
 fn deliver(
     lookup: &mut Lookup,
     request_id: u64,
@@ -251,7 +250,8 @@ fn an_eviction_carries_the_evicted_entrys_age_and_whether_it_was_answered() {
         .recent_requests
         .get_mut(&1)
         .unwrap()
-        .response_forwarded = true;
+        .relayed
+        .push_back([0; 8]);
 
     let first = deliver_at(&mut lookup, 500, &peer, 5_500)
         .evicted

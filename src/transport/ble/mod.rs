@@ -66,6 +66,7 @@ pub mod io_radio;
 pub mod neighbor;
 pub mod pool;
 pub mod psm;
+mod recall;
 pub mod stats;
 pub mod stream_read;
 
@@ -80,6 +81,7 @@ use addr::BleAddr;
 use io::{BleIo, BleScanner, BleStream};
 use neighbor::NeighborBuffer;
 use pool::{Admission, Admitted, BleConnection, ConnectionPool, Verify};
+use recall::Recall;
 use stats::BleStats;
 use stream_read::BleStreamRead;
 
@@ -193,17 +195,18 @@ pub struct BleTransport<I: BleIo> {
 
 /// Advertised listener PSM by link address, shared between the scan loop
 /// that learns it and the dials that need it. A plain mutex: never held
-/// across an await.
-type LearnedPsm = Arc<std::sync::Mutex<HashMap<BleAddr, u16>>>;
+/// across an await. Bounded: see [`Recall`].
+type LearnedPsm = Arc<std::sync::Mutex<Recall<u16>>>;
+
+/// Lock an address memory. A panic while it was held leaves nothing half
+/// written that its users rely on, so a poisoned lock is used as it is.
+fn recall<V>(memory: &Arc<std::sync::Mutex<Recall<V>>>) -> std::sync::MutexGuard<'_, Recall<V>> {
+    memory.lock().unwrap_or_else(|e| e.into_inner())
+}
 
 /// The PSM to dial `addr` at: what it advertised, else `configured`.
 fn psm_for(learned: &LearnedPsm, addr: &BleAddr, configured: u16) -> u16 {
-    learned
-        .lock()
-        .unwrap_or_else(|e| e.into_inner())
-        .get(addr)
-        .copied()
-        .unwrap_or(configured)
+    recall(learned).get(addr).copied().unwrap_or(configured)
 }
 
 /// A learned PSM that refused a dial is stale: forget it, so the next
@@ -218,7 +221,7 @@ fn psm_for(learned: &LearnedPsm, addr: &BleAddr, configured: u16) -> u16 {
 /// nothing would re-learn the entry, because `DeviceAdded` fires once per
 /// discovery session.
 fn forget_psm(learned: &LearnedPsm, addr: &BleAddr, dialled: u16) {
-    let mut learned = learned.lock().unwrap_or_else(|e| e.into_inner());
+    let mut learned = recall(learned);
     if learned.get(addr) == Some(&dialled) {
         learned.remove(addr);
     }
@@ -420,7 +423,7 @@ impl<I: BleIo> BleTransport<I> {
             scan_probe_task: None,
             neighbor_buffer: Arc::new(NeighborBuffer::new(transport_id)),
             stats: Arc::new(BleStats::new()),
-            learned_psm: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            learned_psm: Arc::default(),
             next_id: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -1125,6 +1128,11 @@ impl PendingProbes {
         self.entries.iter().position(|e| &e.addr == addr)
     }
 
+    /// Whether `addr` is in the book.
+    fn contains(&self, addr: &BleAddr) -> bool {
+        self.position(addr).is_some()
+    }
+
     /// Record a sighting. A previously unseen address becomes immediately
     /// eligible; a known one keeps whatever backoff it has earned, so a
     /// scanner that re-reports the same address many times a second cannot
@@ -1203,6 +1211,22 @@ impl PendingProbes {
     }
 }
 
+/// Log the addresses an address memory forgot to stay within its bound.
+fn log_evicted(evicted: Vec<BleAddr>) {
+    for addr in evicted {
+        debug!(
+            addr = %addr, bound = recall::MAX_RECALLED_ADDRS, outcome = "recall-evicted",
+            "BLE probe memory full, forgot the oldest address not in use"
+        );
+    }
+}
+
+/// Whether the probe loop still depends on what it learned about `addr`: a
+/// link is pooled there, or the address is in the retry book.
+fn is_live<S>(pool: &ConnectionPool<S>, pending: &PendingProbes, addr: &BleAddr) -> bool {
+    pending.contains(addr) || pool.contains(&addr.to_transport_addr())
+}
+
 /// Combined scan + probe loop.
 ///
 /// Scanner events arrive continuously (both sides advertise continuously).
@@ -1246,10 +1270,13 @@ async fn scan_probe_loop<I: io::BleIo>(
                     Some(advert) => {
                         if let Some(psm) = advert.psm {
                             trace!(addr = %advert.addr, psm, "BLE scan: learned peer PSM");
-                            learned_psm
-                                .lock()
-                                .unwrap_or_else(|e| e.into_inner())
-                                .insert(advert.addr.clone(), psm);
+                            let pool_guard = pool.lock().await;
+                            log_evicted(recall(&learned_psm).note(
+                                &advert.addr,
+                                psm,
+                                tokio::time::Instant::now(),
+                                |a| is_live(&pool_guard, &pending, a),
+                            ));
                         }
                         advert.addr
                     }
@@ -1263,6 +1290,9 @@ async fn scan_probe_loop<I: io::BleIo>(
                 // Re-probe pending addresses that aren't connected
                 let pool_guard = pool.lock().await;
                 pending.drop_connected(|a| pool_guard.contains(&a.to_transport_addr()));
+                recall(&learned_psm).prune(tokio::time::Instant::now(), |a| {
+                    is_live(&pool_guard, &pending, a)
+                });
                 drop(pool_guard);
                 // Rotating rather than always taking the head is what stops one
                 // slow or dead address from starving every other pending one.
@@ -2203,13 +2233,22 @@ mod tests {
         transport.start_async().await.unwrap();
 
         let learned = Arc::clone(&transport.learned_psm);
-        learned.lock().unwrap().insert(test_addr(2), 0x00C1);
+        let _ = learned.lock().unwrap().note(
+            &test_addr(2),
+            0x00C1,
+            tokio::time::Instant::now(),
+            |_| false,
+        );
         {
             let learned = Arc::clone(&learned);
             transport.io.set_connect_handler(move |addr, psm| {
                 dials.lock().unwrap().push((addr.clone(), psm));
                 // The peer re-advertised on a new PSM meanwhile.
-                learned.lock().unwrap().insert(addr.clone(), 0x00C2);
+                let _ =
+                    learned
+                        .lock()
+                        .unwrap()
+                        .note(addr, 0x00C2, tokio::time::Instant::now(), |_| false);
                 Err(TransportError::ConnectionRefused)
             });
         }
@@ -3234,5 +3273,191 @@ mod tests {
             }
             transport.stop_async().await.unwrap();
         }
+    }
+
+    // ------------------------------------------------------------------
+    // The probe loop's memory of addresses it has seen
+    // ------------------------------------------------------------------
+
+    /// One of a flood of distinct link addresses.
+    fn flood_addr(i: u16) -> BleAddr {
+        let [hi, lo] = i.to_be_bytes();
+        BleAddr {
+            adapter: "hci0".to_string(),
+            device: [0x20, 0x00, 0x00, 0x00, hi, lo],
+        }
+    }
+
+    /// Distinct addresses in each probe-memory flood: far more than any
+    /// bound the memory could reasonably have.
+    const FLOOD: u16 = 1_000;
+
+    /// A probing transport whose dials are logged, whose dials to `peer_at`
+    /// hand the remote end to the returned receiver, and whose every other
+    /// dial is hung up at once, so its link leaves the pool as it arrives.
+    fn psm_flood_transport(
+        peer_at: &BleAddr,
+        dials: DialLog,
+    ) -> (
+        BleTransport<MockBleIo>,
+        tokio::sync::mpsc::UnboundedReceiver<MockBleStream>,
+    ) {
+        let io = MockBleIo::new("hci0", test_addr(1));
+        let (peer_tx, peer_rx) = tokio::sync::mpsc::unbounded_channel();
+        let peer_at = peer_at.clone();
+        io.set_connect_handler(move |addr, psm| {
+            dials.lock().unwrap().push((addr.clone(), psm));
+            let (mine, theirs) = MockBleStream::pair(test_addr(1), addr.clone(), 2048);
+            if *addr == peer_at {
+                peer_tx
+                    .send(theirs)
+                    .map_err(|_| TransportError::ConnectionRefused)?;
+            }
+            Ok(mine)
+        });
+        let config = BleConfig {
+            scan: Some(true),
+            accept_connections: Some(false),
+            ..identity_test_config()
+        };
+        let (tx, _rx) = tokio::sync::mpsc::channel(64);
+        (
+            BleTransport::new(TransportId::new(1), None, config, io, tx),
+            peer_rx,
+        )
+    }
+
+    /// Advertise each of `FLOOD` new addresses with a PSM and wait until the
+    /// probe loop has read every one.
+    async fn flood_psm_adverts(transport: &BleTransport<MockBleIo>) {
+        let before = transport.stats.snapshot().scan_results;
+        for i in 0..FLOOD {
+            transport
+                .io
+                .inject_scan_advert(io::ScanAdvert::with_psm(flood_addr(i), 0x00C3))
+                .await;
+        }
+        let stats = Arc::clone(&transport.stats);
+        wait_for("every flood advert to be read", || {
+            stats.snapshot().scan_results >= before + u64::from(FLOOD)
+        })
+        .await;
+    }
+
+    /// The dials made to `addr`, in order, with the PSM each went to.
+    fn psms_dialled(dials: &DialLog, addr: &BleAddr) -> Vec<u16> {
+        dials
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(d, _)| d == addr)
+            .map(|(_, psm)| *psm)
+            .collect()
+    }
+
+    /// Advertisements from ever new addresses must not grow the probe memory
+    /// past its bound on non-live addresses, plus the live ones: the retry
+    /// book's addresses and the pool's, where each flood link sits until it
+    /// closes.
+    #[tokio::test]
+    async fn advertisements_from_ever_new_addresses_do_not_grow_the_probe_memory_past_its_bound() {
+        let dials: DialLog = Arc::default();
+        let (mut transport, _peer_rx) = psm_flood_transport(&test_addr(2), dials);
+        transport.start_async().await.unwrap();
+
+        flood_psm_adverts(&transport).await;
+
+        let remembered = recall(&transport.learned_psm).len();
+        let live = MAX_PENDING_PROBES + transport.config.max_connections();
+        assert!(
+            remembered <= recall::MAX_RECALLED_ADDRS + live,
+            "the probe memory holds {remembered} PSMs after {FLOOD} new advertising addresses"
+        );
+        transport.stop_async().await.unwrap();
+    }
+
+    /// A pooled peer is live, so a flood of new advertising addresses must
+    /// not cost it the PSM it advertised.
+    #[tokio::test]
+    async fn a_pooled_peers_learned_psm_survives_an_address_flood() {
+        let a = test_addr(2);
+        let dials: DialLog = Arc::default();
+        let (mut transport, mut peer_rx) = psm_flood_transport(&a, dials);
+        transport.start_async().await.unwrap();
+
+        transport
+            .io
+            .inject_scan_advert(io::ScanAdvert::with_psm(a.clone(), 0x00C1))
+            .await;
+        let theirs = tokio::time::timeout(std::time::Duration::from_secs(5), peer_rx.recv())
+            .await
+            .expect("the peer is probed")
+            .unwrap();
+        wait_for("the peer to be pooled", || pooled(&transport, &a)).await;
+        transport
+            .mark_verified(&a.to_transport_addr(), &node(2))
+            .await;
+
+        flood_psm_adverts(&transport).await;
+
+        assert!(
+            holds(&transport, &a).await,
+            "the peer's link is still pooled"
+        );
+        assert_eq!(
+            recall(&transport.learned_psm).get(&a).copied(),
+            Some(0x00C1),
+            "the pooled peer's learned PSM was lost to the flood"
+        );
+        drop(theirs);
+        transport.stop_async().await.unwrap();
+    }
+
+    /// A peer that advertised its PSM once, connected and went away is not
+    /// live, so a flood of new advertising addresses must not leave its PSM
+    /// remembered for ever: an unbounded memory keeps every one of them.
+    #[tokio::test]
+    async fn a_departed_peers_learned_psm_is_not_kept_through_a_thousand_new_advertising_addresses()
+    {
+        let a = test_addr(2);
+        let dials: DialLog = Arc::default();
+        let (mut transport, mut peer_rx) = psm_flood_transport(&a, Arc::clone(&dials));
+        transport.start_async().await.unwrap();
+
+        // The peer advertises its PSM once, is probed and pooled, then leaves.
+        transport
+            .io
+            .inject_scan_advert(io::ScanAdvert::with_psm(a.clone(), 0x00C1))
+            .await;
+        let theirs = tokio::time::timeout(std::time::Duration::from_secs(5), peer_rx.recv())
+            .await
+            .expect("the peer is probed")
+            .unwrap();
+        wait_for("the peer to be pooled", || pooled(&transport, &a)).await;
+        drop(theirs);
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        while holds(&transport, &a).await {
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "timed out waiting for the peer's link to close"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(1)).await;
+        }
+
+        flood_psm_adverts(&transport).await;
+
+        // The departed peer is seen again by a scan that carries no PSM.
+        transport.io.inject_scan_result(a.clone()).await;
+        wait_for("the departed peer to be probed again", || {
+            psms_dialled(&dials, &a).len() >= 2
+        })
+        .await;
+        assert_eq!(
+            psms_dialled(&dials, &a),
+            vec![0x00C1, DEFAULT_PSM],
+            "the probe memory still held the departed peer's PSM after {FLOOD} newer \
+             advertising addresses"
+        );
+        transport.stop_async().await.unwrap();
     }
 }
