@@ -54,7 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   any interface there, and naming an interface elsewhere is an error at
   start. The interface must exist when the daemon starts: unlike an
   Ethernet transport, an interface-bound UDP instance is not retried when
-  its interface appears later.
+  its interface appears later. The name is checked when the config is
+  loaded: an empty name, one over 15 bytes, or one holding `/`,
+  whitespace or a control character is refused, for UDP as for Ethernet
+  (an empty name would otherwise bind a Linux socket to no interface).
 
 - Dynamic interface binding for the Ethernet transport. An interface-bound
   transport is now a long-lived object that is *sometimes bound*: the interface
