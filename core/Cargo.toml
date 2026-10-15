@@ -37,8 +37,17 @@ libm = "0.2"
 # randomization.
 hashbrown = { version = "0.16", default-features = false }
 siphasher = { version = "1.0", default-features = false }
+# The AEAD backend that builds for every target (`noise::aead`).
+chacha20poly1305 = { version = "0.10", default-features = false }
+# The hosted AEAD backend, behind the `ring` feature: its assembly is faster,
+# but it does not build for bare-metal targets. The AEAD needs neither of its
+# defaults (`alloc`, `dev_urandom_fallback`).
+ring = { version = "0.17", default-features = false, optional = true }
 
 [features]
+# Use `ring` for the AEAD instead of RustCrypto (`noise::aead::AeadKey`).
+# Hosted builds turn it on; bare-metal builds must leave it off.
+ring = ["dep:ring"]
 # Test hooks in `proto`: methods and re-exports that only unit tests use to
 # set up or inspect state. This crate's tests see them through `cfg(test)`;
 # the root crate's tests see them because the root enables this feature from

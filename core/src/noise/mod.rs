@@ -5,6 +5,8 @@
 //! against. They are wire format. The handshake and the sessions that use
 //! them stay in the root crate's `noise` module, which re-exports these.
 
+pub mod aead;
+
 /// Size of the AEAD tag.
 pub const TAG_SIZE: usize = 16;
 
