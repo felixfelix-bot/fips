@@ -94,9 +94,9 @@ holds once they are no longer needed: the node's long-term private
 key when the identity is dropped, the static and ephemeral keypairs a
 Noise handshake holds, the chaining key and handshake hash, the
 per-message Diffie-Hellman results, the key-derivation outputs and the
-two session keys derived from them, the retained key on each cipher
-state, the bech32 and hex encodings of a secret, and the configuration
-text that carries `node.identity.nsec`. The SHA-256 state that hashes
+two session keys derived from them, the bech32 and hex encodings of a
+secret, and the configuration text that carries `node.identity.nsec`.
+The SHA-256 state that hashes
 each Diffie-Hellman result and the HMAC states inside HKDF clear
 themselves on drop, through the opt-in `zeroize` features of `sha2`
 and `hmac`, which the daemon turns on. A completed session keeps its

@@ -95,9 +95,16 @@ paths are not built, the tie is the check that keeps the daemon on
   attribute.
 - **The key hand-out is deliberately not `#[inline]`**
   (`send_cipher_clone`, `recv_cipher_clone`, `CipherState::cipher_clone`).
-  It builds and returns a keyed cipher, and inlining it into the root
-  measured slower on the `handout/send_cipher_clone` row of
-  `benches/noise_aead.rs`.
+  It clones and returns the cached keyed cipher. Inlining it into the
+  root measured slower on the `handout/send_cipher_clone` row of
+  `benches/noise_aead.rs`, but that was measured when the hand-out
+  rebuilt the cipher from retained key bytes, and has not been measured
+  again since. Against that rebuilding hand-out, the clone measured
+  29.2 ns to 28.2 ns on the hand-out row (median of five interleaved
+  rounds each, on a loaded host), within the +5 ns the change was held
+  to, and the `session/*` and `worker/*` rows moved by -2.5 to +0.1
+  percent, within +5 percent. The release daemon still calls the
+  hand-out rather than inlining it.
 - **The randomness comes from the host.** The ephemeral secret is filled
   by `E::fill`, and the ephemeral public key is derived with the shared
   context from `identity::secp()`; nothing here reads a random source

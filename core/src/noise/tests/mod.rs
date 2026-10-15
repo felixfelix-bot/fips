@@ -4,7 +4,6 @@ use alloc::vec;
 use alloc::vec::Vec;
 use rand::Rng;
 use secp256k1::Parity;
-use zeroize::Zeroize;
 
 type HandshakeState = handshake::HandshakeState<crate::testutil::TestEntropy>;
 
@@ -208,27 +207,35 @@ fn test_cipher_state_nonce_sequence() {
 }
 
 #[test]
-fn cipher_state_drop_impl_clears_the_retained_key() {
-    // Reading the bytes back out of a dropped `CipherState` would mean
-    // reading freed memory, so the drop behaviour is asserted through two
-    // observable proxies instead: that `CipherState` implements
-    // `ZeroizeOnDrop`, and that an explicit `zeroize()` leaves `key`
-    // all-zero while `has_key` is untouched.
+fn cipher_state_still_implements_zeroize_on_drop() {
+    // `CipherState` keeps no key bytes of its own, but keeps its
+    // `ZeroizeOnDrop` impl. On RustCrypto the key material is inside the
+    // cached `AeadKey`, which clears itself on drop; `ring`'s key has no
+    // clearing route, so there is nothing to assert for it.
     fn assert_zeroize_on_drop<T: zeroize::ZeroizeOnDrop>() {}
     assert_zeroize_on_drop::<CipherState>();
+    #[cfg(not(feature = "ring"))]
+    assert_zeroize_on_drop::<aead::AeadKey>();
+}
 
-    let mut cipher = CipherState::new([7u8; 32]);
-    // `key_bytes` hands back a copy of live key material, so the observation
-    // is bound and cleared rather than left in an unnamed temporary.
-    let mut observed = cipher.key_bytes();
-    assert_eq!(observed, [7u8; 32]);
-    observed.zeroize();
-    assert!(cipher.has_key());
+#[test]
+fn cipher_state_clone_and_handed_out_key_seal_like_the_original() {
+    let plaintext = b"cloned and handed-out keys";
+    let mut original = CipherState::new([0x5a; 32]);
+    let mut cloned = original.clone();
+    let handed = original
+        .cipher_clone()
+        .expect("a keyed state hands out a key");
 
-    cipher.zeroize();
+    let expected = original.encrypt(plaintext).unwrap();
+    assert_eq!(cloned.encrypt(plaintext).unwrap(), expected);
 
-    assert_eq!(cipher.key_bytes(), [0u8; 32]);
-    assert!(cipher.has_key());
+    let mut sealed = plaintext.to_vec();
+    let tag = aead::Aead::seal(&handed, &aead::nonce(0), &[], &mut sealed).unwrap();
+    sealed.extend_from_slice(&tag);
+    assert_eq!(sealed, expected);
+
+    assert!(CipherState::empty().cipher_clone().is_none());
 }
 
 #[test]

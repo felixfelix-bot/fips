@@ -6,7 +6,12 @@ Unit tests for `core/src/noise`.
   `#[cfg(test)] mod tests;`, so their names are `noise::tests::*`. The
   IK and XK handshakes end to end and their message sizes, the sessions
   and the replay window, the clearing of secrets on drop and by
-  `take_cleared` and `clear_slot`, and
+  `take_cleared` and `clear_slot`,
+  `cipher_state_still_implements_zeroize_on_drop` (the trait impl
+  `CipherState` keeps, and on RustCrypto that its `AeadKey` clears itself
+  on drop), `cipher_state_clone_and_handed_out_key_seal_like_the_original`
+  (a clone and the key `cipher_clone` hands out seal the same bytes as
+  the original, and an un-keyed state hands out none), and
   `test_cipher_state_output_is_pinned`, which pins `CipherState`'s
   transport bytes and so checks whichever AEAD backend the build uses.
   `HandshakeState` is named through `crate::testutil::TestEntropy`;
