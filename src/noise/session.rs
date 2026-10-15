@@ -1,4 +1,5 @@
 use super::{CipherState, HandshakeRole, NoiseError, ReplayWindow};
+use fips_core::noise::aead::AeadKey;
 use secp256k1::{PublicKey, XOnlyPublicKey};
 use std::fmt;
 
@@ -167,7 +168,7 @@ impl NoiseSession {
     }
 
     /// Clone the recv-side AEAD instance, for off-task decrypt workers.
-    pub fn recv_cipher_clone(&self) -> Option<ring::aead::LessSafeKey> {
+    pub fn recv_cipher_clone(&self) -> Option<AeadKey> {
         self.recv_cipher.cipher_clone()
     }
 
@@ -182,7 +183,7 @@ impl NoiseSession {
     /// Clone the send-side AEAD instance, for off-task encrypt workers.
     /// Pair with `take_send_counter` to keep counter assignment serial
     /// under the session's `&mut`.
-    pub fn send_cipher_clone(&self) -> Option<ring::aead::LessSafeKey> {
+    pub fn send_cipher_clone(&self) -> Option<AeadKey> {
         self.send_cipher.cipher_clone()
     }
 
