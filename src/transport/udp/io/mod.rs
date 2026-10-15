@@ -47,6 +47,8 @@ pub use windows::{AsyncUdpSocket, UdpRawSocket};
 #[cfg(target_os = "macos")]
 pub(crate) use macos::recvmsg_x_drain;
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use bind_device::bound_interface;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use connected::{ConnectedPeerSocket, PeerRecvDrain, open_connected_fd};
 

@@ -10,6 +10,10 @@
 use std::io;
 use std::os::unix::io::RawFd;
 
+#[cfg(test)]
+#[path = "tests/bind_device.rs"]
+mod tests;
+
 /// Bind `fd` to the interface named `name`. `v4` selects the IPv4 or IPv6
 /// option where the platform has one per family.
 #[cfg(target_os = "linux")]
@@ -84,4 +88,30 @@ pub(super) fn bind_to_interface(_fd: RawFd, name: &str, _v4: bool) -> io::Result
         io::ErrorKind::Unsupported,
         format!("udp.interface ({name}) is supported on Linux and macOS only"),
     ))
+}
+
+/// The interface `fd` is bound to, read back with `SO_BINDTODEVICE`; empty
+/// when it is bound to none. Lets tests see the binding the kernel holds
+/// rather than the name the code meant to pass.
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) fn bound_interface(fd: RawFd) -> io::Result<String> {
+    let mut buf = [0u8; libc::IFNAMSIZ];
+    let mut len = buf.len() as libc::socklen_t;
+    // SAFETY: `fd` is an open socket owned by the caller; `buf` and `len`
+    // describe a writable buffer of `IFNAMSIZ` bytes on the stack.
+    let r = unsafe {
+        libc::getsockopt(
+            fd,
+            libc::SOL_SOCKET,
+            libc::SO_BINDTODEVICE,
+            buf.as_mut_ptr() as *mut libc::c_void,
+            &mut len,
+        )
+    };
+    if r < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let name = &buf[..len as usize];
+    let end = name.iter().position(|&b| b == 0).unwrap_or(name.len());
+    Ok(String::from_utf8_lossy(&name[..end]).into_owned())
 }
