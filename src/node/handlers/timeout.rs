@@ -72,12 +72,15 @@ impl Node {
         }
 
         let now_ms = Self::now_ms();
+        let peering_now = Self::peering_now();
         let timeout_ms = self.config().node.rate_limit.handshake_timeout_secs * 1000;
 
         let stale = self.stale_connections(now_ms, timeout_ms);
         for action in self.fmp.poll_timeouts(stale) {
             match action {
-                ConnAction::ScheduleRetry { peer } => self.note_handshake_timeout(peer, now_ms),
+                ConnAction::ScheduleRetry { peer } => {
+                    self.note_handshake_timeout(peer, peering_now)
+                }
                 ConnAction::Teardown { link } => {
                     // Log before cleanup (needs live connection state). The
                     // failure signal is now read from the control machine; the
@@ -254,7 +257,7 @@ impl Node {
             };
             if reap {
                 if let Some(peer) = retry_peer {
-                    self.note_handshake_timeout(peer, now_ms);
+                    self.note_handshake_timeout(peer, crate::time::WallMillis(now_ms));
                 }
                 debug!(link_id = %link, "Handshake connection timed out");
                 self.cleanup_stale_connection(link, now_ms).await;

@@ -8,9 +8,7 @@
 //!   what the control API reports.
 //! - [`WallClock`] is a transitional clock over the wall clock, for code that
 //!   moves onto the core's time type before it moves onto the monotonic clock.
-//!
-//! Items that nothing outside this module's tests uses yet allow dead code in
-//! non-test builds; the code that adopts the core's time type uses them.
+//!   The peering retry schedule runs on it.
 
 use std::sync::LazyLock;
 use std::time::{Duration, Instant as StdInstant};
@@ -152,9 +150,8 @@ pub(crate) fn deadline<I: Instant>(now: I, d: Duration) -> I {
 /// the system clock moves it either way. It exists so code that measures time
 /// on the wall clock today can move onto the core's time type without changing
 /// behaviour, before a separate change moves it onto [`HostClock`]. It goes
-/// when nothing uses it.
+/// when nothing uses it; the peering retry schedule still does.
 #[derive(Clone, Copy, Debug, Default)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct WallClock;
 
 impl Clock for WallClock {
@@ -169,7 +166,6 @@ impl Clock for WallClock {
 /// millisecond arithmetic, the difference saturating at zero as
 /// `u64::saturating_sub` does.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash)]
-#[cfg_attr(not(test), allow(dead_code))]
 pub(crate) struct WallMillis(pub(crate) u64);
 
 impl Instant for WallMillis {

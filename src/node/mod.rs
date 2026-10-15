@@ -2503,7 +2503,7 @@ impl Node {
                 node_addr: *addr,
                 display_name: self.peer_display_name(addr),
                 retry_count: state.retry_count,
-                retry_after_ms: state.retry_after_ms,
+                retry_after_ms: state.retry_after.map_or(0, WallStamp::wall_ms),
                 auto_reconnect: state.reconnect,
             })
             .collect();

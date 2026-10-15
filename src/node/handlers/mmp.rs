@@ -719,7 +719,7 @@ impl Node {
             let held = self.peer_link(&node_addr);
             self.remove_active_peer(&node_addr);
             self.relink(&node_addr, held, None).await;
-            self.note_link_dead(node_addr, now_ms);
+            self.note_link_dead(node_addr, crate::time::WallMillis(now_ms));
             return;
         }
         let ambient = self.link_dead_ctx(&node_addr, now_ms);

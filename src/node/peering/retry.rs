@@ -10,6 +10,21 @@
 //! gate-guarded reflex call sites) live in [`super::driver`].
 
 use crate::config::PeerConfig;
+use fips_core::time::Clock;
+
+/// The clock the peering retry schedule is measured on. It is still the wall
+/// clock, as the schedule was before it took the core's time type; times the
+/// control API reports go through `WallStamp`.
+pub(crate) type PeeringClock = crate::time::WallClock;
+
+/// An instant on [`PeeringClock`].
+pub(crate) type PeeringInstant = <PeeringClock as Clock>::Instant;
+
+/// The peering clock's instant `ms` milliseconds after its test epoch.
+#[cfg(test)]
+pub(crate) fn peering_at(ms: u64) -> PeeringInstant {
+    crate::time::at::<PeeringClock>(ms)
+}
 
 /// Per-tick cap on retry-dial connection attempts (ceiling).
 pub(in crate::node) const MAX_RETRY_CONNECTIONS_PER_TICK: usize = 16;
@@ -22,17 +37,17 @@ pub struct RetryState {
     /// Number of retries attempted so far.
     pub retry_count: u32,
 
-    /// Timestamp (Unix ms) when the next retry should be attempted.
-    pub retry_after_ms: u64,
+    /// When the next retry should be attempted; `None` means it is due now.
+    pub(crate) retry_after: Option<PeeringInstant>,
 
     /// Whether this is an auto-reconnect (unlimited retries, ignores max_retries).
     pub reconnect: bool,
 
-    /// Optional absolute expiry for this retry entry (Unix ms).
+    /// Optional absolute expiry for this retry entry.
     ///
     /// When set, retries are dropped after this point even if reconnect logic
     /// would otherwise continue.
-    pub expires_at_ms: Option<u64>,
+    pub(crate) expires_at: Option<PeeringInstant>,
 }
 
 impl RetryState {
@@ -41,9 +56,9 @@ impl RetryState {
         Self {
             peer_config,
             retry_count: 0,
-            retry_after_ms: 0,
+            retry_after: None,
             reconnect: false,
-            expires_at_ms: None,
+            expires_at: None,
         }
     }
 }

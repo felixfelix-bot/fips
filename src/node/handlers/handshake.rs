@@ -2076,7 +2076,10 @@ impl Node {
             // an IK dial: the initiator's expected identity is fixed at
             // `start_handshake` and `complete_handshake` never overwrites it, so
             // it is still the peer we meant to dial and not whoever answered.
-            self.note_handshake_timeout(*peer_identity.node_addr(), packet.timestamp_ms);
+            self.note_handshake_timeout(
+                *peer_identity.node_addr(),
+                crate::time::WallMillis(packet.timestamp_ms),
+            );
             self.stats_mut()
                 .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
             return;

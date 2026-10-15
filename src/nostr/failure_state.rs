@@ -72,7 +72,7 @@ pub(super) struct FailureDecision {
     pub consecutive_failures: u32,
     /// True iff lifecycle should log at WARN; false → log at DEBUG.
     pub should_warn: bool,
-    /// If set, retry_after_ms for this peer should not fire before this
+    /// If set, the peer's scheduled retry should not fire before this
     /// wall-clock ms.
     pub cooldown_until_ms: Option<u64>,
     /// True only on the streak-threshold-crossing transition. Lifecycle

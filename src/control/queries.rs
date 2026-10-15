@@ -1521,7 +1521,7 @@ pub fn show_routing(node: &Node) -> Value {
                 "node_addr": hex::encode(addr.as_bytes()),
                 "display_name": node.peer_display_name(addr),
                 "retry_count": state.retry_count,
-                "retry_after_ms": state.retry_after_ms,
+                "retry_after_ms": state.retry_after.map_or(0, WallStamp::wall_ms),
                 "auto_reconnect": state.reconnect,
             })
         })

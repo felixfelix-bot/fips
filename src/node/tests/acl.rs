@@ -195,7 +195,7 @@ async fn test_outbound_msg2_acl_reject_reschedules_a_configured_peer() {
         .expect("the rejected dial is back on the retry schedule");
     assert_eq!(state.retry_count, 1, "counted as a first failure");
     assert!(
-        state.retry_after_ms > 1100,
+        state.retry_after > Some(crate::node::peering::retry::peering_at(1100)),
         "scheduled after the msg2 that triggered it"
     );
 

@@ -240,7 +240,7 @@ impl Victim {
         let now = Node::now_ms();
         self.node.check_timeouts().await;
         self.node.drive_peer_timers(now).await;
-        self.node.process_pending_retries(now).await;
+        self.node.process_pending_retries(Node::peering_now()).await;
         let q = self.q_dialled();
         if beacons > 0 {
             let key = self.p.pubkey();
@@ -297,7 +297,7 @@ async fn redial_delay_with(claims: Claims, pre: usize, window: usize) -> Option<
 
     // Q drops as a Disconnect does: removed, then the reconnect reflex.
     v.node.remove_active_peer(&v.q.clone());
-    v.node.note_link_dead(v.q, Node::now_ms());
+    v.node.note_link_dead(v.q, Node::peering_now());
     let dropped = Instant::now();
     println!(
         "CLAIM-SLOTS {claims:?} Q dropped: handshake_slots={} legs_claiming_P={} admission_ok={}",

@@ -18,11 +18,18 @@ use crate::identity::NodeAddr;
 use crate::node::{Node, NodeError};
 use crate::nostr::NostrRendezvous;
 use crate::peer::ActivePeer;
+use fips_core::time::Clock;
 use tracing::warn;
 
 use super::reconcile::{DiscoveryPools, Gate, PeeringAction};
+use super::retry::{PeeringClock, PeeringInstant};
 
 impl Node {
+    /// Now on the peering retry schedule's clock, [`PeeringClock`].
+    pub(in crate::node) fn peering_now() -> PeeringInstant {
+        PeeringClock::default().now()
+    }
+
     /// Reflex: an outbound handshake timed out (replaces the old
     /// `Node::schedule_retry` call sites).
     ///
@@ -30,7 +37,11 @@ impl Node {
     /// observe the peers map, so the driver drops the event when the peer is
     /// already connected — then feeds the gate-guarded reconciler reflex with
     /// the gate derived from the live published state.
-    pub(in crate::node) fn note_handshake_timeout(&mut self, node_addr: NodeAddr, now_ms: u64) {
+    pub(in crate::node) fn note_handshake_timeout(
+        &mut self,
+        node_addr: NodeAddr,
+        now: PeeringInstant,
+    ) {
         if self.peers.contains_key(&node_addr) {
             return;
         }
@@ -40,7 +51,7 @@ impl Node {
         let _ = self
             .peering
             .reconciler
-            .on_handshake_timeout(node_addr, now_ms, &policy, gate);
+            .on_handshake_timeout(node_addr, now, &policy, gate);
     }
 
     /// Reflex: a link went dead / a peer was lost (replaces the old
@@ -50,14 +61,14 @@ impl Node {
     /// disconnect event fires (`schedule_reconnect` had none). The gate is
     /// derived from the live published state so a drain self-suppresses the
     /// reconnect.
-    pub(in crate::node) fn note_link_dead(&mut self, node_addr: NodeAddr, now_ms: u64) {
+    pub(in crate::node) fn note_link_dead(&mut self, node_addr: NodeAddr, now: PeeringInstant) {
         let policy =
             self.build_peering_policy(self.config().auto_connect_peers().cloned().collect());
         let gate = Gate::from_state(self.supervisor.state);
         let _ = self
             .peering
             .reconciler
-            .on_link_dead(node_addr, now_ms, &policy, gate);
+            .on_link_dead(node_addr, now, &policy, gate);
     }
 
     /// Process pending retries whose time has arrived (replaces the old
@@ -65,13 +76,13 @@ impl Node {
     ///
     /// The pure retry-dial phase owns the decision — drop expired entries, refuse
     /// to grow when admission binds, dial the first `retry_per_tick` due entries
-    /// (bumping their `retry_after_ms` past the handshake window). This driver
+    /// (bumping their `retry_after` past the handshake window). This driver
     /// performs the advert-refetch + dial I/O each emitted `Connect` names, and
     /// on an immediate dial error feeds the `on_handshake_timeout` reflex so the
     /// optimistic re-fire suppression is overwritten by proper backoff. During a
     /// drain the gate is `Suspended`, so the reconcile clears the schedule and
     /// emits nothing.
-    pub(in crate::node) async fn process_pending_retries(&mut self, now_ms: u64) {
+    pub(in crate::node) async fn process_pending_retries(&mut self, now: PeeringInstant) {
         if self.peering.reconciler.retry_pending.is_empty() {
             return;
         }
@@ -87,7 +98,8 @@ impl Node {
             &observed,
             &budget,
             &DiscoveryPools::default(),
-            now_ms,
+            now,
+            Self::now_ms(),
             gate,
         );
 
@@ -130,7 +142,7 @@ impl Node {
             }
 
             match self.initiate_peer_connection(&peer_config).await {
-                // The core already pushed `retry_after_ms` past the handshake
+                // The core already pushed `retry_after` past the handshake
                 // window; a successful promotion clears the entry, a later
                 // timeout re-fires the reflex with proper backoff.
                 Ok(()) => {}
@@ -153,7 +165,7 @@ impl Node {
                     }
                     // Immediate failure counts as an attempt: overwrite the
                     // optimistic re-fire suppression with backoff.
-                    self.note_handshake_timeout(node_addr, now_ms);
+                    self.note_handshake_timeout(node_addr, now);
                 }
             }
         }

@@ -1872,6 +1872,81 @@ async fn test_open_discovery_sweep_queues_eligible_skips_filtered() {
     assert_eq!(node.peering.reconciler.retry_pending.len(), 1);
 }
 
+/// The startup sweep's age filter measures each advert's age against the
+/// wall clock, the clock its `created_at` stamp was written on, and not
+/// against the retry schedule's instant. With the schedule instant near its
+/// clock's epoch and a one-hour limit, an advert ten minutes old is enqueued
+/// and one two hours old is skipped.
+#[test]
+fn the_startup_sweep_age_filter_measures_advert_age_on_the_wall_clock() {
+    use crate::node::peering::reconcile::{
+        Budget, DiscoveryPools, Gate, Observed, PeeringReconciler, Policy,
+    };
+    use crate::node::peering::retry::peering_at;
+    use crate::nostr::{OverlayEndpointAdvert, OverlayTransportKind};
+
+    let wall_ms = crate::time::wall_ms();
+    let wall_secs = wall_ms / 1000;
+    let fresh = crate::PeerIdentity::from_pubkey(crate::Identity::generate().pubkey());
+    let stale = crate::PeerIdentity::from_pubkey(crate::Identity::generate().pubkey());
+    let advert = |peer: &crate::PeerIdentity, age_secs: u64| {
+        (
+            peer.npub(),
+            vec![OverlayEndpointAdvert {
+                transport: OverlayTransportKind::Udp,
+                addr: "203.0.113.7:2121".to_string(),
+            }],
+            wall_secs - age_secs,
+        )
+    };
+    let pools = DiscoveryPools {
+        overlay: vec![advert(&fresh, 10 * 60), advert(&stale, 2 * 60 * 60)],
+        startup_sweep_max_age_secs: Some(60 * 60),
+        ..DiscoveryPools::default()
+    };
+    let policy = Policy {
+        auto_connect_peers: Vec::new(),
+        max_peers: 0,
+        max_connections: 0,
+        max_links: 0,
+        retry_base_interval_ms: 1_000,
+        retry_max_backoff_ms: 60_000,
+        retry_max_retries: 5,
+        handshake_timeout_ms: 5_000,
+        open_discovery_enabled: true,
+        open_discovery_max_pending: 32,
+        open_discovery_expires_ms: 600_000,
+    };
+    let budget = Budget {
+        handshake_slots: 1_000,
+        link_slots: 1_000,
+        peer_slots: 1_000,
+        admission_ok: true,
+        discovery_per_tick: 16,
+        retry_per_tick: 16,
+        per_peer_cap: 4,
+    };
+
+    let mut reconciler = PeeringReconciler::default();
+    let (_, tally) = reconciler.reconcile_overlay(
+        &policy,
+        &Observed::default(),
+        &budget,
+        &pools,
+        peering_at(1_000),
+        wall_ms,
+        Gate::Reconciling,
+    );
+
+    assert_eq!(tally.enqueued, 1, "the ten-minute-old advert is enqueued");
+    assert_eq!(
+        tally.skipped_age, 1,
+        "the two-hour-old advert is skipped by the one-hour age limit"
+    );
+    assert!(reconciler.retry_state(fresh.node_addr()).is_some());
+    assert!(reconciler.retry_state(stale.node_addr()).is_none());
+}
+
 // ============================================================================
 // Per-Attempt Timeout State Machine — IF-3-A
 // ============================================================================

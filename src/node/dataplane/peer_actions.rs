@@ -610,10 +610,13 @@ impl Node {
                     // `note_link_dead` (`driver.rs:48`).
                     match kind {
                         LostKind::HandshakeTimeout => {
-                            self.note_handshake_timeout(peer, ambient.now_ms);
+                            self.note_handshake_timeout(
+                                peer,
+                                crate::time::WallMillis(ambient.now_ms),
+                            );
                         }
                         LostKind::LinkDead => {
-                            self.note_link_dead(peer, ambient.now_ms);
+                            self.note_link_dead(peer, crate::time::WallMillis(ambient.now_ms));
                         }
                     }
                 }
