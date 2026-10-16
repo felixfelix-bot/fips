@@ -511,7 +511,7 @@ impl TcpTransport {
         let timeout_ms = self.config.connect_timeout_ms();
 
         let connected =
-            connect_to_any_addr(self.transport_id, addr, &socket_addrs, timeout_ms).await;
+            connect_to_any_addr(self.transport_id, addr, &socket_addrs, timeout_ms, self.config.mptcp()).await;
         let stream = match connected {
             Ok(stream) => stream,
             Err(error @ TransportError::ConnectionRefused) => {
@@ -701,7 +701,7 @@ impl TcpTransport {
             // Failures are counted here, where they happen, as connect()
             // counts them; whoever later takes the result does not.
             let connected =
-                connect_to_any_addr(transport_id, &remote_addr, &socket_addrs, timeout_ms).await;
+                connect_to_any_addr(transport_id, &remote_addr, &socket_addrs, timeout_ms, config.mptcp()).await;
             let stream = match connected {
                 Ok(stream) => stream,
                 Err(error @ TransportError::ConnectionRefused) => {
@@ -1582,12 +1582,120 @@ async fn tcp_receive_loop(
 // Socket Configuration Helpers
 // ============================================================================
 
+/// Connect to the first reachable address, optionally over MPTCP.
+///
+/// Falls back to plain TCP when an MPTCP socket cannot be created (old
+/// kernel, MPTCP compiled out, or a sandbox that blocks the protocol). The
+/// fallback is expected on most of the mesh, so it is logged at `info`, not
+/// `warn`: failing hard here would take a node off the network for an
+/// optional optimisation.
+async fn connect_stream(
+    socket_addrs: &[SocketAddr],
+    mptcp: bool,
+) -> std::io::Result<TcpStream> {
+    if mptcp {
+        match try_connect_mptcp(socket_addrs).await {
+            Ok(stream) => return Ok(stream),
+            Err(error) => {
+                // Debug, not warn: falling back is the normal case on hosts
+                // without MPTCP support.
+                tracing::debug!(
+                    error = %error,
+                    "MPTCP unavailable, falling back to plain TCP"
+                );
+            }
+        }
+    }
+    TcpStream::connect(socket_addrs).await
+}
+
+/// Attempt an MPTCP connection, returning an error if the protocol is
+/// unavailable or the addresses are unreachable.
+///
+/// Each candidate is tried in resolver order, matching the plain-TCP path's
+/// behaviour so the two are interchangeable.
+#[cfg(target_os = "linux")]
+async fn try_connect_mptcp(socket_addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
+    use std::net::TcpStream as StdTcpStream;
+
+    let mut last_error = None;
+    for addr in socket_addrs {
+        let domain = match addr {
+            SocketAddr::V4(_) => socket2::Domain::IPV4,
+            SocketAddr::V6(_) => socket2::Domain::IPV6,
+        };
+        let socket = match socket2::Socket::new(
+            domain,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::MPTCP),
+        ) {
+            Ok(socket) => socket,
+            // The protocol itself is unavailable; no point trying the rest.
+            Err(error) => return Err(error),
+        };
+        if let Err(error) = socket.set_nonblocking(true) {
+            last_error = Some(error);
+            continue;
+        }
+        match socket.connect(&(*addr).into()) {
+            Ok(()) => {}
+            Err(error) if error.raw_os_error() == Some(libc::EINPROGRESS) => {}
+            Err(error) if error.raw_os_error() == Some(libc::EALREADY) => {}
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        }
+        let std_stream: StdTcpStream = socket.into();
+        match TcpStream::from_std(std_stream) {
+            Ok(stream) => {
+                // Wait for the handshake to complete, mirroring what
+                // TcpStream::connect would have done for us.
+                match stream.writable().await {
+                    Ok(()) => {
+                        if let Some(error) = stream.take_error()? {
+                            last_error = Some(error);
+                            continue;
+                        }
+                        return Ok(stream);
+                    }
+                    Err(error) => {
+                        last_error = Some(error);
+                        continue;
+                    }
+                }
+            }
+            Err(error) => {
+                last_error = Some(error);
+                continue;
+            }
+        }
+    }
+
+    Err(last_error.unwrap_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "no addresses to connect to",
+        )
+    }))
+}
+
+/// On non-Linux there is no MPTCP protocol to try.
+#[cfg(not(target_os = "linux"))]
+async fn try_connect_mptcp(_socket_addrs: &[SocketAddr]) -> std::io::Result<TcpStream> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "MPTCP is not supported on this platform",
+    ))
+}
+
 /// Connect to the first reachable of a peer's resolved addresses within one timeout.
 async fn connect_to_any_addr(
     transport_id: TransportId,
     remote_addr: &TransportAddr,
     socket_addrs: &[SocketAddr],
     timeout_ms: u64,
+    mptcp: bool,
 ) -> Result<TcpStream, TransportError> {
     if socket_addrs.is_empty() {
         return Err(TransportError::InvalidAddress(format!(
@@ -1599,7 +1707,7 @@ async fn connect_to_any_addr(
     // Try candidates in resolver order within one overall connection timeout.
     match tokio::time::timeout(
         Duration::from_millis(timeout_ms),
-        TcpStream::connect(socket_addrs),
+        connect_stream(socket_addrs, mptcp),
     )
     .await
     {
@@ -1768,7 +1876,7 @@ mod tests {
 
         let remote = TransportAddr::from_string(&format!("localhost:{}", good_addr.port()));
         let stream =
-            connect_to_any_addr(TransportId::new(1), &remote, &[bad_addr, good_addr], 1_000)
+            connect_to_any_addr(TransportId::new(1), &remote, &[bad_addr, good_addr], 1_000, false)
                 .await
                 .expect("second TCP candidate should connect");
         let (accepted, _) = timeout(Duration::from_secs(1), listener.accept())
@@ -1784,11 +1892,11 @@ mod tests {
         let id = TransportId::new(1);
         let remote = TransportAddr::from_string("localhost:0");
         assert!(matches!(
-            connect_to_any_addr(id, &remote, &[], 1_000).await,
+            connect_to_any_addr(id, &remote, &[], 1_000, false).await,
             Err(TransportError::InvalidAddress(ref message)) if message.ends_with("localhost:0")
         ));
         assert!(matches!(
-            connect_to_any_addr(id, &remote, &["127.0.0.1:0".parse().unwrap()], 1_000).await,
+            connect_to_any_addr(id, &remote, &["127.0.0.1:0".parse().unwrap()], 1_000, false).await,
             Err(TransportError::ConnectionRefused)
         ));
     }
@@ -1802,9 +1910,9 @@ mod tests {
         // this capture is the only subscriber caches its own thread's "never"
         // interest; installing the capture rebuilds already-registered
         // callsites, so registering first makes the capture see the event.
-        let _ = connect_to_any_addr(TransportId::new(7), &remote, &refused, 1_000).await;
+        let _ = connect_to_any_addr(TransportId::new(7), &remote, &refused, 1_000, false).await;
         let (logs, guard) = crate::testutil::capture_logs_scoped();
-        let result = connect_to_any_addr(TransportId::new(7), &remote, &refused, 1_000).await;
+        let result = connect_to_any_addr(TransportId::new(7), &remote, &refused, 1_000, false).await;
         drop(guard);
 
         assert!(matches!(result, Err(TransportError::ConnectionRefused)));

@@ -450,6 +450,21 @@ pub struct TcpConfig {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub max_inbound_per_source: Option<usize>,
 
+    /// Enable MPTCP (multipath TCP) for this transport's connections.
+    ///
+    /// When true, outgoing sockets are created with the MPTCP protocol so a
+    /// single connection can spread over several local addresses/uplinks.
+    /// Requires a Linux kernel with MPTCP enabled (`net.mptcp.enabled=1`),
+    /// at least two local addresses reachable by the peer, and matching
+    /// `ip mptcp endpoint`/`ip mptcp limits` configuration on the node.
+    ///
+    /// Off by default, and falls back to plain TCP when unavailable, so
+    /// enabling it is safe on a heterogeneous mesh. Aggregate throughput is
+    /// typically 1.2-1.3x, not the sum of the links: this buys resilience
+    /// and better use of idle capacity, not N-times bandwidth.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mptcp: Option<bool>,
+
     /// Whether this transport should be advertised on Nostr overlay discovery.
     /// Default: false.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -509,6 +524,14 @@ impl TcpConfig {
     pub fn max_inbound_per_source(&self) -> usize {
         self.max_inbound_per_source
             .unwrap_or(DEFAULT_TCP_MAX_INBOUND_PER_SOURCE)
+    }
+
+    /// Whether MPTCP is enabled for this transport. Default: false.
+    ///
+    /// Off by default: a node that has never opted in must behave exactly as
+    /// it did before this option existed.
+    pub fn mptcp(&self) -> bool {
+        self.mptcp.unwrap_or(false)
     }
 
     /// Whether this TCP transport should be advertised on Nostr discovery.
@@ -1188,5 +1211,38 @@ mod tests {
         assert_eq!(with(Some(1_000)).verify_grace(), secs(10));
         assert_eq!(with(Some(30_000)).verify_grace(), secs(30));
         assert_eq!(with(None).verify_grace(), secs(10));
+    }
+
+    /// MPTCP is opt-in. A node whose config predates the option — or that
+    /// simply does not set it — must stay on plain TCP, because silently
+    /// switching a mesh onto multipath is a connectivity change, not a
+    /// preference.
+    #[test]
+    fn tcp_mptcp_defaults_to_off_and_round_trips_when_set() {
+        let bare: TcpConfig = serde_yaml::from_str("bind_addr: \"0.0.0.0:443\"\n").unwrap();
+        assert!(!bare.mptcp(), "mptcp must default to off");
+
+        // Absent from the serialized form too, so a default config written
+        // back does not acquire an explicit `mptcp: false`.
+        assert!(!serde_yaml::to_string(&bare).unwrap().contains("mptcp"));
+
+        let opted: TcpConfig = serde_yaml::from_str("mptcp: true\n").unwrap();
+        assert!(opted.mptcp());
+        let round: TcpConfig =
+            serde_yaml::from_str(&serde_yaml::to_string(&opted).unwrap()).unwrap();
+        assert!(round.mptcp());
+    }
+
+    /// The option must not weaken the existing typo protection: an unknown
+    /// key is still a hard error, so a misspelled `mptcp` cannot silently
+    /// leave a node on plain TCP after the operator believes they enabled it.
+    #[test]
+    fn tcp_config_still_rejects_unknown_keys() {
+        let err = serde_yaml::from_str::<TcpConfig>("mptpc: true\n").unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown field") || msg.contains("mptpc"),
+            "a misspelled key must be rejected, got: {msg}"
+        );
     }
 }
