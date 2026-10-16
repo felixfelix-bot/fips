@@ -3,10 +3,11 @@
 //! Prevents routing error floods (CoordsRequired / PathBroken) by
 //! rate-limiting error signals per destination address at transit nodes.
 //!
-//! Runtime-agnostic: the clock is injected as `now_ms` (Unix milliseconds,
-//! the `Node::now_ms()` wall-clock basis) rather than read internally, and
-//! per-destination state lives in an `alloc` `BTreeMap` for `no_std`
-//! portability and deterministic ordering.
+//! Runtime-agnostic: the clock is injected as `now_ms`, the caller's
+//! millisecond clock, rather than read internally, and per-destination state
+//! lives in an `alloc` `BTreeMap` for `no_std` portability and deterministic
+//! ordering. Only differences between two readings are compared, so the
+//! caller picks the epoch; each instance must be fed from one clock.
 
 use crate::identity::NodeAddr;
 use crate::proto::rate_limit::{PerAddrRateLimiter, RecordOutcome};

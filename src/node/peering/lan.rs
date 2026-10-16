@@ -528,7 +528,7 @@ mod tests {
                 &observed,
                 &budget(),
                 &pools,
-                now_ms,
+                crate::node::peering::retry::peering_at(now_ms),
                 Gate::Reconciling,
             );
             for action in actions {

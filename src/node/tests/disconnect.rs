@@ -278,7 +278,7 @@ async fn test_disconnect_clears_session() {
             node0_addr,
             remote_identity.pubkey_full(),
             EndToEndState::Established(session),
-            1_000,
+            crate::node::session::session_at(1_000),
             true,
         );
         nodes[1].node.sessions.insert(node0_addr, entry);

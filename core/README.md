@@ -17,12 +17,18 @@ moves in from the root crate one module at a time. So far it holds:
 - the coordinate cache, `CoordCache`, re-exported under `fips::cache`;
 - `EntropySource`, the trait through which the host supplies random
   bytes;
+- `time::Clock` and `time::Instant`, the traits through which the host
+  supplies the time, with `Duration` from `core::time`;
 - the transport value types: `TransportId`, `LinkId`, `LinkDirection`,
   `TransportAddr` and `LinkStats`, re-exported under `fips::transport`.
   The transports themselves stay in the root crate;
 - `SessionIndex`, its random allocator `IndexAllocator` and
   `IndexError`, re-exported under `fips::utils::index`, where
   `IndexAllocator` is an alias over `OsEntropy`;
+- the rate limiters (`node::rate_limit`) and the stats history
+  (`node::stats_history`), generic over `time::Clock` and re-exported
+  under the root crate's `node::rate_limit` and `node::stats_history`
+  with aliases over its `HostClock`;
 - Noise: the XX handshake, the transport sessions, the replay
   window, the cipher state and the AEAD under it, with the handshake
   message sizes. All but the AEAD are re-exported under `fips::noise`;
@@ -79,8 +85,13 @@ time T"), not as a suspended task.
 
 **Time is an argument.** Never read a clock. Functions that need the
 time take it as a parameter, and timeouts are deadlines the caller
-schedules. This is what makes the state machines testable with
-synthetic timestamps.
+schedules. A type that measures time takes the host's clock as a type
+parameter bounded by `time::Clock` and takes its instants as arguments;
+it never calls `Clock::now`, which is for the host. The host fixes the
+parameter in a type alias, as it does for the entropy source below: the
+root crate's is `HostClock`, its monotonic clock. This is what makes the
+state machines testable with synthetic timestamps, and what lets an
+embedded host supply its own timer.
 
 **Randomness is an argument.** Never reach for a thread-local or OS
 random source. Code that needs random bytes or a nonce takes them from

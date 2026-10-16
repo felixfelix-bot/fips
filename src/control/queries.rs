@@ -6,6 +6,8 @@
 use crate::identity::{NodeAddr, PeerIdentity, encode_npub};
 use crate::node::Node;
 use crate::node::stats_history::{ALL_METRICS, ALL_PEER_METRICS, Granularity, Metric, PeerMetric};
+use crate::time::{HostClock, WallStamp};
+use fips_core::time::{Clock as _, Instant as _};
 use serde_json::{Value, json};
 use std::str::FromStr;
 use std::time::Duration;
@@ -764,7 +766,7 @@ pub fn show_sessions(node: &Node) -> Value {
                 "display_name": node.peer_display_name(addr),
                 "state": state_str,
                 "is_initiator": entry.is_initiator(),
-                "last_activity_ms": entry.last_activity(),
+                "last_activity_ms": entry.last_activity().wall_ms(),
             });
 
             // Derive npub from session's remote public key
@@ -787,7 +789,8 @@ pub fn show_sessions(node: &Node) -> Value {
 
             // Rekey and session health (visible when established)
             if entry.is_established() {
-                session_json["session_start_ms"] = json!(entry.session_start_ms());
+                session_json["session_start_ms"] =
+                    json!(entry.session_start().map_or(0, WallStamp::wall_ms));
                 session_json["current_k_bit"] = json!(entry.current_k_bit());
                 session_json["coords_warmup_remaining"] = json!(entry.coords_warmup_remaining());
                 session_json["is_draining"] = json!(entry.is_draining());
@@ -1531,7 +1534,7 @@ pub fn show_routing(node: &Node) -> Value {
                 "node_addr": hex::encode(addr.as_bytes()),
                 "display_name": node.peer_display_name(addr),
                 "retry_count": state.retry_count,
-                "retry_after_ms": state.retry_after_ms,
+                "retry_after_ms": state.retry_after.map_or(0, WallStamp::wall_ms),
                 "auto_reconnect": state.reconnect,
             })
         })
@@ -2159,13 +2162,15 @@ pub(crate) fn show_stats_all_history_from_handle(
 /// peer selectors and to confirm a peer is in the retention window.
 pub fn show_stats_peers(node: &Node) -> Value {
     let hist = node.stats_history();
-    let now = std::time::Instant::now();
+    let now = HostClock.now();
 
     let mut peers: Vec<Value> = hist
         .peers()
         .map(|(addr, rings)| {
-            let last_contact_secs = now.duration_since(rings.last_contact()).as_secs();
-            let first_seen_secs = now.duration_since(rings.first_seen()).as_secs();
+            let last_contact_secs = now
+                .saturating_duration_since(rings.last_contact())
+                .as_secs();
+            let first_seen_secs = now.saturating_duration_since(rings.first_seen()).as_secs();
             let is_active = node.peers().any(|p| p.node_addr() == addr);
             let npub = node
                 .peers()
@@ -2221,13 +2226,15 @@ pub(crate) fn show_stats_peers_from_handle(
     let stats = handle.stats();
     let hist = &stats.history;
     let meta = &stats.peer_meta;
-    let now = std::time::Instant::now();
+    let now = HostClock.now();
 
     let mut peers: Vec<Value> = hist
         .peers()
         .map(|(addr, rings)| {
-            let last_contact_secs = now.duration_since(rings.last_contact()).as_secs();
-            let first_seen_secs = now.duration_since(rings.first_seen()).as_secs();
+            let last_contact_secs = now
+                .saturating_duration_since(rings.last_contact())
+                .as_secs();
+            let first_seen_secs = now.saturating_duration_since(rings.first_seen()).as_secs();
             let (is_active, npub, display_name) = match meta.get(addr) {
                 Some(m) => (m.is_active, m.npub.clone(), m.display_name.clone()),
                 None => (false, hex::encode(addr.as_bytes()), addr.short_hex()),

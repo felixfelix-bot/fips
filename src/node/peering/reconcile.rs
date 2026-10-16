@@ -7,7 +7,8 @@
 //! [`PeeringAction`] names and reports results back as reflex events
 //! ([`PeeringReconciler::on_handshake_timeout`] /
 //! [`PeeringReconciler::on_link_dead`]). The core reads no clock, performs no
-//! I/O, and holds no runtime handles — time enters only as the `now` input, and
+//! I/O, and holds no runtime handles — time enters only as the `now` input (and,
+//! for the overlay layer's advert ages, a wall-clock `wall_ms` input), and
 //! the live dataplane maps enter only as an immutable [`Observed`] snapshot — so
 //! it is unit-testable with synthetic inputs and survives a later
 //! thread-boundary move. It mirrors the
@@ -42,7 +43,7 @@
 //!
 //! The durable `retry_pending` schedule survives between the reconcile
 //! invocations at the two relevant cadence slots. The overlay layer at the
-//! nostr-poll slot *enqueues* entries at `retry_after_ms = now`; the retry-dial
+//! nostr-poll slot *enqueues* entries at `retry_after = Some(now)`; the retry-dial
 //! phase at the retry slot *dials* those now-due entries. Layer order within a
 //! single call runs the retry-dial phase **before** the overlay enqueue, so an
 //! overlay enqueue never dials in its own call — reproducing today's
@@ -68,6 +69,7 @@
 //! just closed. `NotRunning` is the inert startup gate.
 
 use std::collections::{HashMap, HashSet};
+use std::time::Duration;
 
 use crate::PeerIdentity;
 use crate::config::{ConnectPolicy, PeerAddress, PeerConfig};
@@ -75,10 +77,11 @@ use crate::identity::NodeAddr;
 use crate::node::NodeState;
 use crate::nostr::{OverlayEndpointAdvert, RendezvousDriver};
 use crate::proto::fmp::backoff_ms;
+use crate::time::deadline;
 use crate::transport::{TransportAddr, TransportId};
 
 use super::lan::MAX_LAN_DIALS_IN_FLIGHT;
-use super::retry::RetryState;
+use super::retry::{PeeringInstant, RetryState};
 
 /// Drain/run gate derived from the supervisor's published [`NodeState`].
 /// Not a bare bool: it must also express "not yet running" (the
@@ -360,13 +363,18 @@ impl PeeringReconciler {
     /// Reconcile the observed peer set toward the desired-state policy, returning
     /// the actions the driver must perform. See the module docs for the four
     /// layers, the two-phase overlay timing, and the cadence contract.
+    /// `now` is the retry schedule's clock and `wall_ms` the wall clock the
+    /// overlay layer measures advert ages on (see
+    /// [`Self::layer_overlay_enqueue`]).
+    #[allow(clippy::too_many_arguments)]
     pub(crate) fn reconcile(
         &mut self,
         policy: &Policy,
         observed: &Observed,
         budget: &Budget,
         pools: &DiscoveryPools,
-        now: u64,
+        now: PeeringInstant,
+        wall_ms: u64,
         gate: Gate,
     ) -> Vec<PeeringAction> {
         // Gate prologue.
@@ -396,6 +404,7 @@ impl PeeringReconciler {
             budget,
             pools,
             now,
+            wall_ms,
             &mut actions,
             &mut OverlaySweepTally::default(),
         );
@@ -419,13 +428,15 @@ impl PeeringReconciler {
     /// slot. The returned [`PeeringAction::ScheduleRetry`] items are
     /// observability only; the durable mutation is the insert the layer performed
     /// into `retry_pending`, dialed at the later retry slot (two-phase).
+    #[allow(clippy::too_many_arguments)]
     pub(in crate::node) fn reconcile_overlay(
         &mut self,
         policy: &Policy,
         observed: &Observed,
         budget: &Budget,
         pools: &DiscoveryPools,
-        now: u64,
+        now: PeeringInstant,
+        wall_ms: u64,
         gate: Gate,
     ) -> (Vec<PeeringAction>, OverlaySweepTally) {
         match gate {
@@ -442,6 +453,7 @@ impl PeeringReconciler {
             budget,
             pools,
             now,
+            wall_ms,
             &mut actions,
             &mut tally,
         );
@@ -472,7 +484,7 @@ impl PeeringReconciler {
         observed: &Observed,
         budget: &Budget,
         pools: &DiscoveryPools,
-        _now: u64,
+        _now: PeeringInstant,
         gate: Gate,
     ) -> Vec<PeeringAction> {
         match gate {
@@ -522,7 +534,7 @@ impl PeeringReconciler {
         policy: &Policy,
         observed: &Observed,
         budget: &Budget,
-        now: u64,
+        now: PeeringInstant,
         actions: &mut Vec<PeeringAction>,
     ) {
         if self.retry_pending.is_empty() {
@@ -535,8 +547,8 @@ impl PeeringReconciler {
             .iter()
             .filter_map(|(addr, state)| {
                 state
-                    .expires_at_ms
-                    .filter(|expires_at_ms| now >= *expires_at_ms)
+                    .expires_at
+                    .filter(|expires_at| now >= *expires_at)
                     .map(|_| *addr)
             })
             .collect();
@@ -557,7 +569,7 @@ impl PeeringReconciler {
         let due: Vec<NodeAddr> = self
             .retry_pending
             .iter()
-            .filter(|(_, state)| now >= state.retry_after_ms)
+            .filter(|(_, state)| state.retry_after.is_none_or(|at| now >= at))
             .map(|(addr, _)| *addr)
             .collect();
 
@@ -577,7 +589,10 @@ impl PeeringReconciler {
             actions.push(PeeringAction::Connect(candidate));
             // Suppress re-fire until the handshake window closes (retry.rs:298).
             if let Some(state) = self.retry_pending.get_mut(&addr) {
-                state.retry_after_ms = now + policy.handshake_timeout_ms;
+                state.retry_after = Some(deadline(
+                    now,
+                    Duration::from_millis(policy.handshake_timeout_ms),
+                ));
             }
         }
     }
@@ -588,6 +603,11 @@ impl PeeringReconciler {
     /// available outbound slots). No `>= N` set-point floor. Enqueues due-now
     /// retry entries; the dial happens on a later
     /// retry-slot invocation (two-phase).
+    ///
+    /// `now` places the entries on the retry schedule. `wall_ms` is Unix time
+    /// in milliseconds, for what is measured against the adverts' own
+    /// wall-clock stamps: the startup-sweep age filter and each address's
+    /// `seen_at_ms`.
     #[allow(clippy::too_many_arguments)]
     fn layer_overlay_enqueue(
         &mut self,
@@ -595,14 +615,15 @@ impl PeeringReconciler {
         observed: &Observed,
         budget: &Budget,
         pools: &DiscoveryPools,
-        now: u64,
+        now: PeeringInstant,
+        wall_ms: u64,
         actions: &mut Vec<PeeringAction>,
         tally: &mut OverlaySweepTally,
     ) {
         if !policy.open_discovery_enabled {
             return;
         }
-        let now_secs = now / 1000;
+        let now_secs = wall_ms / 1000;
 
         // open_discovery_enqueue_budget: cap_remaining ∧ available_outbound_slots
         // (== handshake_slots ∧ peer_slots). Note this is min(cap, handshake,
@@ -644,9 +665,9 @@ impl PeeringReconciler {
                     if !observed.connected.contains(&addr)
                         && !observed.connecting.contains(&addr)
                         && let Some(state) = self.retry_pending.get_mut(&addr)
-                        && state.retry_after_ms > now
+                        && state.retry_after.is_some_and(|at| at > now)
                     {
-                        state.retry_after_ms = now;
+                        state.retry_after = Some(now);
                     }
                 }
                 tally.skipped_configured = tally.skipped_configured.saturating_add(1);
@@ -682,7 +703,7 @@ impl PeeringReconciler {
             let mut priority = 120u8;
             for endpoint in endpoints {
                 let Some(candidate) =
-                    RendezvousDriver::overlay_endpoint_to_peer_address(endpoint, priority, now)
+                    RendezvousDriver::overlay_endpoint_to_peer_address(endpoint, priority, wall_ms)
                 else {
                     continue;
                 };
@@ -709,8 +730,11 @@ impl PeeringReconciler {
                 via_nostr: false,
             });
             state.reconnect = false;
-            state.retry_after_ms = now;
-            state.expires_at_ms = Some(now.saturating_add(policy.open_discovery_expires_ms));
+            state.retry_after = Some(now);
+            state.expires_at = Some(deadline(
+                now,
+                Duration::from_millis(policy.open_discovery_expires_ms),
+            ));
             self.retry_pending.insert(addr, state);
             actions.push(PeeringAction::ScheduleRetry {
                 peer: addr,
@@ -870,7 +894,7 @@ impl PeeringReconciler {
     pub(crate) fn on_handshake_timeout(
         &mut self,
         addr: NodeAddr,
-        now: u64,
+        now: PeeringInstant,
         policy: &Policy,
         gate: Gate,
     ) -> Vec<PeeringAction> {
@@ -891,7 +915,7 @@ impl PeeringReconciler {
                 return Vec::new();
             }
             let delay = backoff_ms(state.retry_count, base, cap);
-            state.retry_after_ms = now + delay;
+            state.retry_after = Some(deadline(now, Duration::from_millis(delay)));
             return vec![PeeringAction::ScheduleRetry {
                 peer: addr,
                 backoff_ms: delay,
@@ -915,7 +939,7 @@ impl PeeringReconciler {
         state.retry_count = 1;
         state.reconnect = true;
         let delay = backoff_ms(state.retry_count, base, cap);
-        state.retry_after_ms = now + delay;
+        state.retry_after = Some(deadline(now, Duration::from_millis(delay)));
         self.retry_pending.insert(addr, state);
         vec![PeeringAction::ScheduleRetry {
             peer: addr,
@@ -930,7 +954,7 @@ impl PeeringReconciler {
     pub(crate) fn on_link_dead(
         &mut self,
         addr: NodeAddr,
-        now: u64,
+        now: PeeringInstant,
         policy: &Policy,
         gate: Gate,
     ) -> Vec<PeeringAction> {
@@ -959,7 +983,7 @@ impl PeeringReconciler {
             state.reconnect = true;
             state.retry_count += 1;
             let delay = backoff_ms(state.retry_count, base, cap);
-            state.retry_after_ms = now + delay;
+            state.retry_after = Some(deadline(now, Duration::from_millis(delay)));
             return vec![PeeringAction::ScheduleRetry {
                 peer: addr,
                 backoff_ms: delay,
@@ -969,7 +993,7 @@ impl PeeringReconciler {
         let mut state = RetryState::new(peer_config);
         state.reconnect = true;
         let delay = backoff_ms(state.retry_count, base, cap);
-        state.retry_after_ms = now + delay;
+        state.retry_after = Some(deadline(now, Duration::from_millis(delay)));
         self.retry_pending.insert(addr, state);
         vec![PeeringAction::ScheduleRetry {
             peer: addr,
@@ -1027,6 +1051,7 @@ mod claim_tests;
 mod tests {
     use super::*;
     use crate::identity::Identity;
+    use crate::node::peering::retry::peering_at;
 
     const BASE_MS: u64 = 1_000;
     const CAP_MS: u64 = 60_000;
@@ -1107,6 +1132,7 @@ mod tests {
             &observed,
             &ample_budget(),
             &DiscoveryPools::default(),
+            peering_at(10_000),
             10_000,
             Gate::Reconciling,
         );
@@ -1147,7 +1173,7 @@ mod tests {
         // Seed a due retry, an overlay candidate, and a transport neighbor.
         let seed = |r: &mut PeeringReconciler| {
             let mut st = RetryState::new(auto_peer(&retry_npub));
-            st.retry_after_ms = 0;
+            st.retry_after = None;
             r.insert_retry_for_test(retry_addr, st);
         };
         let pools = || DiscoveryPools {
@@ -1180,6 +1206,7 @@ mod tests {
                 &Observed::default(),
                 &b,
                 &pools(),
+                peering_at(10_000),
                 10_000,
                 Gate::Reconciling,
             );
@@ -1206,6 +1233,7 @@ mod tests {
                 &Observed::default(),
                 &b,
                 &pools(),
+                peering_at(10_000),
                 10_000,
                 Gate::Reconciling,
             );
@@ -1236,6 +1264,7 @@ mod tests {
                 &Observed::default(),
                 &b,
                 &neigh_only,
+                peering_at(10_000),
                 10_000,
                 Gate::Reconciling,
             );
@@ -1257,19 +1286,23 @@ mod tests {
 
         let mut r = PeeringReconciler::default();
         // First link-dead: fresh entry, retry_count stays 0, delay = backoff(0).
-        let out = r.on_link_dead(addr, 1_000, &policy, Gate::Reconciling);
+        let out = r.on_link_dead(addr, peering_at(1_000), &policy, Gate::Reconciling);
         assert!(matches!(
             out.as_slice(),
             [PeeringAction::ScheduleRetry { .. }]
         ));
         let st = r.retry_state(&addr).expect("entry scheduled");
         assert_eq!(st.retry_count, 0);
-        assert_eq!(st.retry_after_ms, 1_000 + backoff_ms(0, BASE_MS, CAP_MS));
+        assert_eq!(
+            st.retry_after,
+            Some(peering_at(1_000 + backoff_ms(0, BASE_MS, CAP_MS)))
+        );
 
         // A later retry-slot reconcile (now past retry_after) dials once. The
         // retry-slot policy has an empty config floor (cadence contract),
         // so the single Connect comes only from the retry-dial phase.
-        let now = 1_000 + backoff_ms(0, BASE_MS, CAP_MS);
+        let now_ms = 1_000 + backoff_ms(0, BASE_MS, CAP_MS);
+        let now = peering_at(now_ms);
         let tick_policy = base_policy();
         let actions = r.reconcile(
             &tick_policy,
@@ -1277,6 +1310,7 @@ mod tests {
             &ample_budget(),
             &DiscoveryPools::default(),
             now,
+            now_ms,
             Gate::Reconciling,
         );
         assert_eq!(count_connects(&actions), 1);
@@ -1286,7 +1320,10 @@ mod tests {
         r.on_link_dead(addr, now, &policy, Gate::Reconciling);
         let st = r.retry_state(&addr).expect("entry still scheduled");
         assert_eq!(st.retry_count, 1, "retry_count escalates, not reset");
-        assert_eq!(st.retry_after_ms, now + backoff_ms(1, BASE_MS, CAP_MS));
+        assert_eq!(
+            st.retry_after,
+            Some(peering_at(now_ms + backoff_ms(1, BASE_MS, CAP_MS)))
+        );
         assert!(backoff_ms(1, BASE_MS, CAP_MS) > backoff_ms(0, BASE_MS, CAP_MS));
     }
 
@@ -1300,7 +1337,7 @@ mod tests {
 
         let mut r = PeeringReconciler::default();
         // Seed a retry entry.
-        r.on_link_dead(addr, 1_000, &policy, Gate::Reconciling);
+        r.on_link_dead(addr, peering_at(1_000), &policy, Gate::Reconciling);
         assert_eq!(r.retry_pending_len(), 1);
 
         // Draining reconcile returns nothing AND clears the schedule.
@@ -1309,6 +1346,7 @@ mod tests {
             &Observed::default(),
             &ample_budget(),
             &DiscoveryPools::default(),
+            peering_at(2_000),
             2_000,
             Gate::Suspended,
         );
@@ -1316,10 +1354,10 @@ mod tests {
         assert_eq!(r.retry_pending_len(), 0, "drain clears the schedule");
 
         // Reflex is suppressed while draining.
-        let out = r.on_link_dead(addr, 3_000, &policy, Gate::Suspended);
+        let out = r.on_link_dead(addr, peering_at(3_000), &policy, Gate::Suspended);
         assert!(out.is_empty());
         assert_eq!(r.retry_pending_len(), 0, "drain suppresses the reflex");
-        let out2 = r.on_handshake_timeout(addr, 3_000, &policy, Gate::Suspended);
+        let out2 = r.on_handshake_timeout(addr, peering_at(3_000), &policy, Gate::Suspended);
         assert!(out2.is_empty());
         assert_eq!(r.retry_pending_len(), 0);
     }
@@ -1338,6 +1376,7 @@ mod tests {
             &Observed::default(),
             &ample_budget(),
             &DiscoveryPools::default(),
+            peering_at(10_000),
             10_000,
             Gate::NotRunning,
         );
@@ -1371,6 +1410,7 @@ mod tests {
             &Observed::default(),
             &ample_budget(),
             &pools,
+            peering_at(10_000),
             10_000,
             Gate::Reconciling,
         );
@@ -1386,7 +1426,10 @@ mod tests {
             "phase 1 enqueues the overlay peer at 0 backoff"
         );
         assert!(r.retry_state(&addr).is_some());
-        assert_eq!(r.retry_state(&addr).unwrap().retry_after_ms, 10_000);
+        assert_eq!(
+            r.retry_state(&addr).unwrap().retry_after,
+            Some(peering_at(10_000))
+        );
 
         // Phase 2 (retry slot): overlay empty → the now-due entry dials.
         let phase2 = r.reconcile(
@@ -1394,6 +1437,7 @@ mod tests {
             &Observed::default(),
             &ample_budget(),
             &DiscoveryPools::default(),
+            peering_at(10_000),
             10_000,
             Gate::Reconciling,
         );
@@ -1436,6 +1480,7 @@ mod tests {
             &Observed::default(),
             &b,
             &pools,
+            peering_at(10_000),
             10_000,
             Gate::Reconciling,
         );
@@ -1474,6 +1519,7 @@ mod tests {
             &Observed::default(),
             &b,
             &pools,
+            peering_at(10_000),
             10_000,
             Gate::Reconciling,
         );
@@ -1495,7 +1541,7 @@ mod tests {
         let mut r = PeeringReconciler::default();
         for (_, addr, npub) in &peers {
             let mut st = RetryState::new(auto_peer(npub));
-            st.retry_after_ms = 0; // due
+            st.retry_after = None; // due
             r.insert_retry_for_test(*addr, st);
         }
 
@@ -1504,16 +1550,17 @@ mod tests {
             &Observed::default(),
             &ample_budget(),
             &DiscoveryPools::default(),
+            peering_at(10_000),
             10_000,
             Gate::Reconciling,
         );
         // retry_per_tick == 16 → exactly 16 dialed, the 17th deferred.
         assert_eq!(count_connects(&actions), 16);
-        // All 17 entries survive (dialed ones just get retry_after_ms bumped).
+        // All 17 entries survive (dialed ones just get retry_after bumped).
         assert_eq!(r.retry_pending_len(), 17);
     }
 
-    // ---- Parity: expires_at_ms drop ----------------------------------------
+    // ---- Parity: expires_at drop -------------------------------------------
 
     #[test]
     fn expired_retry_entry_is_dropped_before_dial() {
@@ -1523,8 +1570,8 @@ mod tests {
 
         let mut r = PeeringReconciler::default();
         let mut st = RetryState::new(auto_peer(&npub));
-        st.retry_after_ms = 0; // would be due
-        st.expires_at_ms = Some(5_000); // but expires before now
+        st.retry_after = None; // would be due
+        st.expires_at = Some(peering_at(5_000)); // but expires before now
         r.insert_retry_for_test(addr, st);
 
         let actions = r.reconcile(
@@ -1532,7 +1579,8 @@ mod tests {
             &Observed::default(),
             &ample_budget(),
             &DiscoveryPools::default(),
-            10_000, // now >= expires_at_ms
+            peering_at(10_000), // now >= expires_at
+            10_000,
             Gate::Reconciling,
         );
         assert_eq!(count_connects(&actions), 0, "expired entry does not dial");
@@ -1559,7 +1607,7 @@ mod tests {
         r.insert_retry_for_test(addr, st);
 
         // Next timeout bumps to 4 > max(3) with reconnect=false → give up.
-        let out = r.on_handshake_timeout(addr, 1_000, &policy, Gate::Reconciling);
+        let out = r.on_handshake_timeout(addr, peering_at(1_000), &policy, Gate::Reconciling);
         assert!(out.is_empty());
         assert_eq!(r.retry_pending_len(), 0, "exhausted retry is removed");
     }
@@ -1606,7 +1654,7 @@ mod tests {
             observed,
             budget,
             pools,
-            1_000,
+            peering_at(1_000),
             Gate::Reconciling,
         ))
     }

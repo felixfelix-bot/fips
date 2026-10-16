@@ -9,6 +9,7 @@
 
 use super::*;
 use crate::identity::Identity;
+use crate::node::peering::retry::peering_at;
 
 /// A distinct random peer: its resolved identity, node address and npub.
 fn peer() -> (PeerIdentity, NodeAddr, String) {
@@ -108,7 +109,7 @@ fn opportunistic(
         observed,
         budget,
         pools,
-        1_000,
+        peering_at(1_000),
         Gate::Reconciling,
     )
 }
@@ -237,6 +238,7 @@ fn the_config_floor_dials_a_configured_peer_while_claims_of_it_are_in_flight() {
         &claims_for(addr, 4),
         &budget(),
         &DiscoveryPools::default(),
+        peering_at(10_000),
         10_000,
         Gate::Reconciling,
     );
@@ -267,6 +269,7 @@ fn the_overlay_enqueues_an_advertised_node_while_claims_of_it_are_in_flight() {
         &claims_for(addr, 4),
         &budget(),
         &pools,
+        peering_at(10_000),
         10_000,
         Gate::Reconciling,
     );
@@ -289,17 +292,21 @@ fn the_overlay_expedites_a_configured_peers_retry_while_claims_of_it_are_in_flig
     };
     let mut reconciler = PeeringReconciler::default();
     let mut state = RetryState::new(configured(&npub));
-    state.retry_after_ms = 50_000;
+    state.retry_after = Some(peering_at(50_000));
     reconciler.retry_pending.insert(addr, state);
     let _ = reconciler.reconcile_overlay(
         &policy,
         &claims_for(addr, 4),
         &budget(),
         &pools,
+        peering_at(10_000),
         10_000,
         Gate::Reconciling,
     );
-    assert_eq!(reconciler.retry_pending[&addr].retry_after_ms, 10_000);
+    assert_eq!(
+        reconciler.retry_pending[&addr].retry_after,
+        Some(peering_at(10_000))
+    );
 }
 
 /// The LAN layer dials a node's held candidate while its only in-flight

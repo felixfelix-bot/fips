@@ -74,7 +74,8 @@ pub(in crate::node) struct PeerActionCtx {
     pub(in crate::node) our_index: Option<SessionIndex>,
     /// The peer's session index for this exchange (msg2 framing receiver_idx).
     pub(in crate::node) their_index: Option<SessionIndex>,
-    /// The wire timestamp driving this step (promotion ts / loss-report clock).
+    /// The wire timestamp driving this step (promotion ts). A loss report does
+    /// not use it: the retry schedule reads the peering clock.
     pub(in crate::node) now_ms: u64,
     /// Establish direction for this exchange. `false` = inbound, `true` =
     /// outbound. `PromoteToActive` reads this to pick the direction-specific
@@ -855,13 +856,14 @@ impl Node {
                     // `kind` names: an un-promoted handshake attempt takes the
                     // connected-guarded `note_handshake_timeout` (`driver.rs:28`),
                     // an established peer's link-death takes the unconditional
-                    // `note_link_dead` (`driver.rs:48`).
+                    // `note_link_dead` (`driver.rs:48`). Both schedule on the
+                    // peering clock, read here; `ambient.now_ms` is wall time.
                     match kind {
                         LostKind::HandshakeTimeout => {
-                            self.note_handshake_timeout(peer, ambient.now_ms);
+                            self.note_handshake_timeout(peer, Self::peering_now());
                         }
                         LostKind::LinkDead => {
-                            self.note_link_dead(peer, ambient.now_ms);
+                            self.note_link_dead(peer, Self::peering_now());
                         }
                     }
                 }

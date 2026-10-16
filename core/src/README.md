@@ -15,12 +15,18 @@ changing anything here.
   parameter; the core never reads a random source of its own.
 - `identity/`: node and peer identity types and their encodings. Its own
   README describes it.
+- `node/`: node-level bookkeeping that is not a protocol layer: the
+  handshake, session-setup and lookup-signing rate limiters, and the
+  stats history. Its own README describes it.
 - `noise/`: the Noise handshakes, the transport sessions, the replay
   window, the cipher state and the AEAD under it, and the fixed sizes of
   the handshake messages. Its own README describes it.
 - `proto/`: the protocol: wire codecs and sans-IO state machines for
   every layer. The root crate reaches it as `crate::proto`. Its own
   README describes it.
+- `time/`: the `Clock` and `Instant` traits, through which the host
+  supplies the time. The core takes instants as arguments and never
+  reads a clock. Its own README describes it.
 - `transport/`: the transport value types (identifiers, address,
   statistics) that transports and the protocol cores both name. Its own
   README describes it.
@@ -31,7 +37,9 @@ changing anything here.
 - `testutil.rs`: fixtures shared by the crate's unit tests
   (`make_node_addr`, `make_keypair`; `TestEntropy`, the random source
   tests build randomized types with; and `FixedEntropy`, a source that
-  fills every byte with one value). Compiled for tests only.
+  fills every byte with one value; `TestClock` and `TestInstant`, a
+  clock of whole milliseconds from 0 that moves only when a test
+  advances it). Compiled for tests only.
 
 ## Rules for this level
 

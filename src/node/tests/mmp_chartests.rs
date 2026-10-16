@@ -93,7 +93,7 @@ fn insert_session(node: &mut Node, mode: MmpMode) -> NodeAddr {
         remote_addr,
         remote.pubkey_full(),
         EndToEndState::Established(session),
-        1000,
+        crate::node::session::session_at(1000),
         true,
     );
     let cfg = SessionMmpConfig {

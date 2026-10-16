@@ -225,7 +225,7 @@ impl Node {
                 outcome.updated += 1;
                 if let Some(state) = self.peering.reconciler.retry_pending.get_mut(node_addr) {
                     state.peer_config = new_peer.clone();
-                    state.retry_after_ms = Self::now_ms();
+                    state.retry_after = Some(Self::peering_now());
                 }
                 if let Ok(identity) = PeerIdentity::from_npub(&new_peer.npub) {
                     let name = new_peer
@@ -274,7 +274,7 @@ impl Node {
                     error = %err,
                     "Failed to initiate connection for newly added runtime peer"
                 );
-                self.note_handshake_timeout(*identity.node_addr(), Self::now_ms());
+                self.note_handshake_timeout(*identity.node_addr(), Self::peering_now());
             }
         }
 
@@ -311,8 +311,10 @@ impl Node {
                             self.peering.reconciler.retry_pending.get_mut(&node_addr)
                         {
                             state.peer_config = peer_config;
-                            state.retry_after_ms =
-                                Self::now_ms().saturating_add(handshake_timeout_secs * 1000);
+                            state.retry_after = Some(crate::time::deadline(
+                                Self::peering_now(),
+                                Duration::from_millis(handshake_timeout_secs * 1000),
+                            ));
                         }
                     }
                     Err(err) => {
@@ -321,7 +323,7 @@ impl Node {
                             error = %err,
                             "Refreshed peer addresses did not initiate a direct connection"
                         );
-                        self.note_handshake_timeout(node_addr, Self::now_ms());
+                        self.note_handshake_timeout(node_addr, Self::peering_now());
                     }
                 }
             }
@@ -395,13 +397,14 @@ impl Node {
         let policy = self.build_peering_policy(auto_connect_peers);
         let observed = self.observe_peering();
         let budget = self.build_peering_budget();
-        let now_ms = Self::now_ms();
+        let now = Self::peering_now();
         let actions = self.peering.reconciler.reconcile(
             &policy,
             &observed,
             &budget,
             &DiscoveryPools::default(),
-            now_ms,
+            now,
+            Self::now_ms(),
             Gate::Reconciling,
         );
 
@@ -426,7 +429,7 @@ impl Node {
                 // Schedule a retry so transient address-resolution failures
                 // (e.g. cached endpoints stale, NAT rebinds, all addresses
                 // currently unreachable) recover without a daemon restart.
-                self.note_handshake_timeout(node_addr, now_ms);
+                self.note_handshake_timeout(node_addr, now);
                 // No-transport failures most often mean the cached overlay
                 // advert is pointing at a dead post-NAT-rebind address. The
                 // advert cache is read-only inside fetch_advert, so retries
@@ -1257,12 +1260,15 @@ impl Node {
         let policy = self.build_peering_policy(Vec::new());
         let observed = self.observe_peering();
         let budget = self.build_peering_budget();
-        let now_ms = Self::now_ms();
         let gate = Gate::from_state(self.supervisor.state);
-        let actions = self
-            .peering
-            .reconciler
-            .reconcile_opportunistic(&policy, &observed, &budget, &pools, now_ms, gate);
+        let actions = self.peering.reconciler.reconcile_opportunistic(
+            &policy,
+            &observed,
+            &budget,
+            &pools,
+            Self::peering_now(),
+            gate,
+        );
 
         for action in actions {
             let PeeringAction::Connect(candidate) = action else {
@@ -1404,7 +1410,7 @@ impl Node {
                             if let Ok(peer_identity) = PeerIdentity::from_npub(&peer_npub) {
                                 self.note_handshake_timeout(
                                     *peer_identity.node_addr(),
-                                    Self::now_ms(),
+                                    Self::peering_now(),
                                 );
                             }
                         }
@@ -1437,6 +1443,7 @@ impl Node {
                     }
 
                     let now_ms = Self::now_ms();
+                    let peering_now = Self::peering_now();
                     let decision = bootstrap.record_traversal_failure(&peer_config.npub, now_ms);
                     if decision.should_warn {
                         warn!(
@@ -1494,15 +1501,24 @@ impl Node {
                         continue;
                     }
 
-                    self.note_handshake_timeout(node_addr, now_ms);
+                    self.note_handshake_timeout(node_addr, peering_now);
                     if let Some(cooldown_until_ms) = decision.cooldown_until_ms
                         && let Some(state) =
                             self.peering.reconciler.retry_pending.get_mut(&node_addr)
                     {
                         // Push the next retry past the cooldown so the
                         // open-discovery sweep doesn't re-enqueue and the
-                        // per-attempt backoff doesn't fire sooner.
-                        state.retry_after_ms = state.retry_after_ms.max(cooldown_until_ms);
+                        // per-attempt backoff doesn't fire sooner. The cooldown is
+                        // a wall-clock deadline, so it enters the schedule as the
+                        // time left until it, from the same wall-clock read it
+                        // was computed against. An unset schedule (`None`, due)
+                        // orders before any instant, so it takes the cooldown.
+                        let cooldown = std::time::Duration::from_millis(
+                            cooldown_until_ms.saturating_sub(now_ms),
+                        );
+                        state.retry_after = state
+                            .retry_after
+                            .max(Some(crate::time::deadline(peering_now, cooldown)));
                     }
                 }
             }
@@ -1779,7 +1795,7 @@ impl Node {
                 &observed,
                 &budget,
                 &pools,
-                Self::now_ms(),
+                Self::peering_now(),
                 gate,
             )
         };
@@ -1979,7 +1995,7 @@ impl Node {
                 self.links.remove(&pending.link_id);
                 if let Some(id) = &pending.peer_identity {
                     self.remove_peer_machine(pending.link_id);
-                    self.note_handshake_timeout(*id.node_addr(), Self::now_ms());
+                    self.note_handshake_timeout(*id.node_addr(), Self::peering_now());
                 }
             }
         }
@@ -3040,6 +3056,7 @@ impl Node {
         }
 
         let now_ms = Self::now_ms();
+        let peering_now = Self::peering_now();
         let self_node_addr = *self.identity().node_addr();
 
         let configured_npubs = self
@@ -3133,16 +3150,21 @@ impl Node {
         // Two-phase enqueue: reconcile_overlay inserts due-now
         // entries into retry_pending; the retry slot dials them. The core emits
         // a `ScheduleRetry` for exactly the NEW enqueues (the configured-advert
-        // expedite bumps `retry_after_ms` without emitting), which is precisely
+        // expedite bumps `retry_after` without emitting), which is precisely
         // the set the old sweep pre-seeded — its `register_identity` /
         // `peer_aliases` sat after every skip `continue`, so only enqueued
         // candidates reached it. Consuming the core's own output here to drive
         // that I/O bookkeeping is legitimate sans-IO: the core decides WHICH to
         // enqueue, the driver performs the side effects for exactly that set.
-        let (actions, tally) = self
-            .peering
-            .reconciler
-            .reconcile_overlay(&policy, &observed, &budget, &pools, now_ms, gate);
+        let (actions, tally) = self.peering.reconciler.reconcile_overlay(
+            &policy,
+            &observed,
+            &budget,
+            &pools,
+            peering_now,
+            now_ms,
+            gate,
+        );
 
         for action in actions {
             let PeeringAction::ScheduleRetry { peer, .. } = action else {

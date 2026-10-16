@@ -415,7 +415,7 @@ async fn session_data_the_encrypt_worker_sends_counts_once_in_the_udp_transport_
             node_addr,
             far_side.pubkey_full(),
             EndToEndState::Established(session),
-            1_000,
+            crate::node::session::session_at(1_000),
             true,
         ),
     );

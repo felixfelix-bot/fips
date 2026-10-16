@@ -2188,7 +2188,10 @@ async fn a_session_completes_through_a_transit_with_both_sides_drained_under_a_d
         .handshake_resend_interval_ms;
     nodes[0]
         .node
-        .resend_pending_session_handshakes(Node::now_ms() + interval_ms + 1)
+        .resend_pending_session_handshakes(crate::node::session::session_after(
+            Node::session_now(),
+            interval_ms + 1,
+        ))
         .await;
     for _ in 0..6 {
         tokio::time::sleep(std::time::Duration::from_millis(20)).await;

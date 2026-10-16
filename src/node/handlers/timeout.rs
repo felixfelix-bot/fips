@@ -2,12 +2,16 @@
 //! and handshake message resend scheduling.
 
 use crate::node::Node;
+use crate::node::session::SessionInstant;
 use crate::peer::machine::TimerKind;
 use crate::proto::fmp::{
     ConnAction, ConnSnapshot, LifecycleView, PeerSnapshot, RekeyResendSnapshot,
 };
 use crate::proto::fsp::{FspAction, InitialMsg3ResendSnapshot};
+use crate::time::deadline;
 use crate::transport::LinkId;
+use fips_core::time::Instant;
+use std::time::Duration;
 use tracing::{debug, info, warn};
 
 impl LifecycleView for Node {
@@ -72,12 +76,15 @@ impl Node {
             return;
         }
 
+        let peering_now = Self::peering_now();
         let timeout_ms = self.config().node.rate_limit.handshake_timeout_secs * 1000;
 
         let stale = self.stale_connections(now_ms, timeout_ms);
         for action in self.fmp.poll_timeouts(stale) {
             match action {
-                ConnAction::ScheduleRetry { peer } => self.note_handshake_timeout(peer, now_ms),
+                ConnAction::ScheduleRetry { peer } => {
+                    self.note_handshake_timeout(peer, peering_now)
+                }
                 ConnAction::Teardown { link } => {
                     // Log before cleanup (needs live connection state). The
                     // failure signal is now read from the control machine; the
@@ -255,7 +262,7 @@ impl Node {
             };
             if reap {
                 if let Some(peer) = retry_peer {
-                    self.note_handshake_timeout(peer, now_ms);
+                    self.note_handshake_timeout(peer, Self::peering_now());
                 }
                 debug!(link_id = %link, "Handshake connection timed out");
                 self.cleanup_stale_connection(link, now_ms).await;
@@ -432,12 +439,12 @@ impl Node {
     /// For an established initiator still holding its msg3, resend it until
     /// the peer is heard from or the budget is spent (see
     /// `resend_initial_msg3`). Established sessions are never removed here.
-    pub(in crate::node) async fn resend_pending_session_handshakes(&mut self, now_ms: u64) {
+    pub(in crate::node) async fn resend_pending_session_handshakes(&mut self, now: SessionInstant) {
         if self.sessions.is_empty() {
             return;
         }
 
-        let timeout_ms = self.config().node.rate_limit.handshake_timeout_secs * 1000;
+        let timeout = Duration::from_secs(self.config().node.rate_limit.handshake_timeout_secs);
         let max_resends = self.config().node.rate_limit.handshake_max_resends;
         let interval_ms = self.config().node.rate_limit.handshake_resend_interval_ms;
         let backoff = self.config().node.rate_limit.handshake_resend_backoff;
@@ -450,13 +457,13 @@ impl Node {
         // when it holds neither and its responder hold, if any, is a
         // handshake timeout old.
         for entry in self.sessions.values_mut() {
-            entry.expire_candidates(now_ms, timeout_ms);
+            entry.expire_candidates(now, timeout);
             if entry.is_established() {
                 continue;
             }
             if entry.has_initiator_leg()
-                && now_ms.saturating_sub(entry.last_activity()) > timeout_ms
-                && (entry.has_candidates() || entry.responder_hold_open(now_ms, timeout_ms))
+                && now.saturating_duration_since(entry.last_activity()) > timeout
+                && (entry.has_candidates() || entry.responder_hold_open(now, timeout))
             {
                 entry.drop_initiator_leg();
             }
@@ -467,9 +474,9 @@ impl Node {
             .filter(|(_, entry)| {
                 !entry.is_established()
                     && !entry.has_candidates()
-                    && !entry.responder_hold_open(now_ms, timeout_ms)
+                    && !entry.responder_hold_open(now, timeout)
                     && (!entry.has_initiator_leg()
-                        || now_ms.saturating_sub(entry.last_activity()) > timeout_ms)
+                        || now.saturating_duration_since(entry.last_activity()) > timeout)
             })
             .map(|(addr, _)| *addr)
             .collect();
@@ -492,9 +499,9 @@ impl Node {
         for entry in self.sessions.values_mut() {
             if entry.has_initiator_leg()
                 && entry.initiator_paused()
-                && (!entry.has_candidates() || entry.responder_hold_aged(now_ms))
+                && (!entry.has_candidates() || entry.responder_hold_aged(now))
             {
-                entry.resume_initiator(now_ms);
+                entry.resume_initiator(now);
             }
         }
 
@@ -512,8 +519,7 @@ impl Node {
                     && !entry.initiator_paused()
                     && entry.handshake_payload().is_some()
                     && entry.resend_count() < max_resends
-                    && entry.next_resend_at_ms() > 0
-                    && now_ms >= entry.next_resend_at_ms()
+                    && entry.next_resend_at().is_some_and(|at| now >= at)
             })
             .map(|(addr, entry)| (*addr, entry.handshake_payload().unwrap().to_vec()))
             .collect();
@@ -536,7 +542,7 @@ impl Node {
 
             if sent && let Some(entry) = self.sessions.get_mut(&dest_addr) {
                 let count = entry.resend_count() + 1;
-                let next = now_ms + (interval_ms as f64 * backoff.powi(count as i32)) as u64;
+                let next = resend_deadline(now, interval_ms, backoff, count);
                 entry.record_resend(next);
                 debug!(
                     dest = %self.peer_display_name(&dest_addr),
@@ -546,7 +552,7 @@ impl Node {
             }
         }
 
-        self.resend_initial_msg3(now_ms).await;
+        self.resend_initial_msg3(now).await;
     }
 
     /// Resend an established initiator's retained msg3 until the responder is
@@ -560,10 +566,10 @@ impl Node {
     /// responder with this msg3. The payload is released by the first inbound frame that
     /// authenticates on the session (`handle_encrypted_session_msg`) or, here,
     /// when the budget is spent. Runs whether or not periodic rekey is enabled.
-    async fn resend_initial_msg3(&mut self, now_ms: u64) {
+    async fn resend_initial_msg3(&mut self, now: SessionInstant) {
         use crate::proto::link::SessionDatagram;
 
-        let candidates = self.initial_msg3_resend_snapshots(now_ms);
+        let candidates = self.initial_msg3_resend_snapshots(now);
         if candidates.is_empty() {
             return;
         }
@@ -604,8 +610,7 @@ impl Node {
                     };
                     if sent && let Some(entry) = self.sessions.get_mut(&addr) {
                         let count = entry.resend_count() + 1;
-                        let next =
-                            now_ms + (interval_ms as f64 * backoff.powi(count as i32)) as u64;
+                        let next = resend_deadline(now, interval_ms, backoff, count);
                         entry.record_resend(next);
                         debug!(
                             dest = %self.peer_display_name(&addr),
@@ -621,20 +626,20 @@ impl Node {
     }
 
     /// Snapshot every established session still retaining its initial msg3,
-    /// pre-evaluating the resend-due predicate against `now_ms` so the core
+    /// pre-evaluating the resend-due predicate against `now` so the core
     /// reads no clock.
     ///
     /// `is_established()` partitions the shared handshake resend slot: a
     /// non-established entry's SessionSetup or SessionAck belongs to the passes
     /// above, an established entry's msg3 to this one.
-    fn initial_msg3_resend_snapshots(&self, now_ms: u64) -> Vec<InitialMsg3ResendSnapshot> {
+    fn initial_msg3_resend_snapshots(&self, now: SessionInstant) -> Vec<InitialMsg3ResendSnapshot> {
         self.sessions
             .iter()
             .filter(|(_, entry)| entry.is_established() && entry.handshake_payload().is_some())
             .map(|(addr, entry)| InitialMsg3ResendSnapshot {
                 addr: *addr,
                 resend_count: entry.resend_count(),
-                resend_due: entry.next_resend_at_ms() != 0 && now_ms >= entry.next_resend_at_ms(),
+                resend_due: entry.next_resend_at().is_some_and(|at| now >= at),
             })
             .collect()
     }
@@ -724,7 +729,7 @@ impl Node {
     /// Only targets sessions in the Established state. Entries still being set
     /// up, with an initiator leg or responder candidates, are handled by the
     /// handshake timeout.
-    pub(in crate::node) fn purge_idle_sessions(&mut self, now_ms: u64) {
+    pub(in crate::node) fn purge_idle_sessions(&mut self, now: SessionInstant) {
         let timeout_ms = self.config().node.session.idle_timeout_secs * 1000;
         if timeout_ms == 0 {
             return; // disabled
@@ -734,7 +739,9 @@ impl Node {
             .sessions
             .iter()
             .filter(|(_, entry)| {
-                entry.is_established() && now_ms.saturating_sub(entry.last_activity()) > timeout_ms
+                entry.is_established()
+                    && now.saturating_duration_since(entry.last_activity())
+                        > Duration::from_millis(timeout_ms)
             })
             .map(|(addr, _)| *addr)
             .collect();
@@ -859,6 +866,18 @@ fn is_stranded(
     max_age: std::time::Duration,
 ) -> bool {
     (!live && !in_hold) || age > max_age
+}
+
+/// When the handshake resend after `count` resends is due: `interval_ms`
+/// grown by `backoff` per resend, from `now`.
+pub(in crate::node) fn resend_deadline(
+    now: SessionInstant,
+    interval_ms: u64,
+    backoff: f64,
+    count: u32,
+) -> SessionInstant {
+    let delay_ms = (interval_ms as f64 * backoff.powi(count as i32)) as u64;
+    deadline(now, Duration::from_millis(delay_ms))
 }
 
 #[cfg(test)]

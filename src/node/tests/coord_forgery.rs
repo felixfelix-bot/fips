@@ -60,7 +60,7 @@ fn install_initiating(node: &mut Node, remote: &Identity) {
         *remote.node_addr(),
         remote.pubkey_full(),
         EndToEndState::Initiating(handshake),
-        1000,
+        crate::node::session::session_at(1000),
         true,
     );
     node.sessions.insert(*remote.node_addr(), entry);
@@ -568,7 +568,7 @@ async fn a_path_broken_without_a_cached_identity_starts_a_lookup_this_node_can_v
             dest,
             dest_pubkey,
             EndToEndState::Initiating(handshake),
-            1000,
+            crate::node::session::session_at(1000),
             true,
         ),
     );
@@ -665,7 +665,7 @@ async fn a_genuine_path_broken_still_replaces_stale_verified_coordinates_by_look
             dest,
             dest_pubkey,
             EndToEndState::Initiating(handshake),
-            1000,
+            crate::node::session::session_at(1000),
             true,
         ),
     );

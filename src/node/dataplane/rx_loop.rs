@@ -515,6 +515,8 @@ impl Node {
                         // `pending_max_destinations` bounds.
                         self.native_expire();
                         let now_ms = Self::now_ms();
+                        let session_now = Self::session_now();
+                        let peering_now = Self::peering_now();
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::ReloadPeerAcl,
                         self.reload_peer_acl().await);
                         // The host map hot-reloads on the same tick as the ACL. It
@@ -542,15 +544,15 @@ impl Node {
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::ResendPendingFmpRekeyMsg3,
                         self.resend_pending_fmp_rekey_msg3(now_ms).await);
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::ResendPendingSessionHandshakes,
-                        self.resend_pending_session_handshakes(now_ms).await);
+                        self.resend_pending_session_handshakes(session_now).await);
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::ResendPendingSessionMsg3,
-                        self.resend_pending_session_msg3(now_ms).await);
+                        self.resend_pending_session_msg3(session_now).await);
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::PurgeIdleSessions,
-                        self.purge_idle_sessions(now_ms));
+                        self.purge_idle_sessions(session_now));
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::PurgeExpiredPathMtu,
                         self.purge_expired_path_mtu(now_ms));
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::ProcessPendingRetries,
-                        self.process_pending_retries(now_ms).await);
+                        self.process_pending_retries(peering_now).await);
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::CheckTreeState,
                         self.check_tree_state().await);
                         instr_step!(instr_on, crate::instr::Domain::Tick, crate::instr::Step::CheckBloomState,

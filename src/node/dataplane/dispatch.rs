@@ -106,11 +106,7 @@ impl Node {
 
         let addr = *from;
         self.remove_active_peer(from);
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_millis() as u64)
-            .unwrap_or(0);
-        self.note_link_dead(addr, now_ms);
+        self.note_link_dead(addr, Self::peering_now());
     }
 
     /// Count `peer`'s session, removed without having carried one

@@ -80,6 +80,7 @@ use crate::proto::lookup::{Lookup, LookupBackoff, LookupForwardRateLimiter};
 use crate::proto::mmp::Mmp;
 use crate::proto::routing::{self, Router, RoutingErrorRateLimiter};
 use crate::proto::stp::TreeState;
+use crate::time::{HostClock, WallStamp};
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 use crate::transport::ethernet::EthernetTransport;
 use crate::transport::nym::NymTransport;
@@ -92,6 +93,7 @@ use crate::transport::{
 };
 use crate::utils::index::IndexAllocator;
 use crate::{Config, ConfigError, Identity, IdentityError, NodeAddr, PeerIdentity, TreeCoordinate};
+use fips_core::time::Clock as _;
 use rand::Rng;
 use std::collections::{BTreeSet, HashMap, VecDeque};
 use std::fmt;
@@ -844,6 +846,10 @@ pub struct Node {
     msg1_rate_limiter: HandshakeRateLimiter,
     /// Rate limiter for inbound FSP SessionSetup, keyed on the link peer.
     setup_rate_limiter: SessionSetupRateLimiter,
+    /// The clock [`Self::setup_now`] reads instead of [`HostClock`], so a
+    /// test can drive the setup limiter's refill.
+    #[cfg(test)]
+    setup_clock: Option<fn() -> crate::time::HostInstant>,
     /// Budget bounding the routing errors one authenticated link peer can
     /// induce this node to emit. Keyed on the link peer because that is the
     /// only value at the emission point a sender cannot mint; the
@@ -965,11 +971,13 @@ fn build_msg1_rate_limiter(config: &Config) -> HandshakeRateLimiter {
         rl.handshake_burst,
         rl.handshake_rate,
     );
+    let now = HostClock.now();
     HandshakeRateLimiter::with_params(
-        rate_limit::TokenBucket::with_params(rl.handshake_burst, rl.handshake_rate),
+        rate_limit::TokenBucket::with_params(rl.handshake_burst, rl.handshake_rate, now),
         rate_limit::TokenBucket::with_params(
             rl.established_handshake_burst.unwrap_or(derived_burst),
             rl.established_handshake_rate.unwrap_or(derived_rate),
+            now,
         ),
         config.node.limits.max_pending_inbound,
     )
@@ -1137,6 +1145,8 @@ impl Node {
             silent_sessions: SilentSessions::new(),
             msg1_rate_limiter,
             setup_rate_limiter,
+            #[cfg(test)]
+            setup_clock: None,
             peer_error_budget: PeerBudget::new(),
             coord_hint_budget: PeerBudget::coord_hints(),
             routing: Router::new(),
@@ -1321,6 +1331,8 @@ impl Node {
             silent_sessions: SilentSessions::new(),
             msg1_rate_limiter,
             setup_rate_limiter,
+            #[cfg(test)]
+            setup_clock: None,
             peer_error_budget: PeerBudget::new(),
             coord_hint_budget: PeerBudget::coord_hints(),
             routing: Router::new(),
@@ -2122,6 +2134,9 @@ impl Node {
     }
 
     /// Get the stats history collector.
+    // The history is fixed over the crate's own host clock, which nothing
+    // outside the crate names; the accessor stays public as it was.
+    #[allow(private_interfaces)]
     pub fn stats_history(&self) -> &stats_history::StatsHistory {
         &self.stats_history
     }
@@ -2154,7 +2169,7 @@ impl Node {
             active_sessions: self.sessions.len() as u64,
         };
 
-        let now = std::time::Instant::now();
+        let now = HostClock.now();
         let peer_snaps: Vec<stats_history::PeerSnapshot> = self
             .peers
             .values()
@@ -2517,7 +2532,7 @@ impl Node {
                 node_addr: *addr,
                 display_name: self.peer_display_name(addr),
                 retry_count: state.retry_count,
-                retry_after_ms: state.retry_after_ms,
+                retry_after_ms: state.retry_after.map_or(0, WallStamp::wall_ms),
                 auto_reconnect: state.reconnect,
             })
             .collect();
@@ -2738,7 +2753,7 @@ impl Node {
 
                 let resend_count = (!entry.is_established()).then(|| entry.resend_count());
                 let established = entry.is_established().then(|| snap::SessionEstablished {
-                    session_start_ms: entry.session_start_ms(),
+                    session_start_ms: entry.session_start().map_or(0, WallStamp::wall_ms),
                     current_k_bit: entry.current_k_bit(),
                     coords_warmup_remaining: entry.coords_warmup_remaining(),
                     is_draining: entry.is_draining(),
@@ -2756,7 +2771,7 @@ impl Node {
                     display_name: self.peer_display_name(addr),
                     state,
                     is_initiator: entry.is_initiator(),
-                    last_activity_ms: entry.last_activity(),
+                    last_activity_ms: entry.last_activity().wall_ms(),
                     npub: crate::identity::encode_npub(&xonly),
                     stats: snap::SessionStats {
                         packets_sent: pkts_tx,

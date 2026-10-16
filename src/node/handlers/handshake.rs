@@ -25,8 +25,10 @@ use crate::proto::fmp::{
     NegotiationPayload, OutboundSnapshot, PromotionResult, RekeyClaim, RekeyMsg2Reject,
     RekeyMsg2Snapshot, WireOutcome, cross_connection_winner, decide_fmp_negotiation,
 };
+use crate::time::HostClock;
 use crate::transport::{Link, LinkDirection, LinkId, ReceivedPacket, TransportError};
 use crate::utils::index::SessionIndex;
+use fips_core::time::Clock as _;
 use std::time::{Duration, Instant};
 use tracing::{debug, info, warn};
 
@@ -302,7 +304,10 @@ impl Node {
         // here instead, releasing the slot at acquire time — silently, with
         // no clippy lint catching the difference. Do not "tidy" this
         // binding; the assertion below is what reds if it is tidied.
-        let _slot = match self.msg1_rate_limiter.start_handshake(class) {
+        let _slot = match self
+            .msg1_rate_limiter
+            .start_handshake(class, HostClock.now())
+        {
             Ok(slot) => slot,
             Err(reason) => {
                 debug!(
@@ -1153,7 +1158,7 @@ impl Node {
             // machine's expected identity with the answering static, so reading
             // that here would reschedule against whoever answered.
             if let Some(peer) = dialed_peer {
-                self.note_handshake_timeout(peer, packet.timestamp_ms);
+                self.note_handshake_timeout(peer, Self::peering_now());
             }
             self.stats_mut()
                 .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
@@ -1197,7 +1202,7 @@ impl Node {
             // an IK dial: the initiator's expected identity is fixed at
             // `start_handshake` and `complete_handshake` never overwrites it, so
             // it is still the peer we meant to dial and not whoever answered.
-            self.note_handshake_timeout(*peer_identity.node_addr(), packet.timestamp_ms);
+            self.note_handshake_timeout(*peer_identity.node_addr(), Self::peering_now());
             self.stats_mut()
                 .record_reject(RejectReason::Handshake(HandshakeReject::BadState));
             return;
