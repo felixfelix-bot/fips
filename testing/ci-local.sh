@@ -24,6 +24,13 @@
 #                        run.
 #   --with-tor           Include Tor harnesses (off by default — needs live Tor)
 #   --only <suite>       Run a single integration suite
+#   --rerun <suite>      Run one integration suite after only the release
+#                        build: no guards, lints, unit tests or other build
+#                        stages. For rerunning a suite on a tree whose full run
+#                        already passed them; not a full local CI verdict.
+#                        Cannot be combined with --only, --build-only,
+#                        --test-only, --skip-integration, --cross-check or
+#                        --baremetal (or FIPS_CI_BAREMETAL=1).
 #   -j, --jobs <N>       Max parallel chaos scenarios (default: 4)
 #   --list               List available integration suites
 #   --check-parity       Verify this suite set matches ci.yml's integration
@@ -110,6 +117,8 @@
 # Exit codes:
 #   0   — all stages passed
 #   1   — one or more stages failed
+#   2   — usage error (unknown option, missing value, unknown --rerun suite or
+#         an option --rerun cannot be combined with); nothing ran
 #   130 — interrupted by SIGINT  (128 + 2;  run was cancelled, not a failure)
 #   143 — terminated by SIGTERM  (128 + 15; run was cancelled, not a failure)
 #
@@ -173,6 +182,8 @@ BAREMETAL=false
 CROSS_CHECK=false
 WITH_TOR=false
 ONLY_SUITE=""
+RERUN=false
+ONLY_GIVEN=false
 
 # All integration suites matching ci.yml
 STATIC_SUITES=(static-mesh static-chain)
@@ -320,9 +331,33 @@ list_suites() {
     exit 0
 }
 
+# Whether a name is one --list prints. The listing is captured before it is
+# matched, so the match never closes a pipe on a writer still running.
+known_suite() {
+    local names
+    names="$(list_suites | awk '/^    /{ print $1 }')"
+    grep -qxF -- "$1" <<<"$names" && return 0
+    return 1
+}
+
+# Print the usage; the caller decides the exit status.
 usage() {
     sed -n '2,/^$/{ s/^# \?//; p }' "$0"
-    exit 0
+    return 0
+}
+
+# A bad command line: say what was wrong, show the usage, and exit 2 before
+# anything runs, so a mistyped flag is never mistaken for a green run.
+usage_error() {
+    echo "$1" >&2
+    usage >&2
+    exit 2
+}
+
+# An option that takes a value must be followed by one.
+need_value() {
+    [[ $# -ge 2 ]] || usage_error "$1 needs a value"
+    return 0
 }
 
 # ── Parse arguments ────────────────────────────────────────────────────────
@@ -342,15 +377,28 @@ while [[ $# -gt 0 ]]; do
         --baremetal)        BAREMETAL=true; shift ;;
         --cross-check)      CROSS_CHECK=true; shift ;;
         --with-tor)         WITH_TOR=true; shift ;;
-        --only)             ONLY_SUITE="$2"; shift 2 ;;
-        -j|--jobs)          PARALLEL_JOBS="$2"; shift 2 ;;
+        --only)             need_value "$@"; ONLY_SUITE="$2"; ONLY_GIVEN=true; shift 2 ;;
+        --rerun)            need_value "$@"; ONLY_SUITE="$2"; RERUN=true; shift 2 ;;
+        -j|--jobs)          need_value "$@"; PARALLEL_JOBS="$2"; shift 2 ;;
         --list)             list_suites ;;
         --check-parity)     exec "$SCRIPT_DIR/check-ci-parity.sh" ;;
         --reap)             exec "$SCRIPT_DIR/ci-cleanup.sh" ;;
-        -h|--help)          usage ;;
-        *)                  echo "Unknown option: $1"; usage ;;
+        -h|--help)          usage; exit 0 ;;
+        *)                  usage_error "Unknown option: $1" ;;
     esac
 done
+
+# --rerun is checked once the whole line is read, so the option order does not
+# matter and nothing is built for a bad request.
+if [[ "$RERUN" == true ]]; then
+    known_suite "$ONLY_SUITE" || usage_error "Unknown suite: $ONLY_SUITE (see --list)"
+    for _opt in only:"$ONLY_GIVEN" build-only:"$BUILD_ONLY" \
+            test-only:"$TEST_ONLY" skip-integration:"$SKIP_INTEGRATION" \
+            cross-check:"$CROSS_CHECK" baremetal:"$BAREMETAL"; do
+        [[ "${_opt#*:}" == true ]] \
+            && usage_error "--rerun cannot be combined with --${_opt%%:*}"
+    done
+fi
 
 # ── Results tracking ──────────────────────────────────────────────────────
 
@@ -595,6 +643,22 @@ trap 'on_exit'        EXIT
 
 # ── Stage 1: Build ─────────────────────────────────────────────────────────
 
+# The release build every integration suite's image is made from. Shared by the
+# build stage and by --rerun, which runs it alone.
+run_release() {
+    info "cargo build --release --bins --examples"
+    # --bins --examples rather than the bare default: the native datagram API's
+    # echo server is a cargo example, and the native-api harness's image needs
+    # it built here rather than separately. Naming --bins keeps the daemon and
+    # its tools in the build, which --examples alone would drop.
+    if cargo build --release --bins --examples 2>&1; then
+        record "build" 0
+        return 0
+    fi
+    record "build" 1
+    return 1
+}
+
 run_build() {
     stage "Stage 1: Build"
 
@@ -612,17 +676,7 @@ run_build() {
         return 1
     fi
 
-    info "cargo build --release --bins --examples"
-    # --bins --examples rather than the bare default: the native datagram API's
-    # echo server is a cargo example, and the native-api harness's image needs
-    # it built here rather than separately. Naming --bins keeps the daemon and
-    # its tools in the build, which --examples alone would drop.
-    if cargo build --release --bins --examples 2>&1; then
-        record "build" 0
-    else
-        record "build" 1
-        return 1
-    fi
+    run_release || return 1
 
     info "cargo fmt --check"
     if cargo fmt --check 2>&1; then
@@ -2035,20 +2089,33 @@ run_glibc_floor() {
     record "glibc-floor" $rc
 }
 
-# ── Main ───────────────────────────────────────────────────────────────────
+# This script's own argument handling: an unknown option or a missing value
+# exits 2 before anything runs, and --help exits 0. Each case ends during
+# parsing, so it is static and takes about a second.
+run_ciargs() {
+    local rc=0
+    info "[ci-args] Checking ci-local.sh's argument handling"
+    bash "$SCRIPT_DIR/lib/ci-args-test.sh" || rc=$?
+    record "ci-args" $rc
+    return 0
+}
 
-main() {
-    local start_time=$SECONDS
+# The firewall suite's table check against a listing still being written when
+# its match is found: a present rule must not read as absent. Hermetic (docker
+# is a shell function stand-in) and takes about two seconds.
+run_fwtable() {
+    local rc=0
+    info "[fw-table] Checking the firewall suite's table check against its cases"
+    bash "$SCRIPT_DIR/firewall/table-check-test.sh" || rc=$?
+    record "fw-table" $rc
+    return 0
+}
 
-    stage "FIPS Local CI"
-    info "Project root: $PROJECT_ROOT"
-
-    load_sampler &
-    CI_LOAD_PID=$!
-
-    # Above the mode branches deliberately, so --only, --test-only and
-    # --build-only are gated too: a divergence invalidates any claim that a
-    # local run means what a GitHub run means, whichever subset was asked for.
+# Every static guard, in order. Each gates every mode except --rerun: a
+# divergence invalidates any claim that a local run means what a GitHub run
+# means, whichever subset was asked for. --rerun skips them because it reruns a
+# suite on a tree whose full run already passed them, and says so in its banner.
+run_guards() {
     run_ci_parity
     run_log_strings
     run_trailing_log
@@ -2063,19 +2130,58 @@ main() {
     run_package_versions
     run_nextest_flaky
     run_glibc_floor
+    run_ciargs
+    run_fwtable
+    return 0
+}
 
-    if [[ "$TEST_ONLY" == true ]]; then
-        run_tests
-    elif [[ "$BUILD_ONLY" == true ]]; then
-        run_build
+# --rerun: the release build, then the one suite, then a banner saying what
+# did not run. The summary lists only the build and the suite.
+run_rerun() {
+    stage "Stage 1: Release build (rerun of $ONLY_SUITE)"
+    if run_release; then
+        run_integration
     else
-        run_build
-        if [[ "${RESULTS[build]:-1}" -ne 0 ]]; then
-            fail "Build failed, skipping remaining stages"
-        else
+        fail "Build failed, skipping $ONLY_SUITE"
+    fi
+    stage "Rerun"
+    echo -e "  ${YELLOW}${BOLD}RERUN of $ONLY_SUITE only:${RESET} guards, lints, unit tests and build-stage"
+    echo "  extras (cross-check, bare-metal) did not run; this is not a full local CI"
+    echo "  verdict."
+    return 0
+}
+
+# ── Main ───────────────────────────────────────────────────────────────────
+
+main() {
+    local start_time=$SECONDS
+
+    stage "FIPS Local CI"
+    info "Project root: $PROJECT_ROOT"
+
+    load_sampler &
+    CI_LOAD_PID=$!
+
+    if [[ "$RERUN" == true ]]; then
+        run_rerun
+    else
+        # Above the mode branches deliberately, so --only, --test-only and
+        # --build-only are gated too (see run_guards).
+        run_guards
+
+        if [[ "$TEST_ONLY" == true ]]; then
             run_tests
-            if [[ "$SKIP_INTEGRATION" != true ]]; then
-                run_integration
+        elif [[ "$BUILD_ONLY" == true ]]; then
+            run_build
+        else
+            run_build
+            if [[ "${RESULTS[build]:-1}" -ne 0 ]]; then
+                fail "Build failed, skipping remaining stages"
+            else
+                run_tests
+                if [[ "$SKIP_INTEGRATION" != true ]]; then
+                    run_integration
+                fi
             fi
         fi
     fi

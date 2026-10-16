@@ -14,6 +14,10 @@ mod bloom_echo;
 mod bloom_hold;
 mod bloom_poison;
 mod bootstrap;
+#[cfg(ble_available)]
+mod claim_dials;
+#[cfg(target_os = "linux")]
+mod claim_slots;
 mod connected_udp;
 mod control;
 mod coord_forgery;
@@ -22,10 +26,12 @@ mod decrypt_forged;
 mod disconnect;
 mod discovery;
 mod establish_chartests;
+mod forged_initial_msg2;
 mod forwarding;
 mod handshake;
 mod handshake_lines;
 mod heartbeat;
+mod lan_label;
 mod link_session_diag;
 mod link_setup_diag;
 mod lookup_echo;
