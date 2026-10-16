@@ -3,8 +3,9 @@
 # Runs shellcheck over the shell scripts the OpenWrt packages ship, over
 # .github/scripts/install-nak.sh, which the OpenWrt Package workflow runs to
 # fetch its publishing tool, over testing/build-core-baremetal.sh, which
-# both CI runners run, and over the cross-target compile check that
-# ci-local.sh runs (testing/cross-check/).
+# both CI runners run, over the cross-target compile check that ci-local.sh
+# runs (testing/cross-check/), and over the crate publication check that
+# crate.yml runs (testing/check-crate.sh).
 #
 # This is the one copy of that lint. The OpenWrt Package workflow calls it
 # after building each .ipk, and ci.yml and ci-local.sh call it too, because
@@ -19,8 +20,8 @@
 #     two directories (build-apk.sh wraps the maintainer scripts with one
 #     header line, which is not linted separately); the SDK feed Makefile ships
 #     preinst as well. On a router they run under busybox ash.
-#   * install-nak.sh, build-core-baremetal.sh and the three
-#     testing/cross-check/ scripts as bash, with no exclusions. They are CI
+#   * install-nak.sh, build-core-baremetal.sh, the three testing/cross-check/
+#     scripts and testing/check-crate.sh as bash, with no exclusions. They are CI
 #     scripts, not shipped ones, and the sh exclusion set below misfires on
 #     bash.
 #
@@ -64,6 +65,7 @@ BASH_TARGETS=(
     ".github/scripts/install-nak.sh"
     "testing/build-core-baremetal.sh"
     "testing/cross-check/check.sh"
+    "testing/check-crate.sh"
     "testing/cross-check/zig-cc"
     "testing/cross-check/zig-ar"
 )
