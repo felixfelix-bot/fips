@@ -1783,6 +1783,7 @@ impl Config {
     /// Validate cross-field configuration invariants.
     pub fn validate(&self) -> Result<(), ConfigError> {
         self.validate_ethernet_interfaces()?;
+        self.validate_udp_interfaces()?;
         // Matched to the macOS BLE arm in `Node::create_transports`, which a
         // test build does not compile either.
         self.validate_ble_instances(cfg!(all(target_os = "macos", not(test))))?;
@@ -1861,35 +1862,12 @@ impl Config {
     /// Syntax only. Whether a well-formed name exists is the binder's
     /// question, asked once a second, forever.
     fn validate_ethernet_interfaces(&self) -> Result<(), ConfigError> {
-        // Kernel limit: `IFNAMSIZ` is 16 including the terminating NUL, on
-        // both Linux and the BSDs.
-        const MAX_INTERFACE_NAME: usize = 15;
-
         let mut seen: std::collections::HashMap<&str, &str> = std::collections::HashMap::new();
 
         for (name, cfg) in self.transports.ethernet.iter() {
             let label = name.unwrap_or("ethernet");
             let iface = cfg.interface.as_str();
-
-            if iface.is_empty() {
-                return Err(ConfigError::Validation(format!(
-                    "transport `{label}` has an empty `interface`"
-                )));
-            }
-            if iface.len() > MAX_INTERFACE_NAME {
-                return Err(ConfigError::Validation(format!(
-                    "transport `{label}` interface `{iface}` is {} bytes; \
-                     the kernel limit is {MAX_INTERFACE_NAME}, so no such \
-                     interface can exist",
-                    iface.len()
-                )));
-            }
-            if iface.contains('/') || iface.chars().any(char::is_whitespace) {
-                return Err(ConfigError::Validation(format!(
-                    "transport `{label}` interface `{iface}` contains a \
-                     character no interface name may hold"
-                )));
-            }
+            check_interface_name(label, iface)?;
 
             // Two transports on one netdev means two sockets on the same
             // device at the same ethertype, each receiving every frame the
@@ -1902,6 +1880,20 @@ impl Config {
             }
         }
 
+        Ok(())
+    }
+
+    /// Reject a UDP `interface` no kernel can have.
+    ///
+    /// An empty name binds a Linux socket to no interface without an error,
+    /// so the instance would start unbound. Two UDP instances may share an
+    /// interface: with different ports they are two listeners.
+    fn validate_udp_interfaces(&self) -> Result<(), ConfigError> {
+        for (name, cfg) in self.transports.udp.iter() {
+            if let Some(iface) = cfg.interface.as_deref() {
+                check_interface_name(name.unwrap_or("udp"), iface)?;
+            }
+        }
         Ok(())
     }
 
@@ -2229,6 +2221,45 @@ impl Config {
         serde_yaml::to_string(self)
     }
 }
+
+/// Reject an interface name no kernel can have, for the transport `label`.
+fn check_interface_name(label: &str, iface: &str) -> Result<(), ConfigError> {
+    // Kernel limit: `IFNAMSIZ` is 16 including the terminating NUL, on
+    // both Linux and the BSDs.
+    const MAX_INTERFACE_NAME: usize = 15;
+
+    if iface.is_empty() {
+        return Err(ConfigError::Validation(format!(
+            "transport `{label}` has an empty `interface`"
+        )));
+    }
+    if iface.len() > MAX_INTERFACE_NAME {
+        return Err(ConfigError::Validation(format!(
+            "transport `{label}` interface `{iface}` is {} bytes; \
+             the kernel limit is {MAX_INTERFACE_NAME}, so no such \
+             interface can exist",
+            iface.len()
+        )));
+    }
+    if iface.contains('/') || iface.chars().any(char::is_whitespace) {
+        return Err(ConfigError::Validation(format!(
+            "transport `{label}` interface `{iface}` contains a \
+             character no interface name may hold"
+        )));
+    }
+    // The kernel stops at the first NUL, so `lo\0x` would bind `lo`.
+    if iface.chars().any(char::is_control) {
+        return Err(ConfigError::Validation(format!(
+            "transport `{label}` interface {iface:?} contains a control \
+             character"
+        )));
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+#[path = "tests/udp_interface.rs"]
+mod udp_interface_tests;
 
 #[cfg(test)]
 mod tests {

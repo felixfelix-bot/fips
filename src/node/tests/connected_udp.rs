@@ -438,3 +438,47 @@ async fn session_data_the_encrypt_worker_sends_counts_once_in_the_udp_transport_
         t.stop().await.ok();
     }
 }
+
+/// A UDP transport bound to an interface (`udp.interface`) must bind the
+/// connected socket the node opens for each of its peers to the same
+/// interface, or that peer's traffic routes by the kernel's table and can
+/// leave by another NIC. This drives the node's own tick activation, the
+/// code that hands the transport's interface to `open_connected_fd`, and
+/// reads the binding back from the kernel.
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn a_node_connected_socket_on_an_interface_bound_udp_transport_reads_back_that_interface() {
+    use crate::config::UdpConfig;
+    use crate::transport::udp::UdpTransport;
+    use std::os::unix::io::AsRawFd;
+
+    let transport_id = TransportId::new(1);
+    let (mut node, node_addr, _, _) = promoted_peer_with_the_far_side_session(transport_id);
+    let (tx, _rx) = packet_channel(64);
+    let udp_cfg = UdpConfig {
+        bind_addr: Some("127.0.0.1:0".to_string()),
+        interface: Some("lo".to_string()),
+        ..Default::default()
+    };
+    let mut udp = UdpTransport::new(transport_id, None, udp_cfg, tx);
+    udp.start_async().await.unwrap();
+    node.transports
+        .insert(transport_id, TransportHandle::Udp(udp));
+
+    let remote = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+    node.get_peer_mut(&node_addr).unwrap().set_current_addr(
+        transport_id,
+        TransportAddr::from_string(&remote.local_addr().unwrap().to_string()),
+    );
+    node.activate_connected_udp_sessions().await;
+    let socket = node
+        .get_peer(&node_addr)
+        .unwrap()
+        .connected_udp()
+        .expect("precondition: the tick activation installed a connected socket");
+
+    assert_eq!(
+        crate::transport::udp::io::bound_interface(socket.as_raw_fd()).unwrap(),
+        "lo"
+    );
+}

@@ -152,6 +152,11 @@ impl Node {
                                     link_id = %link,
                                     "Transport connect initiated (non-blocking)"
                                 );
+                                let origin = self
+                                    .peer_machines
+                                    .get(&link)
+                                    .map(|machine| machine.dial_origin())
+                                    .unwrap_or_default();
                                 self.peering
                                     .pending_connects
                                     .push(crate::node::PendingConnect {
@@ -159,6 +164,7 @@ impl Node {
                                         transport_id,
                                         remote_addr,
                                         peer_identity: Some(ambient.verified_identity),
+                                        origin,
                                     });
                             }
                             Err(_e) => {

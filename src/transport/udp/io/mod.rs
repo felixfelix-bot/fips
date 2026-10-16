@@ -21,6 +21,8 @@
 //!
 //! Follows the pattern established by `transport/ethernet/socket.rs`.
 
+#[cfg(unix)]
+mod bind_device;
 #[cfg(target_os = "linux")]
 mod linux;
 #[cfg(target_os = "macos")]
@@ -45,6 +47,8 @@ pub use windows::{AsyncUdpSocket, UdpRawSocket};
 #[cfg(target_os = "macos")]
 pub(crate) use macos::recvmsg_x_drain;
 
+#[cfg(all(test, target_os = "linux"))]
+pub(crate) use bind_device::bound_interface;
 #[cfg(any(target_os = "linux", target_os = "macos"))]
 pub(crate) use connected::{ConnectedPeerSocket, PeerRecvDrain, open_connected_fd};
 
@@ -129,7 +133,7 @@ mod tests {
 
         let adopted = UdpRawSocket::adopt(plain, 65536, 65536).expect("failed to adopt the holder");
 
-        let joined = super::open_connected_fd(adopted.local_addr(), peer_addr, 65536, 65536);
+        let joined = super::open_connected_fd(adopted.local_addr(), peer_addr, 65536, 65536, None);
         // SAFETY: `adopted` owns this fd and outlives every use of the borrow.
         let fd = unsafe { BorrowedFd::borrow_raw(adopted.as_raw_fd()) };
         let flags = socket2::SockRef::from(&fd);

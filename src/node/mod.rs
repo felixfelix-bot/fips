@@ -66,7 +66,7 @@ use crate::cache::{CoordCache, Funding, Placed};
 use crate::hosts::HostMap;
 use crate::ipv6tun::tun::{TunError, TunOutboundTx, TunState, TunTx};
 use crate::node::session::SessionEntry;
-use crate::peer::machine::{PeerMachine, TimerKind};
+use crate::peer::machine::{DialOrigin, PeerMachine, TimerKind};
 use crate::peer::{ActivePeer, ConnectivityState};
 use crate::proto::bloom::{BloomFilter, BloomState};
 use crate::proto::fmp::wire::{
@@ -369,6 +369,8 @@ struct PendingConnect {
     /// None for anonymous discovery connections where identity isn't
     /// known until the XX handshake completes.
     peer_identity: Option<PeerIdentity>,
+    /// Where the dial came from, copied from its control machine.
+    origin: DialOrigin,
 }
 
 /// Whether `peer_addr` is a tree neighbour of the node at `my_addr`: its

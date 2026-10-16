@@ -167,12 +167,18 @@ pub(crate) struct Observed {
     pub pending_connects: usize,
     /// The `peers` map keys (fully authenticated peers).
     pub connected: HashSet<NodeAddr>,
-    /// Peers with an in-flight outbound connection (`is_connecting_to_peer`).
+    /// Peers with an in-flight handshake leg, leaving out legs dialled on a
+    /// transport neighbour's claim.
     pub connecting: HashSet<NodeAddr>,
     /// In-flight legs per peer = connections(expected == addr) +
-    /// pending_connects(addr), used by the LAN layer's per-peer parallel cap.
-    /// Anonymous None-identity legs never key this map.
+    /// pending_connects(addr), leaving out claim dials; used by the LAN
+    /// layer's per-peer parallel cap. Anonymous None-identity legs never key
+    /// this map.
     pub in_flight_by_peer: HashMap<NodeAddr, usize>,
+    /// Legs and pending connects per peer dialled on a transport neighbour's
+    /// claim. A claim is unproven, so these count against other claims of
+    /// the same key only, never against another path to the node.
+    pub claims_in_flight_by_peer: HashMap<NodeAddr, usize>,
     /// Unconfigured LAN dials still connecting, held against
     /// [`MAX_LAN_DIALS_IN_FLIGHT`].
     pub lan_in_flight: usize,
@@ -719,8 +725,11 @@ impl PeeringReconciler {
     ///
     /// Transport-neighbor growth (subsumes `poll_transport_discovery`) uses the
     /// discovery connect budget and needs admission for a new peer; it dials
-    /// each distinct path once per call and counts nothing per claimed node,
-    /// since the claim is unproven until the handshake. LAN growth
+    /// each distinct path once per call. A claim is unproven until the
+    /// handshake, so claims of a node are not counted against each other
+    /// while admission is open; once admission closes, claims of a connected
+    /// peer are held to `per_peer_cap` in flight per claimed key, so they
+    /// cannot fill the handshake slots a dropped peer's redial needs. LAN growth
     /// (from the held mDNS candidates) continues from the same budget, needs
     /// admission for a new peer, and keeps unconfigured LAN handshakes in
     /// flight to at most `MAX_LAN_DIALS_IN_FLIGHT`. The driver pre-filters
@@ -741,6 +750,7 @@ impl PeeringReconciler {
             .min(budget.link_slots)
             .min(budget.discovery_per_tick);
         let mut queued_paths: HashSet<(TransportId, &TransportAddr, NodeAddr)> = HashSet::new();
+        let mut queued_claims: HashMap<NodeAddr, usize> = HashMap::new();
 
         for cand in &pools.transport_neighbors {
             let Some(identity) = cand.identity else {
@@ -766,8 +776,26 @@ impl PeeringReconciler {
             if !connected && !budget.admission_ok {
                 continue;
             }
+            // At the peer limit only claims of a connected peer get through,
+            // and nothing else bounds them per key: hold them to the per-peer
+            // cap, counting claims already in flight and those queued here.
+            let capped = connected && !budget.admission_ok;
+            if capped {
+                let in_flight = observed
+                    .claims_in_flight_by_peer
+                    .get(&addr)
+                    .copied()
+                    .unwrap_or(0);
+                let queued = queued_claims.get(&addr).copied().unwrap_or(0);
+                if in_flight + queued >= budget.per_peer_cap {
+                    continue;
+                }
+            }
             if !queued_paths.insert((cand.transport_id, &cand.remote_addr, addr)) {
                 continue;
+            }
+            if capped {
+                *queued_claims.entry(addr).or_default() += 1;
             }
             let mut emit = cand.clone();
             emit.active_refresh = connected;
@@ -990,6 +1018,10 @@ impl Peering {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "tests/reconcile.rs"]
+mod claim_tests;
 
 #[cfg(test)]
 mod tests {

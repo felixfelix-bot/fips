@@ -18,7 +18,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, Mutex as StdMutex};
 
 /// Generate a deterministic BLE address for test node `n`.
-fn ble_addr(n: u8) -> BleAddr {
+pub(super) fn ble_addr(n: u8) -> BleAddr {
     BleAddr {
         adapter: "hci0".to_string(),
         device: [0xAA, 0xBB, 0xCC, 0xDD, 0xEE, n],
@@ -673,7 +673,7 @@ async fn verified_at(node: &TestNode, addr: &crate::transport::TransportAddr) ->
 
 /// Whether the node pools a link at `addr`. False while the pool lock is
 /// held, so only a wait for presence may use it.
-fn pooled_at(node: &TestNode, addr: &crate::transport::TransportAddr) -> bool {
+pub(super) fn pooled_at(node: &TestNode, addr: &crate::transport::TransportAddr) -> bool {
     ble_of(node).connection_state_sync(addr) == crate::transport::ConnectionState::Connected
 }
 
@@ -694,7 +694,7 @@ async fn until_unpooled(node: &TestNode, addr: &crate::transport::TransportAddr)
 }
 
 /// Let background tasks run until `cond` holds, for at most about a second.
-async fn until(mut cond: impl FnMut() -> bool) -> bool {
+pub(super) async fn until(mut cond: impl FnMut() -> bool) -> bool {
     for _ in 0..200 {
         for _ in 0..16 {
             tokio::task::yield_now().await;
@@ -718,7 +718,7 @@ async fn inject_link(nodes: &[TestNode], i: usize, from: &BleAddr) -> MockBleStr
 
 /// Node 0's genuine link to node 1, dialled by node 0. Node 1 keys its end by
 /// its own address (see [`wire_ble_connection`]).
-async fn link_genuinely(nodes: &[TestNode]) -> StreamBank {
+pub(super) async fn link_genuinely(nodes: &[TestNode]) -> StreamBank {
     let bank: StreamBank = Arc::new(StdMutex::new(HashMap::new()));
     wire_ble_connection(nodes, 0, 1, &bank).await;
     install_connect_handler(nodes, 0, &bank);

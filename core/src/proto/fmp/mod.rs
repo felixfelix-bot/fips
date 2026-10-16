@@ -46,10 +46,10 @@ mod tests;
 
 pub use core::{
     ConnAction, ConnSnapshot, DialMsg2Decision, DialMsg2Reject, DialMsg2Snapshot,
-    EPOCH_RESTART_MIN_INTERVAL_SECS, EstablishSnapshot, InboundDecision, InboundReject,
-    LifecycleView, Msg1Digest, OutboundDecision, OutboundSnapshot, PeerSnapshot, RekeyCfg,
-    RekeyClaim, RekeyMsg2Decision, RekeyMsg2Reject, RekeyMsg2Snapshot, RekeyResendSnapshot,
-    WireOutcome, decide_fmp_negotiation,
+    EPOCH_RESTART_MIN_INTERVAL_SECS, EphemeralDigest, EstablishSnapshot, InboundDecision,
+    InboundReject, LifecycleView, Msg1Digest, OutboundDecision, OutboundSnapshot, PeerSnapshot,
+    RekeyCfg, RekeyClaim, RekeyMsg2Decision, RekeyMsg2Reject, RekeyMsg2Snapshot,
+    RekeyResendSnapshot, WireOutcome, decide_fmp_negotiation,
 };
 pub use core::{PromotionResult, cross_connection_winner};
 pub use limits::backoff_ms;

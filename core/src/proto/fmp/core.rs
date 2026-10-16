@@ -157,6 +157,32 @@ impl Msg1Digest {
     }
 }
 
+/// A digest of the initiator ephemeral a link handshake msg1 carries.
+///
+/// An XX msg1 is the bare initiator ephemeral, with nothing authenticated
+/// in it. A copy whose frame header (`sender_idx`) is rewritten still
+/// carries the same ephemeral, while the whole-message [`Msg1Digest`] does
+/// not match it, so a record that must count one captured msg1 once,
+/// however its header is rewritten, keys on this.
+///
+/// On XX a responder promotes a session only at msg3, which is bound to
+/// the fresh msg2 this node sent, so a replayed msg1 promotes nothing and
+/// this line passes the silent-session record no setup digest. The type is
+/// kept so that record's code stays the same as on the IK line, where a
+/// msg1 promotes the session.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct EphemeralDigest([u8; 32]);
+
+impl EphemeralDigest {
+    /// Digest the ephemeral at the start of a Noise msg1, or `None` if the
+    /// message is too short to carry one.
+    pub fn of_noise_msg1(noise_msg1: &[u8]) -> Option<Self> {
+        use sha2::{Digest, Sha256};
+        let ephemeral = noise_msg1.get(..crate::noise::PUBKEY_SIZE)?;
+        Some(Self(Sha256::digest(ephemeral).into()))
+    }
+}
+
 /// A snapshot of one active peer's rekey-relevant state, taken by the shell.
 ///
 /// Every clock read is resolved shell-side into a plain `u64`/`bool` before the

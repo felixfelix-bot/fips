@@ -12,8 +12,12 @@ Handshake message bytes are opaque here.
 - `mod.rs`: declares the files and re-exports their public items.
 - `core.rs`: the `LifecycleView` trait through which the root crate's
   `Node` shows its connections, the `ConnAction` vocabulary, the
-  snapshot types, the `poll_*` decisions (handshake timeout, msg1
-  resend, rekey), the classification of an inbound msg3 and of an
+  snapshot types, the msg1 digests (`Msg1Digest` of the whole wire
+  message, which joins both ends' log lines for one handshake, and
+  `EphemeralDigest` of the ephemeral an XX msg1 consists of, which the
+  silent-session record can key on; this line passes it none, since an
+  XX session is promoted only at msg3), the `poll_*` decisions
+  (handshake timeout, msg1 resend, rekey), the classification of an inbound msg3 and of an
   outbound msg2, the cross-connection tie-break, and the negotiation
   payload's version and profile checks.
 - `state.rs`: `ConnectionState`, the bookkeeping of a connection in its

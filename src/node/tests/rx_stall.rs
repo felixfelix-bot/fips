@@ -342,7 +342,13 @@ async fn timed_fire(node: &mut Node, trigger: Trigger) -> Reply {
         }
         Trigger::StartHandshake(link, addr) => {
             let _ = node
-                .start_handshake(link, TransportId::new(TCP_ID), addr, None)
+                .start_handshake(
+                    link,
+                    TransportId::new(TCP_ID),
+                    addr,
+                    None,
+                    crate::peer::machine::DialOrigin::Addressed,
+                )
                 .await;
         }
         Trigger::LinkMessage(peer) => {

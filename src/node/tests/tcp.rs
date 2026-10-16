@@ -22,7 +22,7 @@ use std::time::Duration;
 /// Parallel to `make_test_node()` in spanning_tree.rs but uses
 /// TcpTransport instead of UDP. Binds to 127.0.0.1:0 for an
 /// ephemeral port.
-async fn make_test_node_tcp() -> TestNode {
+pub(super) async fn make_test_node_tcp() -> TestNode {
     make_test_node_tcp_with(Config::new()).await
 }
 

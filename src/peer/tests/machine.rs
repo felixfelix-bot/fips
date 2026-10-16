@@ -122,6 +122,12 @@ fn a_too_short_msg2_is_unreadable_and_keeps_the_handshake() {
 }
 
 #[test]
+fn a_msg2_with_an_invalid_ephemeral_is_unreadable_and_keeps_the_handshake() {
+    // 0xFF is not a valid compressed-point prefix.
+    unreadable_then_genuine(|_| vec![0xFF; HANDSHAKE_MSG2_SIZE]);
+}
+
+#[test]
 fn a_garbage_full_length_msg2_is_unreadable_and_keeps_the_handshake() {
     // A valid point followed by bytes that do not authenticate: the read gets
     // as far as both DH operations before the AEAD check fails.

@@ -87,7 +87,7 @@ fn msg3_for(leg: &mut PeerMachine, msg2: &[u8], index: u32) -> Vec<u8> {
 /// Run one handshake from node 0's identity at `epoch` to node 1 and stop
 /// before any frame. Returns whether node 1 promoted it. Panics if node 1
 /// does not answer the msg1.
-async fn silent_session(nodes: &mut [TestNode], epoch: [u8; 8], index: u32) -> bool {
+pub(super) async fn silent_session(nodes: &mut [TestNode], epoch: [u8; 8], index: u32) -> bool {
     let a = *nodes[0].node.node_addr();
     discard(&mut nodes[0]);
     let (mut leg, msg1) = node0_initiator(nodes, epoch, index);

@@ -19,7 +19,7 @@
 //! counts destroys that entry. Every clock is passed in as monotonic
 //! milliseconds; the shell reads the clock.
 
-use super::core::Msg1Digest;
+use super::core::EphemeralDigest;
 use super::limits::backoff_ms;
 use crate::identity::NodeAddr;
 use alloc::collections::{BTreeMap, VecDeque};
@@ -42,9 +42,9 @@ pub const SILENT_BACKOFF_CAP_MS: u64 = 600_000;
 /// so a record held at the cap survives the gap until the next silent session.
 const RECORD_HORIZON_MS: u64 = SILENT_BACKOFF_CAP_MS;
 
-/// Link-setup msg1 digests a record remembers, so a replayed msg1 promotes a
-/// session that is counted only once. A sender cycling more distinct msg1s
-/// than this can be counted again; that needs more captured msg1s of one
+/// Link-setup msg1 ephemerals a record remembers, so a session promoted from
+/// a replayed msg1 is counted only once, whatever its header says. A sender
+/// cycling more distinct msg1s than this can be counted again; that needs more captured msg1s of one
 /// identity's epoch than the limit needs to start a refusal at all.
 const COUNTED_SETUP_RECORD: usize = 8;
 
@@ -77,7 +77,7 @@ struct SilentRecord {
     silent: u32,
     last_end_ms: u64,
     until_ms: Option<u64>,
-    counted: VecDeque<Msg1Digest>,
+    counted: VecDeque<EphemeralDigest>,
     /// Msg1s refused since the current refusal started, for the log line
     /// that reports them.
     refused: u32,
@@ -102,7 +102,7 @@ impl SilentRecord {
     }
 
     /// Remember `setup` as counted, dropping the oldest at the bound.
-    fn note_counted(&mut self, setup: Msg1Digest) {
+    fn note_counted(&mut self, setup: EphemeralDigest) {
         if self.counted.len() == COUNTED_SETUP_RECORD {
             self.counted.pop_front();
         }
@@ -132,9 +132,12 @@ impl SilentSessions {
     /// Count one session of `peer` that ended without an authenticated frame.
     ///
     /// `epoch` is the peer's startup epoch on that session and `setup` the
-    /// digest of the msg1 it was promoted from (`None` for a session this
-    /// node dialled). A session promoted from a msg1 already counted is not
-    /// counted again: a captured msg1 replays as the same digest. A session
+    /// digest of the ephemeral in the msg1 it was promoted from (`None` for a
+    /// session this node dialled). A session promoted from a msg1 already
+    /// counted is not counted again: a captured msg1 replays with the same
+    /// ephemeral even when its unauthenticated header (`sender_idx`) is
+    /// rewritten. On XX the shell passes `None` throughout, since a session
+    /// is promoted only at msg3 and a replayed msg1 promotes nothing. A session
     /// at a different epoch from the record's starts the count again. Returns
     /// the refusal this end starts or extends, if any, with the number of
     /// msg1s refused before it; the refused count starts again at zero.
@@ -142,7 +145,7 @@ impl SilentSessions {
         &mut self,
         peer: NodeAddr,
         epoch: Option<[u8; 8]>,
-        setup: Option<Msg1Digest>,
+        setup: Option<EphemeralDigest>,
         now_ms: u64,
     ) -> Option<RefusalStart> {
         self.records.retain(|_, r| !r.expired(now_ms));
