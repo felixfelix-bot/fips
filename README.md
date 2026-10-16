@@ -289,7 +289,7 @@ Nix / NixOS section of [packaging/README.md](packaging/README.md).
   then [fips-architecture.md](docs/design/fips-architecture.md) for
   the protocol stack.
 - **[Release notes](docs/releases/)** — per-version notes, including
-  [v0.5.2](docs/releases/release-notes-v0.5.2.md).
+  [v0.5.3](docs/releases/release-notes-v0.5.3.md).
 
 If you want to contribute, see [CONTRIBUTING.md](CONTRIBUTING.md)
 and [testing/README.md](testing/README.md).

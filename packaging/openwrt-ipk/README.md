@@ -597,11 +597,27 @@ default settings already uses these rates. On 5 GHz both releases are expected
 to use these rates already; that has not been checked on a router.
 
 When you reach routers over the mesh, upgrade them one at a time, farthest
-first, and run `wifi reload` on each right after its upgrade. A router that
-loses its peerings then is at the edge of what you reach, and the routers you
-reach it through keep theirs until their own turn, when the link to it comes
-back. Upgrading a near router first can cut off every router reached through
-it, which then needs another path, such as its LAN, to finish the upgrade.
+first, and run `wifi reload` on each right after its upgrade. The reload can
+recreate the mesh interface; a running `fips` rebinds to the recreated
+interface and forms its links again without a restart. Over SSH, run the
+upgrade and the reload as one detached command, since the session can drop
+part-way; with the `.apk`, put the `apk add` command above in place of
+`opkg install`:
+
+```bash
+sh -c 'trap "" HUP
+  opkg install /tmp/fips_<new-version>_<arch>.ipk
+  wifi reload' \
+  </dev/null >/tmp/fips-upgrade.log 2>&1 &
+```
+
+The command ignores the hangup itself because OpenWrt's BusyBox does not
+always include `nohup` or `setsid`. A router that loses its peerings then is
+at the edge of what you reach, and the routers you reach it through keep
+theirs until their own turn; the link to it comes back once the router you
+reach it through has been upgraded and reloaded. Upgrading a near router first
+can cut off every router reached through it, which then needs another path,
+such as its LAN, to finish the upgrade.
 
 OpenWrt 22.03 and 23.05 pass no basic rates to a mesh join, whatever is set on
 the interface or the radio, so on 2.4 GHz they join with 1, 2, 5.5 and 11 Mb/s.

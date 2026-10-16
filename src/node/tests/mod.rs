@@ -43,6 +43,7 @@ mod silent_replay;
 mod spanning_tree;
 mod tcp;
 mod traffic_diag;
+mod tree_send_failure;
 mod udp_dns;
 mod unit;
 mod update_peers;
