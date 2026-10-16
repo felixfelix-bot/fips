@@ -1185,7 +1185,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9844ddc3a6e533d62bba727eb6c28b5d360921d5175e9ff0f1e621a5c590a4d5"
 
 [[package]]
-name = "fips"
+name = "fips-core"
+version = "0.0.0"
+dependencies = [
+ "bech32 0.12.0",
+ "chacha20poly1305",
+ "hashbrown 0.16.1",
+ "hex",
+ "hkdf",
+ "hmac 0.13.0",
+ "libm",
+ "once_cell",
+ "rand 0.10.2",
+ "ring",
+ "secp256k1 0.30.0",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "sha2 0.11.0",
+ "siphasher",
+ "thiserror 2.0.20",
+ "zeroize",
+]
+
+[[package]]
+name = "fips-mesh"
 version = "0.6.0-dev"
 dependencies = [
  "arc-swap",
@@ -1233,30 +1257,6 @@ dependencies = [
  "windows-service",
  "windows-sys 0.61.2",
  "wintun",
- "zeroize",
-]
-
-[[package]]
-name = "fips-core"
-version = "0.0.0"
-dependencies = [
- "bech32 0.12.0",
- "chacha20poly1305",
- "hashbrown 0.16.1",
- "hex",
- "hkdf",
- "hmac 0.13.0",
- "libm",
- "once_cell",
- "rand 0.10.2",
- "ring",
- "secp256k1 0.30.0",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2 0.11.0",
- "siphasher",
- "thiserror 2.0.20",
  "zeroize",
 ]
 
@@ -3060,9 +3060,9 @@ dependencies = [
 
 [[package]]
 name = "rustls"
-version = "0.23.45"
+version = "0.23.46"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0d41d731c7d2f962d1ccc364cec258de3c0e93b38c2fb3ba97ac74513048d634"
+checksum = "48e13bd8c0e9365c43cfa5c9e8f9ad49d3c8444926c9aac819e0e4dc503c8fdf"
 dependencies = [
  "once_cell",
  "ring",

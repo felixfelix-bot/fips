@@ -124,22 +124,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   destroy-and-recreate, that an `optional` interface never moves node health,
   and that absence is logged once on the edge rather than once per retry.
 
-#### Docs & contributor tooling
-
-- [`docs/how-to/diagnose-reachability.md`](docs/how-to/diagnose-reachability.md)
-  — an operator how-to for the question "can this node reach that one, by what
-  route, and if not, why not?". It starts from `fipsctl probe` and maps each
-  failing stage and its reason to the next thing to check: `show sessions`
-  rather than `show peers` for nodes reached through a relay, an npub rerolled
-  by an ephemeral identity (`persistent: false`, the default), the target's own
-  link and the relay ACL that may be refusing it, which unknown nodes an ACL
-  lets link (an allowlist alone denies no one, and an accepted inbound link is
-  not logged with its npub at `info`), and `.fips` name resolution, including
-  the v0.3.0 macOS resolver file that pointed at `127.0.0.1` and a
-  `/etc/resolv.conf` that bypasses systemd-resolved. Linked from the how-to
-  index and from the `fipsctl probe` reference, whose description of the `path:`
-  section now matches the real output.
-
 #### Node lifecycle
 
 - Transport-medium change detection, controlled by the new `node.netmon.*`
@@ -542,24 +526,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   failover is unchanged. `fipsctl connect` to a live peer succeeds with
   `refreshed: false` and a new `detail: "peer live, not dialled"` field.
 
-#### Identity and config
-
-- `fips` refuses to start when its config file configures nothing: no
-  `node.identity.nsec`, `node.identity.persistent` off, no transports, no peers
-  and, on Linux, no `gateway` section. Run without `--config`, the same applies
-  to the files found on the search path taken together. This covers an empty
-  file, one holding only comments, a byte-order mark, document markers, `{}` or
-  an empty `node:` section, and one that sets only other settings such as
-  `node.log_level`. Such a config started a node with an ephemeral identity, no
-  transports and no peers, which failed with "no operational transports came up"
-  and pointed at the network instead of the config. Worse, the ephemeral start
-  moved `fips.key` aside to `fips.key.unused`, so once the config was restored
-  the persistent start found no key and generated a new identity. `fips-gateway`
-  already exited on such a config, and now names the file instead of reporting
-  that the configuration has no gateway section. Finding no config file at all
-  still starts on the defaults, and a blank file on the search path beside one
-  that configures the node is still accepted.
-
 #### Packaging
 
 - The glibc floor is 2.34, one step below the 2.35 Ubuntu 22.04 sets. Both
@@ -570,78 +536,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   reaching it means a second build image and a second floor. `FIPS_BUILD_IMAGE`
   is still the oldest Debian-family distribution, which is no longer the oldest
   distribution outright.
-- A release-candidate `.deb` is versioned `X.Y.Z~rcN` instead of
-  `X.Y.Z-rcN`. dpkg read the old form as a revision of the release and sorted
-  it above `X.Y.Z`, so a host that installed a candidate was not upgraded by
-  the release. The tarball, artifact and `.deb` file names keep the tag's
-  `-rcN`.
-
-#### Native datagram API
-
-- An accepted native API flow that its program closes without ever sending on
-  now stays open, holding its port and a slot against
-  `node.native_api.max_flows`, until its listener is closed.
-
-#### OpenWrt
-
-- The `fips` and `fips-gateway` procd services now respawn without limit.
-  procd stopped respawning either one for good after it exited six times in
-  a row, each time within an hour of starting, so a router whose daemon hit a
-  run of failures, such as a missing interface at boot, stayed off the mesh
-  until someone restarted it by hand. Each exit is still followed by a 5 s
-  delay. The old init script comment said procd would reset its count and
-  try again, which it does not.
-- Release-candidate OpenWrt `.ipk` packages are now versioned `vX.Y.Z~rcN`, so
-  opkg sorts them below the final release and the release upgrades a router
-  that ran the candidate. The package file name keeps the tag's `-rcN`.
-
-- `fips0` now has its own default-deny firewall zone, `fips`, instead of
-  joining `lan`. Router services such as LuCI, SSH and DNS are no longer
-  reachable from FIPS peers unless a rule opens them. If you manage the router
-  over FIPS, add a `src fips` rule for SSH before upgrading (see the OpenWrt
-  package README). Upgrades move `fips0` out of `lan`, remove the old firewall
-  include and reload the firewall. If the reload fails or cannot be checked,
-  or the firewall configuration cannot be saved, new connections from FIPS
-  peers to the router and gateway port forwards are blocked until the firewall
-  next reloads, and the upgrade says why and how to clear it. If the firewall
-  was not loaded at all, the upgrade says so. Sessions opened over FIPS before
-  the upgrade can stay open until they close.
-- With `fips0` in the `fips` zone, the gateway's LAN traffic and its port
-  forwards are admitted, and port forwards can now be restricted with
-  `src fips` rules. If fips-gateway serves a network in a firewall zone other
-  than `lan`, add a forwarding from that zone to `fips` (see the OpenWrt
-  package README); otherwise its clients lose the mesh after the upgrade. If
-  `fips0` is in a firewall zone of your own rather than `fips`, gateway port
-  forwards and the gateway's LAN path need rules for that zone, and the
-  upgrade says so. On fw3 builds, which the package does not support, port
-  forwards are no longer admitted.
-- ICMPv6 from the WAN side is no longer forwarded into the mesh; OpenWrt's
-  stock Allow-ICMPv6-Forward rule had let it through. Conntrack helpers are no
-  longer assigned to traffic from FIPS peers.
-- If a full overlay cuts the firewall configuration short when the upgrade
-  saves it, the upgrade now notices, blocks new connections from FIPS peers,
-  and says how to restore the configuration from `/tmp/fips-firewall.uci`.
-
-- The gateway's init script gives the LAN its global-scope address,
-  `2001:2:f1b5::1/64`, when the gateway starts and keeps it across stops and
-  restarts. Turning the gateway off deletes it: `service fips-gateway disable`
-  and `stop`, in either order, starting with the gateway turned off in
-  `fips.yaml`, or removing the package. A gateway disabled while running and
-  then rebooted keeps it until `service fips-gateway stop`. Setting and
-  deleting it on every start and stop reloaded the network each time, which on
-  OpenWrt 25.12 recreates `br-lan` and drops the LAN for a few seconds.
-
-#### Windows
-
-- `install-service.ps1` stops when `\etc\fips\fips.key` exists on the system
-  drive and `C:\ProgramData\fips\fips.key` does not. A service that an
-  earlier release ran from `\etc\fips` reads only `C:\ProgramData\fips`
-  after the installer runs, and came up with a new identity with no warning.
-  Move the key and the settings it needs into `C:\ProgramData\fips`, or
-  delete it if you did not put it there, then run the installer again.
-- The daemon warns when `fips.yaml` or `fips.key` in `\etc\fips` is present
-  but not used by the run, since a node that ran from them before an upgrade
-  now runs on another config or identity.
 
 ### Deprecated
 
@@ -654,21 +548,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   deprecation warning. The type's `Debug` output now reads
   `Ipv6Address(...)`. Its methods, its `Display` output, the control socket
   and the wire are unchanged.
-
-#### Sessions and rekey
-
-- Setting `node.rekey.enabled: false`. The disabled path is less tested and is
-  not supported, and the option is removed in v2. It still works as before;
-  the configuration reference and the mesh-layer design now say so.
-
-#### Windows
-
-- The config search's probe of `\etc\fips\fips.yaml` on the current drive.
-  The search still reads that file first and merges it under
-  `C:\ProgramData\fips\fips.yaml`, but any local user can create it, so the
-  daemon now warns when it loads a config from there, and from v0.6.0 the
-  search no longer looks there. Move the settings you need into
-  `C:\ProgramData\fips\fips.yaml`.
 
 ### Removed
 
@@ -777,38 +656,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   already queued to the exited worker are lost. With the macOS ordered sender,
   a packet sent this way can arrive out of order with the rest of its flow.
 
-- A stop sent while the daemon is starting is no longer lost. The shutdown
-  handler was installed only once start-up finished, so a stop during start-up
-  killed the daemon at once, or, with `fips` as a container's PID 1, was
-  discarded until the container's stop timeout killed it with no drain. The
-  handlers are now registered first; a stop during start-up lets start-up
-  finish for up to five seconds and then drains as usual. The example compose
-  files now run their containers under an init, so a stop reaches `fips`.
-
-#### Android
-
-- fips now builds for 32-bit Android (`armeabi-v7a` and `x86`). The DNS
-  responder set `msg_namelen` with a `u32` cast, which does not compile
-  against 32-bit bionic, where `socklen_t` is `i32`.
-
 #### Data plane and transports
-
-- A Nostr traversal connect no longer stalls for `signal_ttl_secs` (120 s by
-  default) when both peers dial each other and one offer is lost. The node
-  with the smaller address drops the peer's offer and waits for an answer to
-  its own; if its own offer never reached the peer, neither side answered
-  until the wait ran out. Dropping the peer's offer now re-sends ours once, so
-  the peer can answer it straight away. A peer that already has it ignores
-  the copy through its replay check.
-
-- Two nodes that started a handshake to each other at once over Bluetooth LE
-  no longer drop the link between them. Resolving the crossed handshake, or
-  reaping a stale handshake leg, closed the losing leg's connection by its
-  address. On TCP that is a socket of its own, but BLE carries both legs on
-  the one L2CAP link to the peer, so the close took down the link the
-  surviving session ran on; the nodes then redialled, and a peer that still
-  held the first link closed the second, so the pair churned. A leg's
-  connection is now left open when an active peer runs on it.
 
 - A peer that stops reading can no longer stall the node. TCP, Tor, Nym and
   BLE wrote to their links directly from the caller's task, and a write
@@ -869,53 +717,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the Noise session, tree position and routes survive it. Linux and macOS (the
   platforms with the connected-socket fast path); elsewhere the heartbeat alone
   carries the new address.
-- The Ethernet transport on Linux no longer leaks a socket when the interface
-  is missing or its name is invalid at the moment the socket is opened, as when
-  the interface goes away between the presence check and the bind.
-- TCP connections try the remaining addresses for a hostname after a
-  connection fails, within the existing overall connection timeout.
-- Repeated UDP receive errors now back off instead of spinning the receive
-  task and flooding logs. Normal retry timing resumes after a received packet.
-- An Ethernet peer's address is always shown as a colon-separated MAC address
-  in `fipsctl show links` and in log lines. An address whose six bytes happened
-  to be valid UTF-8 was printed as text instead.
-- The node no longer dials from its receive loop. When a peer's TCP, Tor or
-  Nym connection closed before the node answered or resent a handshake or
-  rekey message on it, the send dialed the peer's address and the receive
-  loop waited out the whole connect timeout (5 s by default on TCP) before
-  handling anything else, one send after another. For an inbound connection
-  that address is the peer's source port, where nothing listens. Meanwhile
-  UDP receive queues filled, other peers' links timed out and dropped, and the
-  log showed a `transport timeout` warning on `Failed to send msg2` or
-  `Failed to send rekey msg2` about every 5 s (#176). These sends now use only
-  a connection the transport already holds, and fail at once without one. For
-  a peer this node dialed, a connect is started in the background and the
-  next send uses it; an inbound peer's address is never dialed.
-- `show_transports` (`fipsctl show transports`) reports transport counters as
-  they stand when asked. They were a copy refreshed by the node's periodic
-  tick, so when the receive loop was too busy for the tick to run they stopped
-  moving with nothing to show it: in #176, `connect_timeouts` read 0 while the
-  log recorded hundreds of timeouts. The output is unchanged.
-- The UDP transport's `packets_recv` and `bytes_recv` now count datagrams
-  received on per-peer connected sockets, and `packets_sent`, `bytes_sent` and
-  `send_errors` count the data frames the encrypt workers send. Both were
-  missed, so on a node with connected UDP on (the Linux and macOS default)
-  the counters were far below the traffic the transport carried.
-- A failed connect made in the background by TCP, Tor or Nym is now counted,
-  as a failed inline connect is. TCP counted none, Tor missed timeouts, and
-  Nym missed timeouts and SOCKS5 errors. TCP's `connect_refused` counts every
-  connect that fails before its timeout, not only a refused one: an
-  unreachable host or network, a reset or any other connect error lands there
-  too, with the error in the debug log.
-- A UDP peer configured by hostname no longer holds up the node for as long
-  as the system resolver takes when it is slow or down. The node waits at
-  most 250 ms for a lookup, then carries on. A name that resolved within the
-  last hour keeps its last address until the lookup answers, and keeps it if
-  the lookup fails, including when the resolver answers that the name does
-  not exist; a handshake sent to that address meanwhile is sent again to the
-  new address if the answer has changed it. For a name with no address yet,
-  the handshake is sent as soon as the lookup completes.
-
 - Two BLE nodes that can each reach the other no longer fail to link when only
   one of them can dial. The node with the smaller address stood every inbound
   link down so that its own outbound would win, and when that outbound could
@@ -940,44 +741,226 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   not when a dial times out or went out at another value, so an unreachable
   peer keeps the PSM it advertised.
 
-- A peer is no longer removed when frames carrying its index fail to
-  decrypt. Twenty such frames removed the peer and marked its link dead, and
-  the index travels in clear, so anyone who had seen one frame of a link could
-  tear it down from any address, again after every reconnect. Such frames are
-  now dropped; the node logs one "Excessive decryption failures" warning when
-  the old threshold is reached and keeps the peer. A real key mismatch still
-  ends at the link-dead timeout. Against a 0.5.2 peer, recovery from a genuine
-  desynchronisation now takes the link-dead timeout rather than twenty
-  frames.
+#### macOS
 
-#### Gateway
+- The macOS daemon's log, `/usr/local/var/log/fips/fips.log`, no longer grows
+  without bound (717 MB on a node at debug level). launchd appends stdout to a
+  file forever and gives the daemon no way to reopen one rotated away, so the
+  launchd plist now passes `--log-file` and the daemon rolls the log itself;
+  an upgrade needs no config edit. The existing file rolls to `fips.log.1` on
+  the first write and ages out with the rest. stderr goes to
+  `fips.stderr.log` and carries only what fails before the log opens. The
+  package makes the log directory root-owned, and the daemon refuses to open
+  the log through a symlink.
 
-- The gateway retries failed firewall rebuilds every ten seconds without
-  waiting for another mapping change. Retries apply the latest desired
-  mappings and port forwards, preserving changes across transient failures.
-- An inbound port-forwarded connection from a mesh peer that also has a live
-  `.fips` mapping on the gateway now reaches the LAN target from the
-  gateway's LAN address, as connections from every other peer do. The
-  mapping's source rewrite used to take it first, so the target saw the
-  peer's pool address instead, which changed as mappings came and went and
-  could be answered only by a host that routes the pool to the gateway.
+### Security
 
-- `fips-gateway` now acts on a stop sent while it is still setting up. Its
-  shutdown handler was installed only after set-up, which can spend seconds
-  probing the daemon's DNS responder, so a stop in that window was lost when
-  the gateway ran as a container's PID 1 and killed it part-way through set-up
-  otherwise. A stop during the probe now ends it and exits before any NAT
-  table or route exists.
+#### Links and transports
 
-- Connections the gateway host itself makes to a virtual IP now reach the
-  mapped node. They were never translated, so they reached the gateway host
-  instead: `ssh <name>.fips` run on the gateway logged into the gateway, and
-  pings and health checks run there measured the gateway itself.
-- Connections to a virtual IP that has no mapping, such as one whose mapping
-  expired or an address written into a configuration by hand, are now refused
-  by the gateway. They reached whatever listened on the gateway host itself,
-  from the LAN and from the gateway host, so a stale DNS answer could open an
-  SSH session on the router instead of the intended node.
+- Inbound TCP connections are now also limited per source, so one host can no
+  longer take every inbound slot. By default a single IPv4 address, or a
+  single IPv6 /64, may hold 8 at once (`transports.tcp.max_inbound_per_source`;
+  a value at or above the transport's inbound cap turns the limit off). A
+  refused connection is closed at once and counted in `connections_rejected`
+  and in the new `source_rejected` statistic. A node that receives inbound TCP
+  through a local proxy (sslh, stunnel, a userland port forwarder) sees every
+  peer arrive from the proxy's address and should raise the limit.
+- A peer that completes msg1 and then never sends an authenticated frame can
+  no longer make the node set up a new link for it on every msg1. Each such
+  link cost a msg2, a tree announce and a stale peer entry until the link-dead
+  timeout removed it. After three links in a row from one identity end without
+  an authenticated frame, at one startup epoch, the node drops that identity's
+  msg1s at that epoch unanswered for 30 seconds, doubling with each further
+  silent link up to 10 minutes. Any authenticated frame from the identity
+  clears the record. A msg1 at a new epoch (a restart) is never refused, a
+  resend of the msg1 an existing link was set up from is still answered, and
+  the node's own dials to the peer are unaffected. Refused msg1s are counted
+  as a new `silent_backoff` handshake reject, apart from `bad_state`, and
+  `HandshakeStats` and `HandshakeStatsSnapshot` gain a public `silent_backoff`
+  field.
+
+#### Routing and discovery
+
+- A tree child's bloom filter that returns most of the filter this node sent
+  it is now rejected, and the child's previous filter kept. A child's filter
+  is merged into every filter the node sends, including the one to its parent,
+  so a child announcing back what it was sent made the node's upward filter
+  claim the whole mesh, which the false-positive cap cannot tell apart from an
+  honest whole-mesh view. The check compares each announce from a tree child
+  with the filter last sent to it, and leaves room for a subtree already
+  present in what was sent. It applies only when the filter sent has at least
+  128 set bits and the child already has a stored filter, so a false rejection
+  never drops a child's subtree outright; parents and non-tree peers are not
+  checked. Rejections are counted as `child_role_rejected` in `show_bloom`
+  and logged at WARN. The threshold is `node.bloom.child_echo_threshold`
+  (default 0.8; 1.0 or above turns the check off).
+
+## [0.5.3] - 2026-10-16 (provisional)
+
+### Added
+
+#### Docs & contributor tooling
+
+- [`docs/how-to/diagnose-reachability.md`](docs/how-to/diagnose-reachability.md)
+  — an operator how-to for the question "can this node reach that one, by what
+  route, and if not, why not?". It starts from `fipsctl probe` and maps each
+  failing stage and its reason to the next thing to check: `show sessions`
+  rather than `show peers` for nodes reached through a relay, an npub rerolled
+  by an ephemeral identity (`persistent: false`, the default), the target's own
+  link and the relay ACL that may be refusing it, which unknown nodes an ACL
+  lets link (an allowlist alone denies no one, and an accepted inbound link is
+  not logged with its npub at `info`), and `.fips` name resolution, including
+  the v0.3.0 macOS resolver file that pointed at `127.0.0.1` and a
+  `/etc/resolv.conf` that bypasses systemd-resolved. Linked from the how-to
+  index and from the `fipsctl probe` reference, whose description of the `path:`
+  section now matches the real output.
+
+### Changed
+
+#### Identity and config
+
+- `fips` refuses to start when its config file configures nothing: no
+  `node.identity.nsec`, `node.identity.persistent` off, no transports, no peers
+  and, on Linux, no `gateway` section. Run without `--config`, the same applies
+  to the files found on the search path taken together. This covers an empty
+  file, one holding only comments, a byte-order mark, document markers, `{}` or
+  an empty `node:` section, and one that sets only other settings such as
+  `node.log_level`. Such a config started a node with an ephemeral identity, no
+  transports and no peers, which failed with "no operational transports came up"
+  and pointed at the network instead of the config. Worse, the ephemeral start
+  moved `fips.key` aside to `fips.key.unused`, so once the config was restored
+  the persistent start found no key and generated a new identity. `fips-gateway`
+  already exited on such a config, and now names the file instead of reporting
+  that the configuration has no gateway section. Finding no config file at all
+  still starts on the defaults, and a blank file on the search path beside one
+  that configures the node is still accepted.
+
+#### Linux packages
+
+- A release-candidate `.deb` is versioned `X.Y.Z~rcN` instead of
+  `X.Y.Z-rcN`. dpkg read the old form as a revision of the release and sorted
+  it above `X.Y.Z`, so a host that installed a candidate was not upgraded by
+  the release. The tarball, artifact and `.deb` file names keep the tag's
+  `-rcN`.
+
+#### OpenWrt
+
+- The `fips` and `fips-gateway` procd services now respawn without limit.
+  procd stopped respawning either one for good after it exited six times in
+  a row, each time within an hour of starting, so a router whose daemon hit a
+  run of failures, such as a missing interface at boot, stayed off the mesh
+  until someone restarted it by hand. Each exit is still followed by a 5 s
+  delay. The old init script comment said procd would reset its count and
+  try again, which it does not.
+- Release-candidate OpenWrt `.ipk` packages are now versioned `vX.Y.Z~rcN`, so
+  opkg sorts them below the final release and the release upgrades a router
+  that ran the candidate. The package file name keeps the tag's `-rcN`.
+- `fips0` now has its own default-deny firewall zone, `fips`, instead of
+  joining `lan`. Router services such as LuCI, SSH and DNS are no longer
+  reachable from FIPS peers unless a rule opens them. If you manage the router
+  over FIPS, add a `src fips` rule for SSH before upgrading (see the OpenWrt
+  package README). Upgrades move `fips0` out of `lan`, remove the old firewall
+  include and reload the firewall. If the reload fails or cannot be checked,
+  or the firewall configuration cannot be saved, new connections from FIPS
+  peers to the router and gateway port forwards are blocked until the firewall
+  next reloads, and the upgrade says why and how to clear it. If the firewall
+  was not loaded at all, the upgrade says so. Sessions opened over FIPS before
+  the upgrade can stay open until they close.
+- With `fips0` in the `fips` zone, the gateway's LAN traffic and its port
+  forwards are admitted, and port forwards can now be restricted with
+  `src fips` rules. If fips-gateway serves a network in a firewall zone other
+  than `lan`, add a forwarding from that zone to `fips` (see the OpenWrt
+  package README); otherwise its clients lose the mesh after the upgrade. If
+  `fips0` is in a firewall zone of your own rather than `fips`, gateway port
+  forwards and the gateway's LAN path need rules for that zone, and the
+  upgrade says so. On fw3 builds, which the package does not support, port
+  forwards are no longer admitted.
+- ICMPv6 from the WAN side is no longer forwarded into the mesh; OpenWrt's
+  stock Allow-ICMPv6-Forward rule had let it through. Conntrack helpers are no
+  longer assigned to traffic from FIPS peers.
+- If a full overlay cuts the firewall configuration short when the upgrade
+  saves it, the upgrade now notices, blocks new connections from FIPS peers,
+  and says how to restore the configuration from `/tmp/fips-firewall.uci`.
+- The gateway's init script gives the LAN its global-scope address,
+  `2001:2:f1b5::1/64`, when the gateway starts and keeps it across stops and
+  restarts. Turning the gateway off deletes it: `service fips-gateway disable`
+  and `stop`, in either order, starting with the gateway turned off in
+  `fips.yaml`, or removing the package. A gateway disabled while running and
+  then rebooted keeps it until `service fips-gateway stop`. Setting and
+  deleting it on every start and stop reloaded the network each time, which on
+  OpenWrt 25.12 recreates `br-lan` and drops the LAN for a few seconds.
+- Development builds of the OpenWrt packages, from branch pushes, pull
+  requests and manual runs on a branch, are no longer uploaded to Blossom or
+  announced as NIP-94 release events on Nostr relays. Only release tags
+  publish there, so anyone following those events stops receiving untagged
+  builds.
+- OpenWrt 24.10 and 25.12 routers set up with `fips-mesh-setup` now form
+  802.11s peerings with each other. Mesh points peer only when they join with
+  the same basic rates, and the two releases chose different ones when none
+  was set, so each heard the other's beacons and never peered.
+  `fips-mesh-setup` now sets `basic_rate '6000 12000 24000'` on every mesh
+  interface it creates, and an upgrade sets it on mesh interfaces made by
+  older packages, keeping a value you set yourself. The rates apply at the
+  next reboot or network reload, which on a router with the gateway enabled
+  happens during the upgrade; a router on the new rates stops peering with one
+  still on the old, so upgrade routers you reach over the mesh one at a time,
+  farthest first. OpenWrt 22.03 and 23.05 cannot set basic rates on a mesh and
+  join a 2.4 GHz mesh with 1, 2, 5.5 and 11 Mb/s, so they no longer peer there
+  with upgraded 24.10 or later routers; the package README gives the setting
+  that keeps them in. `fips-mesh-setup rates` applies the rates by hand after
+  a reinstall.
+
+#### Windows
+
+- `install-service.ps1` stops when `\etc\fips\fips.key` exists on the system
+  drive and `C:\ProgramData\fips\fips.key` does not. A service that an
+  earlier release ran from `\etc\fips` reads only `C:\ProgramData\fips`
+  after the installer runs, and came up with a new identity with no warning.
+  If the key is this node's, move it to `C:\ProgramData\fips\fips.key`,
+  carry the settings you need from `\etc\fips\fips.yaml` into
+  `C:\ProgramData\fips\fips.yaml`, including
+  `node.identity.persistent: true` (without it the service sets the key
+  aside and starts under a new identity), and delete `\etc\fips\fips.yaml`.
+  If you did not put the key there, delete it. Then run the installer again.
+- The daemon warns when `fips.yaml` or `fips.key` in `\etc\fips` is present
+  but not used by the run, since a node that ran from them before an upgrade
+  now runs on another config or identity.
+
+#### Native datagram API
+
+- An accepted native API flow that its program closes without ever sending on
+  now stays open, holding its port and a slot against
+  `node.native_api.max_flows`, until its listener is closed.
+
+#### Rust package
+
+- The Rust package is now named `fips-mesh`, and is published on crates.io
+  under that name, where `fips` belongs to another project. The library is
+  still `fips`, and the binaries, the Debian package and every other package
+  keep their names. `cargo` commands that name the package change from
+  `-p fips` to `-p fips-mesh`, and a crate that depends on FIPS must add
+  `package = "fips-mesh"` to its dependency, for example
+  `fips = { package = "fips-mesh", path = "..." }`, keeping the key `fips` so
+  `use fips::...` is unchanged.
+
+### Deprecated
+
+#### Windows
+
+- The config search's probe of `\etc\fips\fips.yaml` on the current drive.
+  The search still reads that file first and merges it under
+  `C:\ProgramData\fips\fips.yaml`, but any local user can create it, so the
+  daemon now warns when it loads a config from there, and from v0.6.0 the
+  search no longer looks there. Move the settings you need into
+  `C:\ProgramData\fips\fips.yaml`.
+
+#### Sessions and rekey
+
+- Setting `node.rekey.enabled: false`. The disabled path is less tested and is
+  not supported, and the option is removed in v2. It still works as before;
+  the configuration reference and the mesh-layer design now say so.
+
+### Fixed
 
 #### Identity and config
 
@@ -993,7 +976,35 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   to apply. Services started with `--config`, or on Windows with
   `FIPS_CONFIG` set, were not affected.
 
-#### Packaging
+#### Gateway
+
+- The gateway retries failed firewall rebuilds every ten seconds without
+  waiting for another mapping change. Retries apply the latest desired
+  mappings and port forwards, preserving changes across transient failures.
+- An inbound port-forwarded connection from a mesh peer that also has a live
+  `.fips` mapping on the gateway now reaches the LAN target from the
+  gateway's LAN address, as connections from every other peer do. The
+  mapping's source rewrite used to take it first, so the target saw the
+  peer's pool address instead, which changed as mappings came and went and
+  could be answered only by a host that routes the pool to the gateway.
+- `fips-gateway` now acts on a stop sent while it is still setting up. Its
+  shutdown handler was installed only after set-up, which can spend seconds
+  probing the daemon's DNS responder, so a stop in that window was lost when
+  the gateway ran as a container's PID 1 and killed it part-way through set-up
+  otherwise. A stop during the probe now ends it and exits before any NAT
+  table or route exists.
+- Connections to a virtual IP no longer reach the gateway host itself.
+  Connections the gateway host makes to a mapped virtual IP now reach the
+  mapped node; they were never translated, so `ssh <name>.fips` run on the
+  gateway logged into the gateway, and pings and health checks run there
+  measured the gateway itself. Connections to a virtual IP that has no
+  mapping, such as one whose mapping expired or an address written into a
+  configuration by hand, are now refused by the gateway, from the LAN and
+  from the gateway host; they reached whatever listened on the gateway host,
+  so a stale DNS answer could open an SSH session on the router instead of
+  the intended node.
+
+#### Linux packages
 
 - The `fips` and `fips-gateway` systemd units (tarball, `.deb`, AUR and NixOS)
   now back off between automatic restarts, waiting 5 s, 7 s, 10 s, 15 s, 21 s
@@ -1026,49 +1037,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `.fips` forwarding line was never loaded. Stopping `fips-dns`, removing the
   `.deb`, and the tarball's `uninstall.sh` now restart a running dnsmasq too,
   so the forwarding is actually dropped.
-- On FreeBSD with pkg dnsmasq, the DNS setup and teardown scripts now restart
-  dnsmasq instead of reloading it. The rc script's reload sends dnsmasq a
-  SIGHUP, which does not make it re-read its configuration, so `.fips` names
-  did not resolve, and after teardown were not dropped, until dnsmasq was
-  restarted by hand.
-
-#### macOS
-
-- The macOS daemon's log, `/usr/local/var/log/fips/fips.log`, no longer grows
-  without bound (717 MB on a node at debug level). launchd appends stdout to a
-  file forever and gives the daemon no way to reopen one rotated away, so the
-  launchd plist now passes `--log-file` and the daemon rolls the log itself;
-  an upgrade needs no config edit. The existing file rolls to `fips.log.1` on
-  the first write and ages out with the rest. stderr goes to
-  `fips.stderr.log` and carries only what fails before the log opens. The
-  package makes the log directory root-owned, and the daemon refuses to open
-  the log through a symlink.
-
-- If an encrypt worker thread exits, the daemon no longer stops once that
-  worker's send queue fills. Packets for that worker are now dropped instead
-  of blocking forever. This applies to the default sender.
-- With the opt-in ordered sender (`FIPS_MACOS_ORDERED_SENDER`), the daemon no
-  longer stops forwarding when an encrypt worker thread or a destination's send
-  thread exits. Packets that thread would have handled are dropped instead of
-  holding up every later packet to the same destination.
-
-#### Native datagram API
-
-- On macOS, a flow accepted through the native API could arrive already
-  closed, losing the peer's first datagram, when the kernel's descriptor
-  garbage collector ran before the client read the arrival message. The same
-  exposure on connect and listen replies is closed too.
-- A native API flow can now reach a node that is not a peer, has no session,
-  was not resolved through DNS and has no known route. Discovery ran for it,
-  but its answer was discarded, and the datagram was held without being
-  sent. The node now records the flow's key before starting discovery, and
-  retries the session for held native datagrams once discovery answers.
-- A native API datagram held for a destination whose session never comes up
-  (its lookup or handshake timed out, its peer went away, or no lookup could
-  be started) is now discarded instead of held for the life of the daemon.
-  After the pending-destination limit
-  (`node.session.pending_max_destinations`, 256 by default) was reached, the
-  first datagrams to every new destination were dropped.
 
 #### OpenWrt
 
@@ -1089,45 +1057,123 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   member port (for example `lan1` or `eth1`), change it back to `br-lan`. Your
   edited config is kept across upgrades, along with its old "physical port
   names, NOT bridge names" comment, so an upgrade alone will not correct it.
-
 - `build-ipk.sh` and `build-apk.sh` find the binaries in the target directory
   cargo used, so a build with `CARGO_TARGET_DIR` or a `target-dir` setting no
   longer fails after compiling. The apk README covers building in an Alpine
   container and installing on a router without internet access.
-- OpenWrt 24.10 and 25.12 routers set up with `fips-mesh-setup` now form
-  802.11s peerings with each other. Mesh points peer only when they join with
-  the same basic rates, and the two releases chose different ones when none
-  was set, so each heard the other's beacons and never peered.
-  `fips-mesh-setup` now sets `basic_rate '6000 12000 24000'` on every mesh
-  interface it creates, and an upgrade sets it on mesh interfaces made by
-  older packages, keeping a value you set yourself. The rates apply at the
-  next reboot or network reload, which on a router with the gateway enabled
-  happens during the upgrade; a router on the new rates stops peering with one
-  still on the old, so upgrade routers you reach over the mesh one at a time,
-  farthest first. OpenWrt 22.03 and 23.05 cannot set basic rates on a mesh and
-  join a 2.4 GHz mesh with 1, 2, 5.5 and 11 Mb/s, so they no longer peer there
-  with upgraded 24.10 or later routers; the package README gives the setting
-  that keeps them in. `fips-mesh-setup rates` applies the rates by hand after
-  a reinstall.
 
-#### Routing and discovery
+#### Windows
 
-- A backward step of the system clock, from an NTP correction, a manual set
-  or a VM resume, no longer holds a node's bloom filter announces for the
-  size of the step. The spacing between announces to a peer
-  (`node.bloom.update_debounce_ms`, 500 ms by default) is now measured on a
-  monotonic clock.
+- The ZIP's `README.txt` lists `\etc\fips\fips.yaml` as the first file a
+  foreground run reads, which it omitted, and says to stop the service before
+  rerunning `install-service.ps1` to upgrade: with the service running, the
+  installer fails copying `fips.exe`.
+- An ICMP port-unreachable answering a datagram the node sent no longer shows
+  up as a receive error on the UDP transport's socket. Windows reports one on
+  the socket's next receive by default, and that socket is shared by every UDP
+  peer, so one unreachable peer address put errors into the receive path that
+  every other UDP peer's traffic uses.
 
-- A transit lookup request is no longer forwarded back to the peer it came
-  from. That copy was always a duplicate, and a tree child announcing a filter
-  that covers most of the mesh turned every lookup between it and the parent
-  into a two-way echo, multiplying duplicate traffic and dedup-cache evictions.
+#### FreeBSD
 
-- A node whose tree parent moves to a worse root, for example after losing its
-  own uplink, now switches at once to a peer still on the better root. It used
-  to follow the parent to the worse root and stay there until its next
-  periodic parent check, up to a minute later, so the mesh could briefly hold
-  two roots.
+- With pkg dnsmasq, the DNS setup and teardown scripts now restart dnsmasq
+  instead of reloading it. The rc script's reload sends dnsmasq a SIGHUP,
+  which does not make it re-read its configuration, so `.fips` names did not
+  resolve, and after teardown were not dropped, until dnsmasq was restarted
+  by hand.
+
+#### macOS
+
+- The daemon no longer stops forwarding when one of its sending threads
+  exits. With the default sender, an encrypt worker thread that exited
+  stopped the daemon once that worker's send queue filled; its packets are
+  now dropped instead of blocking forever. With the opt-in ordered sender
+  (`FIPS_MACOS_ORDERED_SENDER`), an encrypt worker thread or a destination's
+  send thread that exited stopped forwarding; the packets that thread would
+  have handled are now dropped instead of holding up every later packet to
+  the same destination.
+
+#### Android
+
+- fips now builds for 32-bit Android (`armeabi-v7a` and `x86`). The DNS
+  responder set `msg_namelen` with a `u32` cast, which does not compile
+  against 32-bit bionic, where `socklen_t` is `i32`.
+
+#### Links and transports
+
+- A Nostr traversal connect no longer stalls for `signal_ttl_secs` (120 s by
+  default) when both peers dial each other and one offer is lost. The node
+  with the smaller address drops the peer's offer and waits for an answer to
+  its own; if its own offer never reached the peer, neither side answered
+  until the wait ran out. Dropping the peer's offer now re-sends ours once, so
+  the peer can answer it straight away. A peer that already has it ignores
+  the copy through its replay check.
+- Two nodes that started a handshake to each other at once over Bluetooth LE
+  no longer drop the link between them. Resolving the crossed handshake, or
+  reaping a stale handshake leg, closed the losing leg's connection by its
+  address. On TCP that is a socket of its own, but BLE carries both legs on
+  the one L2CAP link to the peer, so the close took down the link the
+  surviving session ran on; the nodes then redialled, and a peer that still
+  held the first link closed the second, so the pair churned. A leg's
+  connection is now left open when an active peer runs on it.
+- The Ethernet transport on Linux no longer leaks a socket when the configured
+  interface is missing or invalid, at startup or when the beacon socket is
+  reopened after the interface goes away. A running node whose interface was
+  removed and not recreated retried the reopen on every beacon interval and
+  leaked one descriptor each time.
+- TCP connections try the remaining addresses for a hostname after a
+  connection fails, within the existing overall connection timeout.
+- Repeated UDP receive errors now back off instead of spinning the receive
+  task and flooding logs. Normal retry timing resumes after a received packet.
+- An Ethernet peer's address is always shown as a colon-separated MAC address
+  in `fipsctl show links` and in log lines. An address whose six bytes happened
+  to be valid UTF-8 was printed as text instead.
+- The node no longer dials from its receive loop. When a peer's TCP, Tor or
+  Nym connection closed before the node answered or resent a handshake or
+  rekey message on it, the send dialed the peer's address and the receive
+  loop waited out the whole connect timeout (5 s by default on TCP) before
+  handling anything else, one send after another. For an inbound connection
+  that address is the peer's source port, where nothing listens. Meanwhile
+  UDP receive queues filled, other peers' links timed out and dropped, and the
+  log showed a `transport timeout` warning on `Failed to send msg2` or
+  `Failed to send rekey msg2` about every 5 s (#176). These sends now use only
+  a connection the transport already holds, and fail at once without one. For
+  a peer this node dialed, a connect is started in the background and the
+  next send uses it; an inbound peer's address is never dialed.
+- Transport counters now keep up with the traffic and failures they count.
+  `show_transports` (`fipsctl show transports`) reports them as they stand
+  when asked. They were a copy refreshed by the node's periodic tick, so when
+  the receive loop was too busy for the tick to run they stopped moving with
+  nothing to show it: in #176, `connect_timeouts` read 0 while the log
+  recorded hundreds of timeouts. The output is unchanged. The UDP transport's
+  `packets_recv` and `bytes_recv` now count datagrams received on per-peer
+  connected sockets, and `packets_sent`, `bytes_sent` and `send_errors` count
+  the data frames the encrypt workers send. Both were missed, so on a node
+  with connected UDP on (the Linux and macOS default) the counters were far
+  below the traffic the transport carried. A failed connect made in the
+  background by TCP, Tor or Nym is now counted, as a failed inline connect
+  is. TCP counted none, Tor missed timeouts, and Nym missed timeouts and
+  SOCKS5 errors. TCP's `connect_refused` counts every connect that fails
+  before its timeout, not only a refused one: an unreachable host or
+  network, a reset or any other connect error lands there too, with the
+  error in the debug log.
+- A UDP peer configured by hostname no longer holds up the node for as long
+  as the system resolver takes when it is slow or down. The node waits at
+  most 250 ms for a lookup, then carries on. A name that resolved within the
+  last hour keeps its last address until the lookup answers, and keeps it if
+  the lookup fails, including when the resolver answers that the name does
+  not exist; a handshake sent to that address meanwhile is sent again to the
+  new address if the answer has changed it. For a name with no address yet,
+  the handshake is sent as soon as the lookup completes.
+- A peer is no longer removed when frames carrying its index fail to
+  decrypt. Twenty such frames removed the peer and marked its link dead, and
+  the index travels in clear, so anyone who had seen one frame of a link could
+  tear it down from any address, again after every reconnect. Such frames are
+  now dropped; the node logs one "Excessive decryption failures" warning when
+  the old threshold is reached and keeps the peer. A real key mismatch still
+  ends at the link-dead timeout. Against a 0.5.2 peer, recovery from a genuine
+  desynchronisation now takes the link-dead timeout rather than twenty
+  frames.
 
 #### Sessions and rekey
 
@@ -1144,7 +1190,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   stream of failing sends starts one), re-caching the destination's identity
   from the session first so the answer can be verified, and the existing
   session carries on once the coordinates return.
-
 - A link rekey whose msg2 is lost now completes on the initiator's next msg1
   resend. The responder refused every resend while it held the session it had
   answered with, so the initiator abandoned its cycles and the link went
@@ -1161,129 +1206,111 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   dropped. They also no longer hold the link alive: after a rekey the
   link-dead timer runs from the switch until a frame on the new session
   arrives.
-- A forged FSP SessionMsg3 or SessionSetup can no longer split a session's
-  key epochs during a rekey. Either one, delivered under the peer's address
-  after the peer had read this node's SessionAck, discarded the handshake the
-  peer's genuine msg3 needed; the peer then cut over to keys this node never
-  derived, and frames from it stopped decoding until a later rekey. An
-  unreadable msg3 now leaves the handshake in place, and a setup arriving
-  while a handshake the peer armed awaits its msg3 is dropped and counted as
-  `rekey_held`. A genuine retry that meets such a handshake completes one
-  handshake timeout later.
-- An unreadable SessionMsg3 no longer discards the half-open session of an
-  initial handshake, which left the initiator's genuine msg3 to an unknown
-  session.
-
+- A forged or unreadable FSP SessionMsg3, or a forged SessionSetup, no
+  longer discards the handshake the peer's genuine msg3 needs. During a
+  rekey, either one, delivered under the peer's address after the peer had
+  read this node's SessionAck, split the session's key epochs: the peer cut
+  over to keys this node never derived, and frames from it stopped decoding
+  until a later rekey. In an initial handshake, an unreadable SessionMsg3
+  discarded the half-open session, which left the initiator's genuine msg3
+  to an unknown session. An unreadable msg3 now leaves the handshake in
+  place, and a setup arriving while a handshake the peer armed awaits its
+  msg3 is dropped and counted as `rekey_held`. A genuine retry that meets
+  such a handshake completes one handshake timeout later.
 - A link whose ends had fallen out of step on the K-bit, for example after a
   peer restart, no longer loses every rekey the peer starts. Frames on the
   peer's new session were tried against it only when their K-bit differed from
   ours, so they failed decryption until the peer was removed. Frames on the
   pending session's index now always get that trial, and the K-bits are put
   back in step at the cutover after a restart.
+- A same-epoch link msg1 from an established peer is now told apart as a
+  rekey, a replay or a fresh dial. One that arrives off the peer's live
+  established link, such as a TCP dial from a peer already linked over UDP,
+  or a second address on the same transport, is no longer taken as a rekey
+  of that link. It was answered on the established link, held a pending
+  session for 120 s, refused the peer's genuine rekeys meanwhile, and could
+  cancel our own. A replayed copy of the msg1 a link was set up from is
+  refused once the link is old enough to rekey, instead of arming a 120 s
+  hold for each copy. For 30 s after a link came up or rekeyed, every
+  same-epoch msg1 from the peer got the msg2 stored for the link's setup
+  msg1, which completes no other handshake, so a peer that lost its side of
+  the link and dialled again could not reconnect until the link-dead
+  timeout. The stored msg2 now answers only the msg1 it was made for. Any
+  other msg1 replaces the session as a peer restart does, once nothing
+  authenticated has arrived from the peer for 15 s. A link rekey the peer
+  starts within 30 s of the previous one, as the message-count trigger does
+  on a busy link, is now answered once 10 s have passed since that rekey.
+  Until 30 s had passed it was dropped, or, from a peer silent for 15 s,
+  taken as a fresh dial that replaced the link. The 30 s that keeps a
+  crossing dial from being taken for a rekey now runs from when the link
+  came up, or from a peer restart our rekey revealed, instead of restarting
+  at every rekey.
 
-- A same-epoch msg1 that arrives off a peer's live established link, such as a
-  TCP dial from a peer already linked over UDP, or a second address on the same
-  transport, is no longer taken as a rekey of that link. It was answered on the
-  established link, held a pending session for 120 s, refused the peer's
-  genuine rekeys meanwhile, and could cancel our own. A replayed copy of the
-  msg1 a link was set up from is also refused once the link is old enough to
-  rekey, instead of arming a 120 s hold for each copy.
+#### Routing and discovery
 
-- For 30 s after a link came up or rekeyed, every same-epoch msg1 from the
-  peer got the msg2 stored for the link's setup msg1, which completes no other
-  handshake, so a peer that lost its side of the link and dialled again could
-  not reconnect until the link-dead timeout. The stored msg2 now answers only
-  the msg1 it was made for. Any other msg1 replaces the session as a peer
-  restart does, once nothing authenticated has arrived from the peer for 15 s.
+- A backward step of the system clock, from an NTP correction, a manual set
+  or a VM resume, no longer holds a node's bloom filter announces for the
+  size of the step. The spacing between announces to a peer
+  (`node.bloom.update_debounce_ms`, 500 ms by default) is now measured on a
+  monotonic clock.
+- A transit lookup request is no longer forwarded back to the peer it came
+  from. That copy was always a duplicate, and a tree child announcing a filter
+  that covers most of the mesh turned every lookup between it and the parent
+  into a two-way echo, multiplying duplicate traffic and dedup-cache evictions.
+- A node whose tree parent moves to a worse root, for example after losing its
+  own uplink, now switches at once to a peer still on the better root. It used
+  to follow the parent to the worse root and stay there until its next
+  periodic parent check, up to a minute later, so the mesh could briefly hold
+  two roots.
+- A TreeAnnounce whose link send fails is now kept pending and resent on the
+  next tick, instead of being dropped until a later announce happened to reach
+  that peer.
 
-- A link rekey the peer starts within 30 s of the previous one, as the
-  message-count trigger does on a busy link, is now answered once 10 s have
-  passed since that rekey. Until 30 s had passed it was dropped, or, from a
-  peer silent for 15 s, taken as a fresh dial that replaced the link. The
-  30 s that keeps a crossing dial from being taken for a rekey now runs from
-  when the link came up, or from a peer restart our rekey revealed, instead
-  of restarting at every rekey.
+#### Native datagram API
 
-#### Windows
+- On macOS, a flow accepted through the native API could arrive already
+  closed, losing the peer's first datagram, when the kernel's descriptor
+  garbage collector ran before the client read the arrival message. The same
+  exposure on connect and listen replies is closed too.
+- A native API flow can now reach a node that is not a peer, has no session,
+  was not resolved through DNS and has no known route. Discovery ran for it,
+  but its answer was discarded, and the datagram was held without being
+  sent. The node now records the flow's key before starting discovery, and
+  retries the session for held native datagrams once discovery answers.
+- A native API datagram held for a destination whose session never comes up
+  (its lookup or handshake timed out, its peer went away, or no lookup could
+  be started) is now discarded instead of held for the life of the daemon.
+  After the pending-destination limit
+  (`node.session.pending_max_destinations`, 256 by default) was reached, the
+  first datagrams to every new destination were dropped.
 
-- The ZIP's `README.txt` lists `\etc\fips\fips.yaml` as the first file a
-  foreground run reads, which it omitted, and says to stop the service before
-  rerunning `install-service.ps1` to upgrade: with the service running, the
-  installer fails copying `fips.exe`.
-- An ICMP port-unreachable answering a datagram the node sent no longer shows
-  up as a receive error on the UDP transport's socket. Windows reports one on
-  the socket's next receive by default, and that socket is shared by every UDP
-  peer, so one unreachable peer address put errors into the receive path that
-  every other UDP peer's traffic uses.
+#### Node lifecycle
+
+- A stop sent while the daemon is starting is no longer lost. The shutdown
+  handler was installed only once start-up finished, so a stop during start-up
+  killed the daemon at once, or, with `fips` as a container's PID 1, was
+  discarded until the container's stop timeout killed it with no drain. The
+  handlers are now registered first; a stop during start-up lets start-up
+  finish for up to five seconds and then drains as usual. The example compose
+  files now run their containers under an init, so a stop reaches `fips`.
 
 ### Security
-
-#### DNS
-
-- The `.fips` responder and the gateway's DNS forwarder no longer answer DNS
-  responses or other datagrams that are not queries, which let one forged
-  datagram start an endless exchange with another responder or service. They
-  no longer copy records or extra questions from a query into the reply, which
-  made the responder a reflector with up to about seven times amplification
-  when bound to a non-loopback address. Both now answer unknown record types
-  with NODATA or NXDOMAIN, other opcodes with NOTIMP, malformed queries with
-  FORMERR and other classes with REFUSED, and copy the RD and CD flags into
-  the reply. A query whose class carries the mDNS unicast-response bit is now
-  refused, where it was answered as class IN, and `.fips` queries larger than
-  512 bytes, such as EDNS-padded ones, are now answered.
-- The gateway's relayed NXDOMAIN now carries an SOA, so resolvers cache it for
-  up to `gateway.dns.ttl` (60 seconds by default). A name that becomes
-  resolvable while the daemon runs, such as an alias added to the hosts file
-  or the peer list, can stay NXDOMAIN to LAN clients that long after a failed
-  lookup.
-- A configured `dns.ttl` or `gateway.dns.ttl` above 2147483647 is used as
-  2147483647, the largest TTL resolvers honour. For the gateway the clamped
-  value is also the TTL its address pool uses.
-- The configuration reference now says which platforms keep mesh peers away
-  from a wildcard `dns.bind_addr` (Linux, macOS and FreeBSD with the daemon's
-  own TUN, unless the daemon logs at start that the mesh interface index is
-  unresolved and the DNS mesh filter disabled) and which do not (Windows, or
-  an application-supplied TUN), and that such a bind answers every host on the
-  node's other networks. The macOS WireGuard container example now publishes
-  the DNS port on `127.0.0.1` only.
-
-- On Linux, a `.fips` query from a mesh address is answered only out of the
-  interface it arrived on. With a non-loopback `dns.bind_addr`, a host on
-  another network could forge a mesh source address and make the node send DNS
-  replies into the mesh from its own address. With a specific (non-wildcard)
-  `dns.bind_addr`, a query from a ULA (`fd00::/8`) source arriving on a
-  non-mesh interface is no longer answered.
-- On Linux, a responder bound to one specific `dns.bind_addr` with no known
-  mesh interface index (an application-supplied TUN, or an index that did not
-  resolve) no longer sends a reply to a forged mesh source (`fd00::/8`) into
-  the mesh. Such a reply is sent only when the routing table takes it back out
-  of the interface the query arrived on, or delivers it locally, and is
-  withheld otherwise.
-- On FreeBSD, macOS, Android and every other target but Linux, a `.fips`
-  query from a forged mesh source address sent to a non-loopback
-  `dns.bind_addr` no longer gets its reply routed into the mesh. A reply to a
-  mesh source is sent only when the routing table takes it back out of the
-  interface it arrived on, and is withheld otherwise.
-
-#### Firewall
-
-- The Linux mesh firewall (`fips.nft`) names the TUN interface in one place,
-  `fips_if`, which must match `tun.name`. When the loaded firewall polices
-  another interface than the node's TUN, the daemon now warns at start, and
-  the control socket and `fipstop` report every listener as exposed instead of
-  filtered.
 
 #### Gateway
 
 - The gateway translates only traffic that arrives on its configured
-  `gateway.lan_interface`. Traffic from its other interfaces into the mesh is
-  dropped unless it is a reply, and so is traffic to its virtual addresses
-  from other interfaces; hosts on other interfaces of a multi-homed gateway
+  `gateway.lan_interface`. Traffic from its other interfaces to its virtual
+  addresses is dropped, and traffic from them into the mesh is let through
+  only when it is a reply; hosts on other interfaces of a multi-homed gateway
   could use its mappings and its mesh identity. This includes VPN interfaces
   and containers or virtual machines on the gateway host, which could reach
-  the mesh through the gateway before. A `gateway.lan_interface` that is a
-  VLAN device on a bridge stops working when bridge netfilter is active with
-  `net.bridge.bridge-nf-pass-vlan-input-dev` at its default of 0.
+  the mesh through the gateway before and lose `.fips` access with this
+  change. A `gateway.lan_interface` that is a VLAN device on a bridge stops
+  serving clients whose traffic enters the bridge untagged when
+  `br_netfilter` passes bridged IPv6 to the firewall
+  (`net.bridge.bridge-nf-call-ip6tables` at 1, its default once the module
+  loads, or the bridge's `nf_call_ip6tables` on); the OpenWrt package sets
+  it to 0.
 - After the gateway process restarts it no longer gives an address the
   previous run handed out to a different name while clients may still have the
   old answer cached; those cached answers stop working until they expire. A
@@ -1324,75 +1351,70 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   change and all of them lie inside the routed prefix. A `.fips` name whose
   mesh address lies inside the pool prefix now gets `SERVFAIL`, since the
   gateway routes the whole prefix to itself and could never reach it.
-
 - The gateway documentation no longer says the mesh firewall restricts port
   forwards: forwarded traffic does not pass the firewall's input chain. It now
   gives a forward-chain recipe that does, and corrects how replies reach the
   mesh, when configuration is read, and what happens to a forward's connection
   when it is removed.
 
-#### Links and transports
+#### DNS
 
-- An inbound TCP or Tor onion connection is now dropped when it goes longer
-  than the node's own link-liveness bound without delivering a complete frame.
-  The bound is about 64 seconds at default settings. A remote that sends one
-  frame and then goes silent no longer holds an inbound connection slot
-  indefinitely. The bound follows `node.heartbeat_interval_secs`,
-  `node.link_dead_timeout_secs`, `node.tick_interval_secs` and the handshake
-  resend settings.
-- Inbound TCP connections are now also limited per source, so one host can no
-  longer take every inbound slot. By default a single IPv4 address, or a
-  single IPv6 /64, may hold 8 at once (`transports.tcp.max_inbound_per_source`;
-  a value at or above the transport's inbound cap turns the limit off). A
-  refused connection is closed at once and counted in `connections_rejected`
-  and in the new `source_rejected` statistic. A node that receives inbound TCP
-  through a local proxy (sslh, stunnel, a userland port forwarder) sees every
-  peer arrive from the proxy's address and should raise the limit.
-- A peer that completes msg1 and then never sends an authenticated frame can
-  no longer make the node set up a new link for it on every msg1. Each such
-  link cost a msg2, a tree announce and a stale peer entry until the link-dead
-  timeout removed it. After three links in a row from one identity end without
-  an authenticated frame, at one startup epoch, the node drops that identity's
-  msg1s at that epoch unanswered for 30 seconds, doubling with each further
-  silent link up to 10 minutes. Any authenticated frame from the identity
-  clears the record. A msg1 at a new epoch (a restart) is never refused, a
-  resend of the msg1 an existing link was set up from is still answered, and
-  the node's own dials to the peer are unaffected. Refused msg1s are counted
-  as a new `silent_backoff` handshake reject, apart from `bad_state`, and
-  `HandshakeStats` and `HandshakeStatsSnapshot` gain a public `silent_backoff`
-  field.
+- The `.fips` responder and the gateway's DNS forwarder no longer answer DNS
+  responses or other datagrams that are not queries, which let one forged
+  datagram start an endless exchange with another responder or service. They
+  no longer copy records or extra questions from a query into the reply, which
+  made the responder a reflector with up to about seven times amplification
+  when bound to a non-loopback address. Both now answer unknown record types
+  with NODATA or NXDOMAIN, other opcodes with NOTIMP, malformed queries with
+  FORMERR and other classes with REFUSED, and copy the RD and CD flags into
+  the reply. A query whose class carries the mDNS unicast-response bit is now
+  refused, where it was answered as class IN, and `.fips` queries larger than
+  512 bytes, such as EDNS-padded ones, are now answered.
+- The gateway's relayed NXDOMAIN now carries an SOA, so resolvers cache it for
+  up to `gateway.dns.ttl` (60 seconds by default). A name that becomes
+  resolvable while the daemon runs, such as an alias added to the hosts file
+  or the peer list, can stay NXDOMAIN to LAN clients that long after a failed
+  lookup.
+- A configured `dns.ttl` or `gateway.dns.ttl` above 2147483647 is used as
+  2147483647, the largest TTL resolvers honour. For the gateway the clamped
+  value is also the TTL its address pool uses.
+- The configuration reference now says which platforms keep mesh peers away
+  from a wildcard `dns.bind_addr` (Linux, macOS and FreeBSD with the daemon's
+  own TUN, unless the daemon logs at start that the mesh interface index is
+  unresolved and the DNS mesh filter disabled) and which do not (Windows, or
+  an application-supplied TUN), and that such a bind answers every host on the
+  node's other networks. The macOS WireGuard container example now publishes
+  the DNS port on `127.0.0.1` only.
+- On Linux, a `.fips` query from a mesh address is answered only out of the
+  interface it arrived on. With a non-loopback `dns.bind_addr`, a host on
+  another network could forge a mesh source address and make the node send DNS
+  replies into the mesh from its own address. With a specific (non-wildcard)
+  `dns.bind_addr`, a query from a ULA (`fd00::/8`) source arriving on a
+  non-mesh interface is no longer answered.
+- On Linux, a responder bound to one specific `dns.bind_addr` with no known
+  mesh interface index (an application-supplied TUN, or an index that did not
+  resolve) no longer sends a reply to a forged mesh source (`fd00::/8`) into
+  the mesh. Such a reply is sent only when the routing table takes it back out
+  of the interface the query arrived on, or delivers it locally, and is
+  withheld otherwise.
+- On FreeBSD, macOS, Android and every other target but Linux, a `.fips`
+  query from a forged mesh source address sent to a non-loopback
+  `dns.bind_addr` no longer gets its reply routed into the mesh. A reply to a
+  mesh source is sent only when the routing table takes it back out of the
+  interface it arrived on, and is withheld otherwise.
 
-- A BLE device that claims another node's key no longer stops that node's own
-  BLE link from being admitted in the direction the node-order tie-break
-  prefers, and links carrying an established FIPS session are no longer
-  displaced by new BLE connections. When the BLE pool is full, new links are
-  refused instead; a link that is not carrying a FIPS session can still be
-  displaced, when the pool is full, once it has had 10 s (or
-  `connect_timeout_ms`, if longer) to start one. Extra links to the same
-  neighbour, for example after it changes its BLE address, can stay open until
-  the pool needs the slot. With BLE `auto_connect` enabled, a device that
-  keeps several handshakes claiming a peer in flight can still delay automatic
-  connection to that peer.
+#### Firewall
 
-- A replayed handshake message from a peer that is not currently linked no
-  longer diverts traffic for that peer, and a single replayed message no
-  longer blocks its real handshake for 15 seconds.
-- A BLE device can no longer take over a link at an address that already
-  holds one for another node, or for a node not yet identified, and its claim
-  is no longer reported at that link. A second link from the same node at that
-  address replaces the first only to settle a simultaneous dial.
-- A BLE or Ethernet neighbour can no longer stop a node from dialling a peer
-  by presenting links that claim the peer's key, or grow the BLE probe's
-  address memory without bound.
-- Unproven BLE or Ethernet neighbour claims of a node's key no longer hold
-  back its other dials: they no longer use up a configured peer's per-peer
-  path budget, no longer make the configured-dial guards treat the peer as
-  already connecting, and no longer park the node's LAN (mDNS) candidate until
-  it expires undialled.
-- At `max_peers`, claims of an already connected peer from transport
-  neighbours are held to four in flight per key, so a neighbour beaconing from
-  fresh source MACs can no longer fill every outbound handshake slot and delay
-  the redial of a peer that dropped.
+- The Linux mesh firewall (`fips.nft`) names the TUN interface in one place,
+  `fips_if`, which must match `tun.name`. When the loaded firewall polices
+  another interface than the node's TUN, the daemon now warns at start, and
+  the control socket and `fipstop` report every listener as exposed instead of
+  filtered. `/etc/fips/fips.nft` is a configuration file. Where it was
+  edited, the `.deb` upgrade asks whether to keep the edited copy or install
+  the new one, and the AUR upgrade keeps the edited copy and writes the new one
+  as `fips.nft.pacnew`. A kept copy keeps the interface name it had. A host
+  that renamed the TUN must police its `tun.name`, in the kept copy's
+  `iifname` line or in the new file's `fips_if`, and reload `fips-firewall`.
 
 #### OpenWrt
 
@@ -1409,81 +1431,42 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   firewall reload or the save fails, IP traffic arriving on them is dropped
   until the firewall next reloads, and the upgrade says so.
 
-#### Routing and discovery
+#### Links and transports
 
-- A tree child's bloom filter that returns most of the filter this node sent
-  it is now rejected, and the child's previous filter kept. A child's filter
-  is merged into every filter the node sends, including the one to its parent,
-  so a child announcing back what it was sent made the node's upward filter
-  claim the whole mesh, which the false-positive cap cannot tell apart from an
-  honest whole-mesh view. The check compares each announce from a tree child
-  with the filter last sent to it, and leaves room for a subtree already
-  present in what was sent. It applies only when the filter sent has at least
-  128 set bits and the child already has a stored filter, so a false rejection
-  never drops a child's subtree outright; parents and non-tree peers are not
-  checked. Rejections are counted as `child_role_rejected` in `show_bloom`
-  and logged at WARN. The threshold is `node.bloom.child_echo_threshold`
-  (default 0.8; 1.0 or above turns the check off).
-- A single forged or reflected `PathBroken` signal no longer deletes
-  coordinates a node verified by lookup. A verified entry is kept while a
-  fresh lookup re-validates it. It is demoted to an unverified hint only when
-  `PathBroken` signals naming the destination arrive over two different links
-  within 15 seconds. The vote is the authenticated link peer the signal
-  arrived over, not the reporter it names, so a sender on one link cannot
-  reach the quorum by inventing reporters. Forged reports that arrive over two
-  different links still demote the entry. The re-lookup now runs on every such
-  signal, and when the destination's identity is not cached the node first
-  caches it from the session's key so the answer can be verified. New
-  error-signal counters `broken_below_quorum`, `broken_demoted`,
-  `broken_link_mismatch` and `broken_reporter_mismatch` appear in
-  `show_routing`; the last two only count and never refuse a signal.
-
-- A flood of Nostr adverts under new keys can no longer push the adverts of
-  configured or linked peers, or adverts cached before the flood, out of the
-  cache. When the cache is full, new unconfigured authors wait for room
-  instead of evicting entries, and open discovery draws its candidates at
-  random from the cache, so adverts that were cached before a flood are still
-  tried while their authors keep republishing them. A peer configured with its
-  npub in upper case now finds its Nostr advert.
-- LAN (mDNS) discovery dials an advertised address only when it lies on the
-  link the advert's address record arrived on, ignores an advert whose service
-  host is not the advertised node's own, and stays within the discovery
-  budget, with configured peers dialled first and at most two handshakes in
-  flight to any one address.
-- A LAN host advertising a malformed npub can no longer crash the node's
-  mDNS discovery while debug logging is on.
-- A datagram from another address can no longer stop a Nostr-discovered peer
-  from being retried for a day.
-- A traversal offer can make the node probe a private IPv4 address only when
-  one of the node's own interface prefixes holds both that address and one of
-  the node's own addresses. Deployments that punched across private subnets
-  with a STUN server inside the network no longer do so, nor do hosts on /32
-  or point-to-point interfaces, while peers on one LAN whose prefix is wider
-  than /24 now reach each other directly.
-- The lookup failure table no longer grows without bound.
-
-- A directly linked peer can no longer make each new coordinate cache entry
-  cost a scan of the whole cache, push other destinations out of the cache
-  faster than a fixed rate, or fill the cache with very deep coordinates; the
-  cache is now bounded by the coordinates it stores as well as its entry
-  count, and traffic from a peer over its rate is still forwarded. Coordinates
-  under another tree root are no longer cached from any session message.
-- A peer that forwards a lookup can no longer stop the genuine answer reaching
-  the node that asked by sending a forged one first. One peer repeating
-  lookups for a target no longer stops other peers' lookups for it being
-  forwarded, and the forward limiter no longer stops limiting when full. A
-  forged lookup answer is now logged at debug level.
-- During an advert flood that keeps the Nostr advert cache full, an honest
-  author that misses one republish keeps its cache slot, unserved, for one
-  republish interval of this node
-  (`node.rendezvous.nostr.advert_refresh_secs`), instead of being refused as a
-  new author until the flood ends. An author that republishes less often than
-  this node's interval can still lose it.
-- LAN discovery refuses an mDNS advert whose host label belongs to a
-  configured or connected peer under a different npub, so a sender with no
-  private key can no longer name a known FIPS node's host under forged npubs
-  and hold the unconfigured LAN dial slots. Hosts this node does not know are
-  not covered.
+- An inbound TCP or Tor onion connection is now dropped when it goes longer
+  than the node's own link-liveness bound without delivering a complete frame.
+  The bound is about 64 seconds at default settings. A remote that sends one
+  frame and then goes silent no longer holds an inbound connection slot
+  indefinitely. The bound follows `node.heartbeat_interval_secs`,
+  `node.link_dead_timeout_secs`, `node.tick_interval_secs` and the handshake
+  resend settings.
+- A BLE device that claims another node's key no longer stops that node's own
+  BLE link from being admitted, and links carrying an established FIPS session
+  are no longer displaced by new BLE connections. When the BLE pool is full,
+  new links are refused instead; a link that is not carrying a FIPS session
+  can still be displaced, when the pool is full, once it has had 10 s (or
+  `connect_timeout_ms`, if longer) to start one. Extra links to the same
+  neighbour, for example after it changes its BLE address, can stay open until
+  the pool needs the slot. With BLE `auto_connect` enabled, a device that
+  keeps several handshakes claiming a peer in flight can still delay automatic
+  connection to that peer.
+- A replayed handshake message from a peer that is not currently linked no
+  longer diverts traffic for that peer, and a single replayed message no
+  longer blocks its real handshake for 15 seconds.
+- A BLE device can no longer replace a link at an address that already holds
+  one.
+- A BLE or Ethernet neighbour can no longer stop a node from dialling a peer
+  by presenting links that claim the peer's key, or grow the BLE probe's
+  address memory without bound.
+- Unproven BLE or Ethernet neighbour claims of a node's key no longer hold
+  back its other dials: they no longer use up a configured peer's per-peer
+  path budget, no longer make the configured-dial guards treat the peer as
+  already connecting, and no longer park the node's LAN (mDNS) candidate until
+  it expires undialled.
+- At `max_peers`, claims of an already connected peer from transport
+  neighbours are held to four in flight per key, so a neighbour beaconing from
+  fresh source MACs can no longer fill every outbound handshake slot and delay
+  the redial of a peer that dropped.
 
 #### Sessions and rekey
 
@@ -1521,14 +1504,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   cross-connection, or reaped as stale. After a promotion, the memory it left
   held the session's two traffic keys for as long as the peer stayed
   connected. The security reference is updated to match.
-
 - Packets to a destination the mesh cannot reach now get an ICMPv6 Destination
   Unreachable at once instead of being held indefinitely, which let a gateway
   LAN host fill the table of held destinations. While the node has no peers,
   and for 30 seconds after it gains one, such packets are still held briefly
   while routing information arrives. Held packets are answered after the
   lookup schedule plus the handshake timeout, 50 seconds by default.
-
 - A forged session setup naming another node no longer holds back this node's
   own traffic to that node, and a single forged setup no longer blocks that
   node's own setup. A node answers each session setup it receives with one
@@ -1539,6 +1520,79 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   msg2 that does not authenticate is now discarded, the handshake state it
   advanced is restored, and the attempt keeps its resend schedule and
   deadline.
+
+#### Routing and discovery
+
+- A single forged or reflected `PathBroken` signal no longer deletes
+  coordinates a node verified by lookup. A verified entry is kept while a
+  fresh lookup re-validates it. It is demoted to an unverified hint only when
+  `PathBroken` signals naming the destination arrive over two different links
+  within 15 seconds. The vote is the authenticated link peer the signal
+  arrived over, not the reporter it names, so a sender on one link cannot
+  reach the quorum by inventing reporters. Forged reports that arrive over two
+  different links still demote the entry. The re-lookup now runs on every such
+  signal, and when the destination's identity is not cached the node first
+  caches it from the session's key so the answer can be verified. New
+  error-signal counters `broken_below_quorum`, `broken_demoted`,
+  `broken_link_mismatch` and `broken_reporter_mismatch` appear in
+  `show_routing`; the last two only count and never refuse a signal.
+- A flood of Nostr adverts under new keys can no longer push the adverts of
+  configured or linked peers, or adverts cached before the flood, out of the
+  cache. When the cache is full, new unconfigured authors wait for room
+  instead of evicting entries, and open discovery draws its candidates at
+  random from the cache, so adverts that were cached before a flood are still
+  tried while their authors keep republishing them. A peer configured with its
+  npub in upper case now finds its Nostr advert.
+- LAN (mDNS) discovery dials an advertised address only when it lies on the
+  link the advert's address record arrived on, ignores an advert whose service
+  host is not the advertised node's own, and stays within the discovery
+  budget, with configured peers dialled first and at most two handshakes in
+  flight to any one address.
+- A LAN host advertising a malformed npub can no longer crash the node's
+  mDNS discovery while debug logging is on.
+- A datagram from another address can no longer stop a Nostr-discovered peer
+  from being retried for a day.
+- A traversal offer can make the node probe a private IPv4 address only when
+  one of the node's own interface prefixes holds both that address and one of
+  the node's own addresses. Deployments that punched across private subnets
+  with a STUN server inside the network no longer do so, nor do hosts on /32
+  or point-to-point interfaces, while peers on one LAN whose prefix is wider
+  than /24 now reach each other directly.
+- The lookup failure table no longer grows without bound.
+- A directly linked peer can no longer make each new coordinate cache entry
+  cost a scan of the whole cache, push other destinations out of the cache
+  faster than a fixed rate, or fill the cache with very deep coordinates; the
+  cache is now bounded by the coordinates it stores as well as its entry
+  count, and traffic from a peer over its rate is still forwarded. Coordinates
+  under another tree root are no longer cached from any session message.
+- A peer that forwards a lookup can no longer stop the genuine answer reaching
+  the node that asked by sending a forged one first. One peer repeating
+  lookups for a target no longer stops other peers' lookups for it being
+  forwarded, and the forward limiter no longer stops limiting when full. A
+  forged lookup answer is now logged at debug level.
+- During an advert flood that keeps the Nostr advert cache full, an honest
+  author that misses one republish keeps its cache slot, unserved, for one
+  republish interval of this node
+  (`node.rendezvous.nostr.advert_refresh_secs`), instead of being refused as a
+  new author until the flood ends. An author that republishes less often than
+  this node's interval can still lose it.
+- LAN discovery refuses an mDNS advert whose host label belongs to a
+  configured or connected peer under a different npub, so a sender with no
+  private key can no longer name a known FIPS node's host under forged npubs
+  and hold the unconfigured LAN dial slots. Hosts this node does not know are
+  not covered.
+
+#### Dependencies
+
+- The lockfile moves `rustls` from 0.23.45 to 0.23.46, for four advisories
+  against 0.23.45: RUSTSEC-2026-0346, whose `Debug` output of client session
+  values exposed TLS secrets; RUSTSEC-2026-0347, which sent buffered
+  application data to the outer server after an ECH rejection;
+  RUSTSEC-2026-0348, where Brotli certificate decompression could allocate up
+  to 1 GiB before authentication; and RUSTSEC-2026-0349, where an
+  unauthenticated ServerHello could downgrade later connections to classical
+  key exchange. `rustls` is the TLS client the Nostr relay connections use. The
+  update is within the version range the dependencies already allowed.
 
 ## [0.5.2] - 2026-09-28
 

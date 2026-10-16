@@ -360,7 +360,7 @@ jobs:
       # Upload the Linux binary so integration jobs can use it without rebuilding
       - name: Upload Linux binary
         if: matrix.os == 'ubuntu-latest'
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fips-linux
           path: |
@@ -477,16 +477,17 @@ jobs:
       # open one fails and says so, so a runner that stops granting the
       # capability shows up as a red leg rather than as silence.
       #
-      # The workspace has more than one lib test executable, so the build and
-      # the selector name the `fips` package: otherwise the order cargo lists
-      # them in decides which one runs, and the core's, which has no ethernet
-      # tests, passes having run nothing. The grep fails the step unless at
-      # least one test passed, since a name filter that matches nothing passes.
+      # The workspace has more than one lib test executable, so the build names
+      # the `fips-mesh` package and the selector its `fips` library: otherwise
+      # the order cargo lists them in decides which one runs, and the core's,
+      # which has no ethernet tests, passes having run nothing. The grep fails
+      # the step unless at least one test passed, since a name filter that
+      # matches nothing passes.
       - name: Run interface-binding tests with privilege
         shell: bash
         run: |
-          cargo test -p fips --lib --no-run
-          BIN=$(cargo test -p fips --lib --no-run --message-format=json \
+          cargo test -p fips-mesh --lib --no-run
+          BIN=$(cargo test -p fips-mesh --lib --no-run --message-format=json \
             | jq -r 'select(.reason == "compiler-artifact")
                      | select(.executable != null)
                      | select(.target.kind[0] == "lib")
@@ -503,7 +504,7 @@ jobs:
           grep -qE '^test result: ok\. [1-9][0-9]* passed;' "$RUNNER_TEMP/privileged-tests.log"
 
       - name: Publish test report (Checks tab)
-        uses: dorny/test-reporter@4a2e97665d5fa767581ef38eca97b9694bd4eef4 # v2
+        uses: dorny/test-reporter@df6247429542221bc30d46a036ee47af1102c451 # v2
         if: always()
         with:
           name: Unit Tests
@@ -961,7 +962,7 @@ jobs:
 
       # Fetch the pre-built Linux binary from job 1
       - name: Download Linux binary
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: fips-linux
           path: _bin
@@ -1062,7 +1063,7 @@ jobs:
 
       - name: Upload sim results on failure (chaos)
         if: matrix.type == 'chaos' && failure()
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: sim-results-${{ matrix.scenario }}
           path: testing/chaos/sim-results/
@@ -1334,7 +1335,7 @@ jobs:
           key: ${{ steps.builder.outputs.key }}
 
       - name: Upload the .deb
-        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7
         with:
           name: fips-deb-${{ matrix.deb_arch }}
           path: deploy/fips_*_${{ matrix.deb_arch }}.deb
@@ -1379,7 +1380,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Download the .deb
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: fips-deb-amd64
           path: _deb
@@ -1466,7 +1467,7 @@ jobs:
       - uses: actions/checkout@d23441a48e516b6c34aea4fa41551a30e30af803 # v6
 
       - name: Download the .deb
-        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8
         with:
           name: fips-deb-${{ matrix.arch }}
           path: _deb

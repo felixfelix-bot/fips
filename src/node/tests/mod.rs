@@ -49,6 +49,7 @@ mod spanning_tree;
 mod stored_msg2;
 mod tcp;
 mod traffic_diag;
+mod tree_send_failure;
 mod udp_dns;
 mod unit;
 mod update_peers;
