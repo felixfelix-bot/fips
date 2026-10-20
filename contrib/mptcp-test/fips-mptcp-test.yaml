@@ -1,0 +1,29 @@
+# FIPS with MPTCP-enabled TCP transport — test config for the multi-WAN bonding work.
+#
+# Verifies the patch from commit 36f82c86 (branch pr/tcp-mptcp-option):
+# TcpConfig.mptcp makes outgoing sockets use socket2 Protocol::MPTCP at socket
+# CREATION (MPTCP cannot be retrofitted onto an existing socket), cfg-gated to
+# Linux, with a mandatory plain-TCP fallback when the protocol is unavailable.
+#
+# Requirements on the host:
+#   net.mptcp.enabled=1
+#   ip mptcp endpoints configured per uplink (see the bonding runbook)
+#   at least two local addresses the peer can reach — otherwise a single subflow
+#     forms and there is nothing to aggregate
+#
+# Verify MPTCP is actually in use by the local address shown in a transfer:
+# a plain-TCP connection shows an ordinary local address; an MPTCP one shows an
+# address registered with `ip mptcp endpoint`.
+node:
+  identity:
+    persistent: false        # ephemeral for a test node
+  data_dir: /tmp/fipsmpt/data
+  control_socket: /tmp/fipsmpt/run/control.sock
+
+tun:
+  enabled: false             # not needed to exercise the transport
+
+transports:
+  tcp:
+    bind_addr: "0.0.0.0:17443"
+    mptcp: true              # <-- the patch's knob
