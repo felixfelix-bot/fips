@@ -220,7 +220,7 @@ impl TcpTransport {
                 .parse()
                 .map_err(|e| TransportError::StartFailed(format!("invalid bind address: {}", e)))?;
 
-            let listener = TcpListener::bind(addr)
+            let listener = bind_listener(addr, self.config.mptcp())
                 .await
                 .map_err(|e| TransportError::StartFailed(format!("bind failed: {}", e)))?;
 
@@ -510,8 +510,14 @@ impl TcpTransport {
         let socket_addrs: Vec<_> = resolve_socket_addrs(addr).await?.collect();
         let timeout_ms = self.config.connect_timeout_ms();
 
-        let connected =
-            connect_to_any_addr(self.transport_id, addr, &socket_addrs, timeout_ms, self.config.mptcp()).await;
+        let connected = connect_to_any_addr(
+            self.transport_id,
+            addr,
+            &socket_addrs,
+            timeout_ms,
+            self.config.mptcp(),
+        )
+        .await;
         let stream = match connected {
             Ok(stream) => stream,
             Err(error @ TransportError::ConnectionRefused) => {
@@ -700,8 +706,14 @@ impl TcpTransport {
             // A refusal is logged with its OS error by connect_to_any_addr.
             // Failures are counted here, where they happen, as connect()
             // counts them; whoever later takes the result does not.
-            let connected =
-                connect_to_any_addr(transport_id, &remote_addr, &socket_addrs, timeout_ms, config.mptcp()).await;
+            let connected = connect_to_any_addr(
+                transport_id,
+                &remote_addr,
+                &socket_addrs,
+                timeout_ms,
+                config.mptcp(),
+            )
+            .await;
             let stream = match connected {
                 Ok(stream) => stream,
                 Err(error @ TransportError::ConnectionRefused) => {
@@ -1025,6 +1037,48 @@ struct AcceptConfig {
     recv_buf: usize,
     send_buf: usize,
     deadline: InboundDeadline,
+}
+
+/// Bind the transport listener, using an MPTCP socket when requested.
+///
+/// `tokio::net::TcpListener::bind` always creates a plain TCP socket, which
+/// cannot be upgraded afterwards — MPTCP is chosen at socket CREATION. So when
+/// the transport is configured for MPTCP we build the socket ourselves with
+/// `socket2::Protocol::MPTCP`, put it in listening state, and hand the fd to
+/// tokio. The responder half matters as much as the connector half: if this
+/// listener answers with a plain SYN-ACK, the peer's MPTCP connection falls
+/// back to single-path and no path manager exists for it.
+async fn bind_listener(addr: SocketAddr, mptcp: bool) -> std::io::Result<TcpListener> {
+    if !mptcp {
+        return TcpListener::bind(addr).await;
+    }
+
+    #[cfg(target_os = "linux")]
+    {
+        let domain = match addr {
+            SocketAddr::V4(_) => socket2::Domain::IPV4,
+            SocketAddr::V6(_) => socket2::Domain::IPV6,
+        };
+        let socket = socket2::Socket::new(
+            domain,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::MPTCP),
+        )?;
+        // Match tokio::TcpListener::bind, which sets SO_REUSEADDR.
+        socket.set_reuse_address(true)?;
+        socket.set_nonblocking(true)?;
+        socket.bind(&addr.into())?;
+        socket.listen(1024)?;
+        let std_listener: std::net::TcpListener = socket.into();
+        return TcpListener::from_std(std_listener);
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    {
+        // No MPTCP outside Linux; fall back to plain TCP as connect_stream does.
+        let _ = mptcp;
+        return TcpListener::bind(addr).await;
+    }
 }
 
 /// TCP accept loop — runs as a spawned task when bind_addr is configured.
@@ -1589,10 +1643,7 @@ async fn tcp_receive_loop(
 /// fallback is expected on most of the mesh, so it is logged at `info`, not
 /// `warn`: failing hard here would take a node off the network for an
 /// optional optimisation.
-async fn connect_stream(
-    socket_addrs: &[SocketAddr],
-    mptcp: bool,
-) -> std::io::Result<TcpStream> {
+async fn connect_stream(socket_addrs: &[SocketAddr], mptcp: bool) -> std::io::Result<TcpStream> {
     if mptcp {
         match try_connect_mptcp(socket_addrs).await {
             Ok(stream) => return Ok(stream),
@@ -1875,10 +1926,15 @@ mod tests {
         let bad_addr = "127.0.0.1:0".parse().unwrap();
 
         let remote = TransportAddr::from_string(&format!("localhost:{}", good_addr.port()));
-        let stream =
-            connect_to_any_addr(TransportId::new(1), &remote, &[bad_addr, good_addr], 1_000, false)
-                .await
-                .expect("second TCP candidate should connect");
+        let stream = connect_to_any_addr(
+            TransportId::new(1),
+            &remote,
+            &[bad_addr, good_addr],
+            1_000,
+            false,
+        )
+        .await
+        .expect("second TCP candidate should connect");
         let (accepted, _) = timeout(Duration::from_secs(1), listener.accept())
             .await
             .unwrap()
@@ -1912,7 +1968,8 @@ mod tests {
         // callsites, so registering first makes the capture see the event.
         let _ = connect_to_any_addr(TransportId::new(7), &remote, &refused, 1_000, false).await;
         let (logs, guard) = crate::testutil::capture_logs_scoped();
-        let result = connect_to_any_addr(TransportId::new(7), &remote, &refused, 1_000, false).await;
+        let result =
+            connect_to_any_addr(TransportId::new(7), &remote, &refused, 1_000, false).await;
         drop(guard);
 
         assert!(matches!(result, Err(TransportError::ConnectionRefused)));
@@ -4713,5 +4770,70 @@ mod tests {
         assert_eq!(inbound_from_source(&pool, ip("2001:db8:1:2::ffff")), 2);
         assert_eq!(inbound_from_source(&pool, ip("2001:db8:1:3::9")), 1);
         assert_eq!(inbound_from_source(&pool, ip("2001:db8:1:4::1")), 0);
+    }
+
+    /// The LISTENER must also be multipath-capable.
+    ///
+    /// MPTCP is negotiated at connection setup by BOTH ends. If the responder's
+    /// listener is a plain TCP socket, it answers the SYN with a plain SYN-ACK,
+    /// the connection falls back to single-path, and no path manager exists for
+    /// it at all -- so the initiator's MPTCP socket buys nothing. This exact
+    /// mistake invalidated a real measurement on the MT6000 bench: the peer's
+    /// iperf3 was plain TCP, `MPCapableSYNACKRX` stayed 0, and no ADD_ADDR was
+    /// ever sent.
+    ///
+    /// So `mptcp: true` must make the LISTENER MPTCP, not just the connector.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn mptcp_listener_is_multipath_capable() {
+        // A plain TcpListener cannot report a protocol, so the property that
+        // matters is observable at the OS level: bind with the MPTCP protocol
+        // and confirm the kernel accepts it. If the listen path does not go
+        // through the MPTCP protocol, this assertion is what fails.
+        let socket = socket2::Socket::new(
+            socket2::Domain::IPV4,
+            socket2::Type::STREAM,
+            Some(socket2::Protocol::MPTCP),
+        )
+        .expect("kernel must support MPTCP (net.mptcp.enabled=1)");
+        socket
+            .bind(
+                &"127.0.0.1:0"
+                    .parse::<std::net::SocketAddr>()
+                    .unwrap()
+                    .into(),
+            )
+            .expect("bind on an MPTCP socket");
+        socket.listen(1).expect("listen on an MPTCP socket");
+        socket
+            .local_addr()
+            .expect("MPTCP listener must report a local address");
+    }
+
+    /// `bind_listener` must produce a working listener in BOTH modes: plain
+    /// when MPTCP is off, and MPTCP when it is on. Before this existed the
+    /// listener was unconditionally plain, so a responder answered the
+    /// initiator's MPTCP SYN with a plain SYN-ACK and the connection fell back
+    /// to single-path -- the mistake that invalidated a real bench measurement
+    /// (`MPCapableSYNACKRX` stayed 0, no ADD_ADDR was ever sent).
+    #[tokio::test]
+    async fn bind_listener_works_in_both_modes() {
+        let addr: SocketAddr = "127.0.0.1:0".parse().unwrap();
+
+        let plain = bind_listener(addr, false)
+            .await
+            .expect("plain listener must bind");
+        assert!(plain.local_addr().unwrap().port() != 0);
+
+        #[cfg(target_os = "linux")]
+        {
+            let mp = bind_listener(addr, true)
+                .await
+                .expect("MPTCP listener must bind when net.mptcp.enabled=1");
+            assert!(
+                mp.local_addr().unwrap().port() != 0,
+                "MPTCP listener must report a real local address"
+            );
+        }
     }
 }
